@@ -32,6 +32,11 @@ pub struct RateCounter {
     bytes_sum: u64,
 }
 
+pub struct TransmittedData {
+    pub bytes_per_min: u64,
+    pub count_per_min: u64,
+}
+
 impl RateCounter {
     pub fn new() -> Self {
         RateCounter { entries: VecDeque::new(), bytes_sum: 0 }
@@ -45,11 +50,17 @@ impl RateCounter {
         self.truncate(now);
     }
 
-    pub fn bytes_per_min(&self) -> u64 {
+    // returns (bytes_per_min, count_per_min)
+    pub fn get_bytes_per_min_and_count_per_min_and_truncate(&mut self) -> TransmittedData {
+        self.truncate(millis_since_epoch());
+        TransmittedData { bytes_per_min: self.bytes_per_min(), count_per_min: self.count_per_min() }
+    }
+
+    fn bytes_per_min(&self) -> u64 {
         self.bytes_sum
     }
 
-    pub fn count_per_min(&self) -> u64 {
+    fn count_per_min(&self) -> u64 {
         self.entries.len() as u64
     }
 

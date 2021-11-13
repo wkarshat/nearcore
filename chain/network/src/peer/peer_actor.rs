@@ -160,9 +160,12 @@ impl PeerActor {
     // I am allowing this for now because I assume `MAX_PEER_MSG_PER_MIN` will
     // some day be less than `u64::MAX`.
     #[allow(clippy::absurd_extreme_comparisons)]
-    fn is_abusive(&self) -> bool {
-        self.tracker.received_bytes.count_per_min() > MAX_PEER_MSG_PER_MIN
-            || self.tracker.sent_bytes.count_per_min() > MAX_PEER_MSG_PER_MIN
+    fn is_abusive(&mut self) -> bool {
+        let sent = self.tracker.sent_bytes.get_bytes_per_min_and_count_per_min_and_truncate();
+        let received =
+            self.tracker.received_bytes.get_bytes_per_min_and_count_per_min_and_truncate();
+
+        received.count_per_min > MAX_PEER_MSG_PER_MIN || sent.count_per_min > MAX_PEER_MSG_PER_MIN
     }
 
     fn send_message(&mut self, msg: &PeerMessage) {
@@ -1028,15 +1031,18 @@ impl Handler<QueryPeerStats> for PeerActor {
     fn handle(&mut self, msg: QueryPeerStats, _: &mut Self::Context) -> Self::Result {
         #[cfg(feature = "delay_detector")]
         let _d = delay_detector::DelayDetector::new("query peer stats".into());
+
+        // TODO(#5218) Refactor this code to use `SystemTime`
+        let sent = self.tracker.sent_bytes.get_bytes_per_min_and_count_per_min_and_truncate();
+        let received =
+            self.tracker.received_bytes.get_bytes_per_min_and_count_per_min_and_truncate();
+
         PeerStatsResult {
             chain_info: self.chain_info.clone(),
-            received_bytes_per_sec: self.tracker.received_bytes.bytes_per_min() / 60,
-            sent_bytes_per_sec: self.tracker.sent_bytes.bytes_per_min() / 60,
+            received_bytes_per_sec: received.bytes_per_min / 60,
+            sent_bytes_per_sec: sent.bytes_per_min / 60,
             is_abusive: self.is_abusive(),
-            message_counts: (
-                self.tracker.sent_bytes.count_per_min(),
-                self.tracker.received_bytes.count_per_min(),
-            ),
+            message_counts: (sent.count_per_min, received.count_per_min),
         }
     }
 }
