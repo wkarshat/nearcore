@@ -31,7 +31,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::default::Default;
 pub use std::time::{Duration, Instant};
-pub use time::Time;
+pub use time_struct::Time;
 
 #[derive(Default)]
 struct MockClockPerState {
@@ -287,12 +287,12 @@ mod tests {
     }
 }
 
-mod time {
+mod time_struct {
     use crate::time::{Clock, Duration, Utc};
     use borsh::{BorshDeserialize, BorshSerialize};
     use chrono::DateTime;
     use std::ops::{Add, Sub};
-    use std::time::SystemTime;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
     pub struct Time {
@@ -301,9 +301,8 @@ mod time {
 
     impl BorshSerialize for Time {
         fn serialize<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
-            let nanos = self.to_unix_timestamp_nanos().as_nanos() as u64;
-            BorshSerialize::serialize(&nanos, writer).unwrap();
-            Ok(())
+            let nanos = self.duration_since(Time::from(UNIX_EPOCH)).as_nanos() as u64;
+            BorshSerialize::serialize(&nanos, writer)
         }
     }
 
@@ -311,7 +310,7 @@ mod time {
         fn deserialize(buf: &mut &[u8]) -> Result<Self, std::io::Error> {
             let nanos: u64 = borsh::BorshDeserialize::deserialize(buf)?;
 
-            Ok(Time::from_unix_timestamp(Duration::from_nanos(nanos)))
+            Ok(Time::UNIX_EPOCH + Duration::from_nanos(nanos))
         }
     }
 
@@ -323,10 +322,7 @@ mod time {
 
     impl From<DateTime<Utc>> for Time {
         fn from(utc: DateTime<Utc>) -> Self {
-            // utc.timestamp_nanos() returns i64
-            let nanos = utc.timestamp_nanos() as u64;
-
-            Self::UNIX_EPOCH + Duration::from_nanos(nanos)
+            Self::UNIX_EPOCH + Duration::from_nanos(utc.timestamp_nanos() as u64)
         }
     }
 
@@ -337,25 +333,15 @@ mod time {
             Self::UNIX_EPOCH + Duration::from_nanos(Clock::utc().timestamp_nanos() as u64)
         }
 
-        pub fn duration_since(&self, rhs: &Self) -> Duration {
-            self.system_time.duration_since(rhs.system_time).unwrap_or(Duration::from_millis(0))
+        /// Computes saturating duration since `rhs`.
+        /// A value of `0` will returned in case given timestamp is greater than self.
+        pub fn duration_since(&self, rhs: Self) -> Duration {
+            self.system_time.duration_since(rhs.system_time).unwrap_or_default()
         }
 
+        /// Time in `std::Duration` since `self`.
         pub fn elapsed(&self) -> Duration {
-            Self::now().duration_since(self)
-        }
-
-        pub fn from_unix_timestamp(duration: Duration) -> Self {
-            Self::UNIX_EPOCH + duration
-        }
-
-        pub fn to_unix_timestamp_nanos(&self) -> Duration {
-            // doesn't truncate, because self::UNIX_EPOCH is 0
-            self.duration_since(&Self::UNIX_EPOCH)
-        }
-
-        pub fn inner(self) -> SystemTime {
-            self.system_time
+            Self::now().duration_since(*self)
         }
     }
 
@@ -371,7 +357,15 @@ mod time {
         type Output = Duration;
 
         fn sub(self, other: Self) -> Self::Output {
-            self.system_time.duration_since(other.system_time).unwrap_or(Duration::from_millis(0))
+            self.system_time.duration_since(other.system_time).unwrap_or_default()
+        }
+    }
+
+    impl Sub<Duration> for Time {
+        type Output = Time;
+
+        fn sub(self, other: Duration) -> Self::Output {
+            Time::from(self.system_time.checked_sub(other).unwrap_or(UNIX_EPOCH))
         }
     }
 
@@ -389,7 +383,7 @@ mod time {
             let t_nc = now_nc + Duration::from_nanos(123456);
             let t_st = now_st + Duration::from_nanos(123456);
 
-            assert_eq!(t_nc.inner(), t_st);
+            assert_eq!(t_nc.system_time, t_st);
         }
 
         #[test]
