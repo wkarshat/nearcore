@@ -1033,9 +1033,9 @@ impl Handler<QueryPeerStats> for PeerActor {
         let _d = delay_detector::DelayDetector::new("query peer stats".into());
 
         // TODO(#5218) Refactor this code to use `SystemTime`
-        let sent = self.tracker.sent_bytes.get_bytes_per_min_and_count_per_min_and_truncate();
-        let received =
-            self.tracker.received_bytes.get_bytes_per_min_and_count_per_min_and_truncate();
+        let now = Instant::now();
+        let sent = self.tracker.sent_bytes.minute_stats(now);
+        let received = self.tracker.received_bytes.minute_stats(now);
 
         PeerStatsResult {
             chain_info: self.chain_info.clone(),

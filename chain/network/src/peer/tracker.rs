@@ -1,6 +1,5 @@
 use crate::peer::rate_counter::TransferStats;
 use near_primitives::hash::CryptoHash;
-use near_primitives::types::StateChangeCause::InitialState;
 use std::time::Instant;
 
 /// Maximum number of requests and responses to track.

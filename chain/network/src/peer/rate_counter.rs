@@ -15,7 +15,8 @@ pub struct TransferStats {
     bytes_per_min: u64,
 }
 
-struct MinuteStats {
+#[derive(Eq, PartialEq, Debug)]
+pub struct MinuteStats {
     // bytes per minute
     pub bytes_per_min: u64,
     // count per minute
@@ -41,7 +42,7 @@ impl TransferStats {
     // TODO(#5245) Remove instant once we add time mocking
     pub fn remove_old_entries(&mut self, instant: Instant) {
         while let Some(event) = self.events.front() {
-            if event.instant.elapsed() > Duration::from_secs(60) {
+            if instant.duration_since(event.instant) > Duration::from_secs(60) {
                 self.bytes_per_min -= event.bytes;
                 self.events.pop_front();
             } else {
@@ -74,5 +75,8 @@ mod tests {
 
         let now = now + Duration::from_secs(2);
         assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 1110, count_per_min: 2 });
+
+        let now = now + Duration::from_secs(59);
+        assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 0, count_per_min: 0 });
     }
 }
