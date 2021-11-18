@@ -41,11 +41,12 @@ impl TransferStats {
     // Remove entries older than
     // TODO(#5245) Remove instant once we add time mocking
     pub fn remove_old_entries(&mut self, instant: Instant) {
-        while let Some(event) = self.events.front() {
+        while let Some(event) = self.events.pop_front() {
             if instant.duration_since(event.instant) > Duration::from_secs(60) {
                 self.bytes_per_min -= event.bytes;
-                self.events.pop_front();
             } else {
+                // add the event back
+                self.events.push_front(event);
                 break;
             }
         }
@@ -65,18 +66,26 @@ mod tests {
 
         assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 10, count_per_min: 1 });
 
-        let now = now + Duration::from_secs(45);
-        ts.record(100, now);
-        assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 110, count_per_min: 2 });
+        ts.record(100, now + Duration::from_secs(45));
+        assert_eq!(
+            ts.minute_stats(now + Duration::from_secs(45)),
+            MinuteStats { bytes_per_min: 110, count_per_min: 2 }
+        );
 
-        let now = now + Duration::from_secs(14);
-        ts.record(1000, now);
-        assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 1111, count_per_min: 3 });
+        ts.record(1000, now + Duration::from_secs(59));
+        assert_eq!(
+            ts.minute_stats(now + Duration::from_secs(59)),
+            MinuteStats { bytes_per_min: 1110, count_per_min: 3 }
+        );
 
-        let now = now + Duration::from_secs(2);
-        assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 1110, count_per_min: 2 });
+        assert_eq!(
+            ts.minute_stats(now + Duration::from_secs(61)),
+            MinuteStats { bytes_per_min: 1100, count_per_min: 2 }
+        );
 
-        let now = now + Duration::from_secs(59);
-        assert_eq!(ts.minute_stats(now), MinuteStats { bytes_per_min: 0, count_per_min: 0 });
+        assert_eq!(
+            ts.minute_stats(now + Duration::from_secs(121)),
+            MinuteStats { bytes_per_min: 0, count_per_min: 0 }
+        );
     }
 }
