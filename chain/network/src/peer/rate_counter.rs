@@ -29,45 +29,44 @@ struct Entry {
 /// over the last minute.
 pub struct RateCounter {
     entries: VecDeque<Entry>,
-    bytes_sum: u64,
+    bytes_per_min: u64,
 }
 
 pub struct TransmittedData {
     pub bytes_per_min: u64,
-    pub count_per_min: u64,
+    pub count_per_min: usize,
 }
 
 impl RateCounter {
     pub fn new() -> Self {
-        RateCounter { entries: VecDeque::new(), bytes_sum: 0 }
+        RateCounter { entries: VecDeque::new(), bytes_per_min: 0 }
     }
 
     /// Increment number of bytes transferred, updating counts and rates.
     pub fn increment(&mut self, bytes: u64) {
         let now = SystemTime::now();
         self.entries.push_back(Entry { bytes, recorded: now });
-        self.bytes_sum += bytes;
+        self.bytes_per_min += bytes;
         self.truncate(now);
     }
 
     // returns (bytes_per_min, count_per_min)
     pub fn get_bytes_per_min_and_count_per_min_and_truncate(&mut self) -> TransmittedData {
-        self.truncate(millis_since_epoch());
         TransmittedData { bytes_per_min: self.bytes_per_min(), count_per_min: self.count_per_min() }
     }
 
     fn bytes_per_min(&self) -> u64 {
-        self.bytes_sum
+        self.bytes_per_min
     }
 
-    fn count_per_min(&self) -> u64 {
-        self.entries.len() as u64
+    fn count_per_min(&self) -> usize {
+        self.entries.len()
     }
 
     fn truncate(&mut self, now: SystemTime) {
         // Remove entries older than 1m.
         while !self.entries.is_empty() && self.entries.front().unwrap().recorded < now - MINUTE {
-            self.bytes_sum -= self.entries.pop_front().unwrap().bytes;
+            self.bytes_per_min -= self.entries.pop_front().unwrap().bytes;
         }
     }
 }
