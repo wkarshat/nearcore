@@ -160,8 +160,7 @@ impl PeerActor {
     // I am allowing this for now because I assume `MAX_PEER_MSG_PER_MIN` will
     // some day be less than `u64::MAX`.
     #[allow(clippy::absurd_extreme_comparisons)]
-    fn is_abusive(&mut self) -> bool {
-        let now = Instant::now();
+    fn is_abusive(&mut self, now: Instant) -> bool {
         let sent = self.tracker.sent_bytes.minute_stats(now);
         let received = self.tracker.received_bytes.minute_stats(now);
 
@@ -1041,7 +1040,7 @@ impl Handler<QueryPeerStats> for PeerActor {
             chain_info: self.chain_info.clone(),
             received_bytes_per_sec: received.bytes_per_min / 60,
             sent_bytes_per_sec: sent.bytes_per_min / 60,
-            is_abusive: self.is_abusive(),
+            is_abusive: self.is_abusive(now),
             message_counts: (sent.count_per_min, received.count_per_min),
         }
     }

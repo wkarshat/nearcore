@@ -25,22 +25,20 @@ pub struct MinuteStats {
 
 impl TransferStats {
     // Record event
-    // TODO(#5245) Remove instant once we add time mocking
     pub fn record(&mut self, bytes: u64, instant: Instant) {
         self.bytes_per_min += bytes;
-        self.events.push_back(Event { instant, bytes })
+        self.events.push_back(Event { instant, bytes });
+        self.remove_old_entries(instant);
     }
 
     // Get MinuteStats
-    // TODO(#5245) Remove instant once we add time mocking
     pub fn minute_stats(&mut self, instant: Instant) -> MinuteStats {
         self.remove_old_entries(instant);
         MinuteStats { bytes_per_min: self.bytes_per_min, count_per_min: self.events.len() }
     }
 
     // Remove entries older than
-    // TODO(#5245) Remove instant once we add time mocking
-    pub fn remove_old_entries(&mut self, instant: Instant) {
+    fn remove_old_entries(&mut self, instant: Instant) {
         while let Some(event) = self.events.pop_front() {
             if instant.duration_since(event.instant) > Duration::from_secs(60) {
                 self.bytes_per_min -= event.bytes;
