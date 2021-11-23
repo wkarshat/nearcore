@@ -1,43 +1,47 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// Represents a single event in time.
 struct Event {
+    /// Time
     instant: Instant,
+    /// Number of bytes
     bytes: u64,
 }
 
-// Measure per minute transfer stats
+/// Represents all events which happened in last minute.
 #[derive(Default)]
 pub struct TransferStats {
-    // list of entries, we keep entries not older than 1m
+    /// We keep list of entries not older than 1m.
     events: VecDeque<Event>,
-    // sum of bytes for all entries
+    /// Sum of bytes for all entries.
     bytes_per_min: u64,
 }
 
+/// Represents cumulative stats per minute.
 #[derive(Eq, PartialEq, Debug)]
 pub struct MinuteStats {
-    // bytes per minute
+    /// Byres per minute.
     pub bytes_per_min: u64,
-    // count per minute
+    /// Byres per minute.
     pub count_per_min: usize,
 }
 
 impl TransferStats {
-    // Record event
+    /// Record event at given `instant` with `bytes` bytes.
     pub fn record(&mut self, bytes: u64, instant: Instant) {
         self.bytes_per_min += bytes;
         self.events.push_back(Event { instant, bytes });
         self.remove_old_entries(instant);
     }
 
-    // Get MinuteStats
+    /// Get stats stored in `MinuteStats` struct.
     pub fn minute_stats(&mut self, instant: Instant) -> MinuteStats {
         self.remove_old_entries(instant);
         MinuteStats { bytes_per_min: self.bytes_per_min, count_per_min: self.events.len() }
     }
 
-    // Remove entries older than
+    /// Remove entries older than 1m.
     fn remove_old_entries(&mut self, instant: Instant) {
         while let Some(event) = self.events.pop_front() {
             if instant.duration_since(event.instant) > Duration::from_secs(60) {
