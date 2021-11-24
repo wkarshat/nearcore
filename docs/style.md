@@ -82,7 +82,7 @@ imports and rely on `rustfmt` to sort them.
 ```rust
 // GOOD
 use crate::types::KnownPeerState;
-use borsh::BorshSerialize;;
+use borsh::BorshSerialize;
 use near_primitives::utils::to_timestamp;
 use near_store::{ColPeers, Store};
 use rand::seq::SliceRandom;

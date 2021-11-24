@@ -16,6 +16,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// Defines how long should entries be tracked.
+const TRANSFER_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Represents a single event in time.
 struct Event {
     /// Time when event happened.
@@ -63,7 +66,7 @@ impl TransferStats {
     /// Remove entries older than 1m.
     fn remove_old_entries(&mut self, now: Instant) {
         while let Some(event) = self.events.pop_front() {
-            if now.duration_since(event.instant) > Duration::from_secs(60) {
+            if now.duration_since(event.instant) > TRANSFER_STATS_INTERVAL {
                 self.total_bytes_in_events -= event.bytes;
             } else {
                 // add the event back
