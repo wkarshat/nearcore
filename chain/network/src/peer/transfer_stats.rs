@@ -13,6 +13,7 @@ struct Event {
 #[derive(Default)]
 pub struct TransferStats {
     /// We keep list of entries not older than 1m.
+    /// Events in the queue have timestamps in non-decreasing order.
     events: VecDeque<Event>,
     /// Sum of bytes for all entries.
     total_bytes_in_events: u64,
@@ -29,7 +30,10 @@ pub struct MinuteStats {
 
 impl TransferStats {
     /// Record event at current time `now` with `bytes` bytes.
+    /// Time in `now` should be monotonically increasing.
     pub fn record(&mut self, bytes: u64, now: Instant) {
+        debug_assert!(self.events.back().map(|e| e.instant).unwrap_or(now) <= now);
+
         self.total_bytes_in_events += bytes;
         self.events.push_back(Event { instant: now, bytes });
         self.remove_old_entries(now);
