@@ -1,16 +1,16 @@
 /// The purpose of `TransferStats` is to keep track of transfer sizes in done in a period of 1 minute.
 /// And then; to provide a summary, the count and total size in bytes when requested.
 ///
+/// ```rust,ignore
+/// use crate::peer::transfer_stats::TransferStats;
+/// use std::time::Instant;
 ///
-/// ```rust
-/// use std::time::{Instant};
-///
-/// let ls = TransferStats::new();
-/// let start = Instant::new();
+/// let ts = TransferStats::new();
+/// let start = Instant::now();
 ///
 /// ts.record(1234, start);
 ///
-/// let later = Instant::new();
+/// let later = Instant::now();
 /// println!("{}", ts.minute_stats(later));
 /// ```
 use std::collections::VecDeque;
@@ -50,11 +50,12 @@ impl TransferStats {
     /// Record event at current time `now` with `bytes` bytes.
     /// Time in `now` should be monotonically increasing.
     pub fn record(&mut self, bytes: u64, now: Instant) {
+        self.remove_old_entries(now);
+
         debug_assert!(self.events.back().map(|e| e.instant).unwrap_or(now) <= now);
 
         self.total_bytes_in_events += bytes;
         self.events.push_back(Event { instant: now, bytes });
-        self.remove_old_entries(now);
     }
 
     /// Get stats stored in `MinuteStats` struct.
