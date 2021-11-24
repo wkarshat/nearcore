@@ -15,37 +15,37 @@ pub struct TransferStats {
     /// We keep list of entries not older than 1m.
     events: VecDeque<Event>,
     /// Sum of bytes for all entries.
-    bytes_per_min: u64,
+    total_bytes_in_events: u64,
 }
 
 /// Represents cumulative stats per minute.
 #[derive(Eq, PartialEq, Debug)]
 pub struct MinuteStats {
-    /// Byres per minute.
+    /// Bytes per minute.
     pub bytes_per_min: u64,
-    /// Byres per minute.
+    /// Bytes per minute.
     pub count_per_min: usize,
 }
 
 impl TransferStats {
-    /// Record event at given `instant` with `bytes` bytes.
-    pub fn record(&mut self, bytes: u64, instant: Instant) {
-        self.bytes_per_min += bytes;
-        self.events.push_back(Event { instant, bytes });
-        self.remove_old_entries(instant);
+    /// Record event at current time `now` with `bytes` bytes.
+    pub fn record(&mut self, bytes: u64, now: Instant) {
+        self.total_bytes_in_events += bytes;
+        self.events.push_back(Event { instant: now, bytes });
+        self.remove_old_entries(now);
     }
 
     /// Get stats stored in `MinuteStats` struct.
-    pub fn minute_stats(&mut self, instant: Instant) -> MinuteStats {
-        self.remove_old_entries(instant);
-        MinuteStats { bytes_per_min: self.bytes_per_min, count_per_min: self.events.len() }
+    pub fn minute_stats(&mut self, now: Instant) -> MinuteStats {
+        self.remove_old_entries(now);
+        MinuteStats { bytes_per_min: self.total_bytes_in_events, count_per_min: self.events.len() }
     }
 
     /// Remove entries older than 1m.
-    fn remove_old_entries(&mut self, instant: Instant) {
+    fn remove_old_entries(&mut self, now: Instant) {
         while let Some(event) = self.events.pop_front() {
-            if instant.duration_since(event.instant) > Duration::from_secs(60) {
-                self.bytes_per_min -= event.bytes;
+            if now.duration_since(event.instant) > Duration::from_secs(60) {
+                self.total_bytes_in_events -= event.bytes;
             } else {
                 // add the event back
                 self.events.push_front(event);

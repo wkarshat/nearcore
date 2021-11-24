@@ -1,4 +1,4 @@
-use crate::peer::rate_counter::TransferStats;
+use crate::peer::transfer_stats::TransferStats;
 use near_primitives::hash::CryptoHash;
 use std::time::Instant;
 
