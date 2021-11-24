@@ -1,9 +1,24 @@
+/// The purpose of `TransferStats` is to keep track of transfer sizes in done in a period of 1 minute.
+/// And then; to provide a summary, the count and total size in bytes when requested.
+///
+///
+/// ```rust
+/// use std::time::{Instant};
+///
+/// let ls = TransferStats::new();
+/// let start = Instant::new();
+///
+/// ts.record(1234, start);
+///
+/// let later = Instant::new();
+/// println!("{}", ts.minute_stats(later));
+/// ```
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Represents a single event in time.
 struct Event {
-    /// Time
+    /// Time when event happened.
     instant: Instant,
     /// Number of bytes
     bytes: u64,
