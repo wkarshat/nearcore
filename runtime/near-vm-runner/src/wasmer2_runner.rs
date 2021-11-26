@@ -375,16 +375,7 @@ impl crate::runner::VM for Wasmer2VM {
             %method_name
         )
         .entered();
-        // NaN behavior is deterministic as of now: https://github.com/wasmerio/wasmer/issues/1269
-        // So doesn't require x86. However, when it is on x86, AVX is required:
-        // https://github.com/wasmerio/wasmer/issues/1567
-        #[cfg(not(feature = "no_cpu_compatibility_checks"))]
-        if (cfg!(target_arch = "x86") || !cfg!(target_arch = "x86_64"))
-            && !is_x86_feature_detected!("avx")
-        {
-            panic!("AVX support is required in order to run Wasmer VM Singlepass backend.");
-        }
-
+        near_primitives::cpu::ensure_cpu_compatibility(true);
         if method_name.is_empty() {
             return (
                 None,

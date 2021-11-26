@@ -1,7 +1,9 @@
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS = 1
 export CARGO_PROFILE_RELEASE_LTO = fat
 export DOCKER_BUILDKIT = 1
-export RUSTFLAGS = -D warnings
+export CFLAGS = -mavx -mpopcnt -msse3 -mssse3 -msse4.1 -msse4.2 -msse4a -mcx16
+export CXXFLAGS = ${CFLAGS}
+export RUSTFLAGS = -D warnings --cfg near_production -Ctarget-feature=+avx,+cmpxchg16b,+popcnt,+sse3,+ssse3,+sse4.1,+sse4.2,+sse4a
 
 
 # By default, build a regular release
