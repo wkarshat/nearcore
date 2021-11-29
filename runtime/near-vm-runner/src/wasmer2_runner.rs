@@ -375,7 +375,10 @@ impl crate::runner::VM for Wasmer2VM {
             %method_name
         )
         .entered();
-        near_primitives::cpu::ensure_cpu_compatibility(cfg!(feature = "cpu_compatibility_checks"));
+
+        #[cfg(feature = "cpu_compatibility_checks")]
+        let _ = near_primitives::cpu::verify_cpu_compatibility().map_err(|e| e.terminate());
+
         if method_name.is_empty() {
             return (
                 None,

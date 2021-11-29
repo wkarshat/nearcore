@@ -3,7 +3,7 @@ export CARGO_PROFILE_RELEASE_LTO = fat
 export DOCKER_BUILDKIT = 1
 export CFLAGS = -mavx -mpopcnt -msse3 -mssse3 -msse4.1 -msse4.2 -msse4a -mcx16
 export CXXFLAGS = ${CFLAGS}
-export RUSTFLAGS = -D warnings --cfg near_production -Ctarget-feature=+avx,+cmpxchg16b,+popcnt,+sse3,+ssse3,+sse4.1,+sse4.2,+sse4a
+export RUSTFLAGS = -D warnings -Ctarget-feature=+avx,+cmpxchg16b,+popcnt,+sse3,+ssse3,+sse4.1,+sse4.2,+sse4a
 
 
 # By default, build a regular release
@@ -21,7 +21,7 @@ docker-nearcore-nightly:
 	docker build -t nearcore-nightly -f Dockerfile.nightly --progress=plain .
 
 release:
-	cargo build -p neard --release
+	cargo build -p neard --release --features cpu_compatibility_checks
 	cargo build -p state-viewer --release
 	cargo build -p store-validator --release
 	cargo build -p runtime-params-estimator --release

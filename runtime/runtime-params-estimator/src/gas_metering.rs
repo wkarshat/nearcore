@@ -70,7 +70,7 @@ fn test_gas_metering_cost_time() {
 fn test_gas_metering_cost_icount() {
     // Use smth like
     // CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=./runner.sh \
-    // cargo test --release --features no_cpu_compatibility_checks \
+    // cargo test --release \
     // --lib gas_metering::test_gas_metering_cost_icount -- --exact --nocapture
     // Where runner.sh is
     // /host/nearcore/runtime/runtime-params-estimator/emu-cost/counter_plugin/qemu-x86_64 \

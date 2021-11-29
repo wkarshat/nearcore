@@ -76,6 +76,7 @@ protocol_feature_chunk_only_producers = ["near-chain-configs/protocol_feature_ch
 protocol_feature_routing_exchange_algorithm = ["near-primitives/protocol_feature_routing_exchange_algorithm", "near-chain/protocol_feature_routing_exchange_algorithm", "near-network/protocol_feature_routing_exchange_algorithm", "near-client/protocol_feature_routing_exchange_algorithm", "near-jsonrpc/protocol_feature_routing_exchange_algorithm"]
 nightly_protocol_features = ["nightly_protocol", "near-primitives/nightly_protocol_features", "near-client/nightly_protocol_features", "near-epoch-manager/nightly_protocol_features", "near-store/nightly_protocol_features", "protocol_feature_alt_bn128", "protocol_feature_chunk_only_producers", "protocol_feature_routing_exchange_algorithm"]
 nightly_protocol = ["near-primitives/nightly_protocol", "near-jsonrpc/nightly_protocol"]
+cpu_compatibility_checks = ["near-vm-runner/cpu_compatibility_checks"]
 
 # Force usage of a specific wasm vm irrespective of protocol version.
 force_wasmer2 = ["near-vm-runner/force_wasmer2"]
