@@ -132,11 +132,8 @@ impl ThrottleController {
             self.total_sizeof_messages_in_progress.fetch_sub(msg_size, Ordering::AcqRel);
         }
 
-        // If `ThrottledFramedReader` is not scheduled to read.
-        if self.semaphore.available_permits() == 0 {
-            // Notify throttled framed reader to start readin
-            self.semaphore.add_permits(1);
-        }
+        // Notify throttled framed reader to start reading
+        self.semaphore.add_permits(1);
     }
 }
 
