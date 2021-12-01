@@ -111,25 +111,25 @@ impl ThrottleController {
     /// Check whenever `ThrottleFrameRead` is allowed to read from socket.
     /// That is, we didn't exceed limits yet.
     fn is_ready(&self) -> bool {
-        (self.num_messages_in_progress.load(Ordering::SeqCst) < self.max_num_messages_in_progress)
-            && (self.total_sizeof_messages_in_progress.load(Ordering::SeqCst)
+        (self.num_messages_in_progress.load(Ordering::Acquire) < self.max_num_messages_in_progress)
+            && (self.total_sizeof_messages_in_progress.load(Ordering::Acquire)
                 < self.max_total_sizeof_messages_in_progress)
     }
 
     /// Tracks the message and increase limits by size of the message.
     pub fn add_msg(&self, msg_size: usize) {
-        self.num_messages_in_progress.fetch_add(1, Ordering::SeqCst);
+        self.num_messages_in_progress.fetch_add(1, Ordering::AcqRel);
         if msg_size != 0 {
-            self.total_sizeof_messages_in_progress.fetch_add(msg_size, Ordering::SeqCst);
+            self.total_sizeof_messages_in_progress.fetch_add(msg_size, Ordering::AcqRel);
         }
     }
 
     /// Un-tracks the message and decreases limits by size of the message and notifies
     /// `ThrottledFramedReader` to try to read again
     pub fn remove_msg(&mut self, msg_size: usize) {
-        self.num_messages_in_progress.fetch_sub(1, Ordering::SeqCst);
+        self.num_messages_in_progress.fetch_sub(1, Ordering::AcqRel);
         if msg_size != 0 {
-            self.total_sizeof_messages_in_progress.fetch_sub(msg_size, Ordering::SeqCst);
+            self.total_sizeof_messages_in_progress.fetch_sub(msg_size, Ordering::AcqRel);
         }
 
         // If `ThrottledFramedReader` is not scheduled to read.
