@@ -267,8 +267,9 @@ impl RoutingTableView {
     pub fn info(&mut self) -> RoutingTableInfo {
         let account_peers = self
             .get_announce_accounts()
-            .into_iter()
-            .map(|announce_account| (announce_account.account_id, announce_account.peer_id))
+            .map(|announce_account| {
+                (announce_account.account_id.clone(), announce_account.peer_id.clone())
+            })
             .collect();
         RoutingTableInfo { account_peers, peer_forwarding: self.peer_forwarding.clone() }
     }
@@ -276,13 +277,13 @@ impl RoutingTableView {
     /// Public interface for `account_peers`
     ///
     /// Get keys currently on cache.
-    pub fn get_accounts_keys(&mut self) -> Vec<AccountId> {
-        self.account_peers.iter().map(|(k, _v)| (k.clone())).collect()
+    pub fn get_accounts_keys(&mut self) -> impl Iterator<Item = &AccountId> {
+        self.account_peers.iter().map(|(k, _v)| k)
     }
 
     /// Get announce accounts on cache.
-    pub fn get_announce_accounts(&mut self) -> Vec<AnnounceAccount> {
-        self.account_peers.iter().map(|(_k, v)| v).cloned().collect()
+    pub fn get_announce_accounts(&mut self) -> impl Iterator<Item = &AnnounceAccount> {
+        self.account_peers.iter().map(|(_k, v)| v)
     }
 
     /// Get number of accounts

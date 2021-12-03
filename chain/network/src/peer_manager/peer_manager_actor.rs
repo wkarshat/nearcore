@@ -591,7 +591,7 @@ impl PeerManagerActor {
         new_edge: Edge,
         known_edges: Vec<Edge>,
     ) {
-        let known_accounts = self.routing_table_view.get_announce_accounts();
+        let known_accounts = self.routing_table_view.get_announce_accounts().cloned().collect();
 
         // Start syncing network point of view. Wait until both parties are connected before start
         // sending messages.
@@ -1374,7 +1374,7 @@ impl PeerManagerActor {
                        find_route_error,
                        msg,
                 );
-                trace!(target: "network", "Known peers: {:?}", self.routing_table_view.get_accounts_keys());
+                trace!(target: "network", message = "Known peers", known_peers = ?self.routing_table_view.get_accounts_keys().collect::<Vec<&AccountId>>());
                 return false;
             }
         };
@@ -1456,7 +1456,6 @@ impl PeerManagerActor {
             known_producers: self
                 .routing_table_view
                 .get_announce_accounts()
-                .iter()
                 .map(|announce_account| KnownProducer {
                     account_id: announce_account.account_id.clone(),
                     peer_id: announce_account.peer_id.clone(),
