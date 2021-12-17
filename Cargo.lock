@@ -2630,12 +2630,12 @@ version = "0.0.0"
 dependencies = [
  "actix",
  "borsh 0.9.1",
- "cached",
  "chrono",
  "delay-detector",
  "failure",
  "failure_derive",
  "itertools",
+ "lru",
  "near-chain-configs",
  "near-chain-primitives",
  "near-crypto",
