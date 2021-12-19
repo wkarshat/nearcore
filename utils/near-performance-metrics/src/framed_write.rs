@@ -203,7 +203,7 @@
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::ops::DerefMut;
+use std::ops::{DerefMut, Not};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -456,6 +456,10 @@ where
                     let len = inner.buffer.len();
                     let capacity = inner.buffer.capacity();
                     inner.callback.drained(n, len, capacity);
+                    // Fix memory leak see (#TODO)
+                    if inner.buffer.is_empty() && inner.buffer.is_empty().not() {
+                        std::mem::take(&mut inner.buffer);
+                    }
                 }
                 Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     if inner.buffer.len() > inner.high {
@@ -552,6 +556,10 @@ where
                     let len = inner.buffer.len();
                     let capacity = inner.buffer.capacity();
                     inner.callback.drained(n, len, capacity);
+                    // Fix memory leak see (#TODO)
+                    if inner.buffer.is_empty() && inner.buffer.is_empty().not() {
+                        std::mem::take(&mut inner.buffer);
+                    }
                 }
                 Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     return if inner.buffer.len() < inner.low {

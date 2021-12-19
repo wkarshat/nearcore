@@ -12,6 +12,7 @@ use near_network_primitives::types::ReasonForBan;
 use near_performance_metrics::framed_write::EncoderCallBack;
 use near_rust_allocator_proxy::allocator::get_tid;
 use std::io::{Error, ErrorKind};
+use std::ops::Not;
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::error;
 
@@ -90,6 +91,10 @@ impl Decoder for Codec {
         } else {
             let res = Some(Ok(buf[4..4 + len as usize].to_vec()));
             buf.advance(4 + len as usize);
+            // Fix memory leak see (#TODO)
+            if buf.is_empty() && buf.is_empty().not() {
+                std::mem::take(buf);
+            }
             Ok(res)
         }
     }
