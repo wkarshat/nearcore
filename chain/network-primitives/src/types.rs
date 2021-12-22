@@ -166,8 +166,8 @@ impl KnownPeerStatus {
 pub struct KnownPeerState {
     pub peer_info: PeerInfo,
     pub status: KnownPeerStatus,
-    first_seen: Time,
-    last_seen: Time,
+    pub first_seen: Time,
+    pub last_seen: Time,
 }
 
 impl KnownPeerState {
@@ -179,18 +179,6 @@ impl KnownPeerState {
             first_seen: now,
             last_seen: now,
         }
-    }
-
-    pub fn first_seen(&self) -> Time {
-        self.first_seen
-    }
-
-    pub fn last_seen(&self) -> Time {
-        self.last_seen
-    }
-
-    pub fn set_last_seen(&mut self, last_seen: Time) {
-        self.last_seen = last_seen
     }
 
     pub fn banned_at(&mut self, ban_reason: ReasonForBan, now: Time) {
@@ -524,13 +512,13 @@ mod tests {
         let mut kps = KnownPeerState::new(pi);
 
         let now = Time::now();
-        kps.set_last_seen(now);
+        kps.last_seen = now;
 
-        assert_eq!(kps.last_seen(), now);
+        assert_eq!(kps.last_seen, now);
 
         let now = now + Duration::from_nanos(123);
         kps.banned_at(ReasonForBan::Abusive, now);
         assert_eq!(kps.status, KnownPeerStatus::Banned(ReasonForBan::Abusive, now));
-        assert_eq!(kps.last_seen(), now);
+        assert_eq!(kps.last_seen, now);
     }
 }
