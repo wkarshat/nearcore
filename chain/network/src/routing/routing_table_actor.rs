@@ -1,8 +1,8 @@
 use crate::network_protocol::{Edge, EdgeState};
 use crate::private_actix::{StopMsg, ValidateEdgeList};
-use crate::routing::edge_set::EdgeSet;
 use crate::routing::edge_validator_actor::EdgeValidatorActor;
 use crate::routing::graph::Graph;
+use crate::routing::projected_hash_map::ProjectedHashMap;
 use crate::routing::routing_table_view::SAVE_PEERS_MAX_TIME;
 use crate::stats::metrics;
 use actix::dev::MessageResponse;
@@ -48,7 +48,7 @@ pub struct RoutingTableActor {
     /// Collection of edges representing P2P network.
     /// It's indexed by `Edge::key()` key and can be search through by called `get()` function
     /// with `(PeerId, PeerId)` as argument.
-    pub(crate) edges_info: EdgeSet,
+    pub(crate) edges_info: ProjectedHashMap<(PeerId, PeerId), Edge>,
     /// Data structure used for exchanging routing tables.
     #[cfg(feature = "protocol_feature_routing_exchange_algorithm")]
     pub(crate) peer_ibf_set: crate::routing::ibf_peer_set::IbfPeerSet,
