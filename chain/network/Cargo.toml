@@ -13,6 +13,7 @@ borsh = { version = "0.9", features = ["rc"] }
 bytes = "1"
 bytesize = "1.1"
 conqueue = "0.4.0"
+deepsize = { version = "0.2.0", optional = true }
 futures = "0.3"
 lru = "0.6.5"
 near-rust-allocator-proxy = "0.3.0"
@@ -24,7 +25,6 @@ tokio = { version = "1.1", features = ["net", "rt-multi-thread"] }
 tokio-stream = { version = "0.1.2", features = ["net"] }
 tokio-util = { version = "0.6", features = ["codec"] }
 tracing = "0.1.13"
-deepsize = { version = "0.2.0", optional = true }
 
 delay-detector = { path = "../../tools/delay_detector", optional = true }
 near-crypto = { path = "../../core/crypto" }
@@ -42,12 +42,12 @@ bencher = "0.1.5"
 tempfile = "3"
 
 [features]
+deepsize_feature = ["deepsize", "near-crypto/deepsize_feature", "near-network-primitives/deepsize_feature", "near-primitives/deepsize_feature"]
 delay_detector = ["delay-detector"]
 performance_stats = ["near-performance-metrics/performance_stats"]
 protocol_feature_routing_exchange_algorithm = ["near-primitives/protocol_feature_routing_exchange_algorithm", "near-stable-hasher"]
 sandbox = ["near-network-primitives/sandbox"]
 test_features = ["near-network-primitives/test_features", "serde"]
-deepsize_feature = ["deepsize", "near-crypto/deepsize_feature", "near-network-primitives/deepsize_feature", "near-primitives/deepsize_feature"]
 
 [[bench]]
 name = "graph"
