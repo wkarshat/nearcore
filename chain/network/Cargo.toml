@@ -42,10 +42,18 @@ bencher = "0.1.5"
 tempfile = "3"
 
 [features]
-deepsize_feature = ["deepsize", "near-crypto/deepsize_feature", "near-network-primitives/deepsize_feature", "near-primitives/deepsize_feature"]
+deepsize_feature = [
+    "deepsize",
+    "near-crypto/deepsize_feature",
+    "near-network-primitives/deepsize_feature",
+    "near-primitives/deepsize_feature"
+]
 delay_detector = ["delay-detector"]
 performance_stats = ["near-performance-metrics/performance_stats"]
-protocol_feature_routing_exchange_algorithm = ["near-primitives/protocol_feature_routing_exchange_algorithm", "near-stable-hasher"]
+protocol_feature_routing_exchange_algorithm = [
+    "near-primitives/protocol_feature_routing_exchange_algorithm",
+    "near-stable-hasher"
+]
 sandbox = ["near-network-primitives/sandbox"]
 test_features = ["near-network-primitives/test_features", "serde"]
 
