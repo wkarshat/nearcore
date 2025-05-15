@@ -1,38 +1,50 @@
+use std::sync::Arc;
+
 use actix::Addr;
-use futures::{future, future::LocalBoxFuture, FutureExt, TryFutureExt};
-use once_cell::sync::Lazy;
+use futures::{FutureExt, TryFutureExt, future, future::LocalBoxFuture};
+use integration_tests::env::setup::setup_no_network_with_validity_period;
+use near_async::{
+    actix::AddrWithAutoSpanContextExt,
+    messaging::{IntoMultiSender, noop},
+};
+use near_chain_configs::GenesisConfig;
+use near_client::ViewClientActor;
+use near_jsonrpc::{RpcConfig, start_http};
+use near_jsonrpc_primitives::{
+    message::{Message, from_slice},
+    types::entity_debug::DummyEntityDebugHandler,
+};
+use near_network::tcp;
+use near_primitives::types::NumBlocks;
+use near_time::Clock;
 use serde_json::json;
 
-use near_chain_configs::GenesisConfig;
-use near_client::test_utils::setup_no_network_with_validity_period_and_no_epoch_sync;
-use near_client::ViewClientActor;
-use near_jsonrpc::{start_http, RpcConfig};
-use near_jsonrpc_primitives::message::{from_slice, Message};
-use near_network::test_utils::open_port;
-#[cfg(feature = "test_features")]
-use near_network::test_utils::test_features::make_peer_manager_routing_table_addr_pair;
-use near_primitives::types::NumBlocks;
-
-pub static TEST_GENESIS_CONFIG: Lazy<GenesisConfig> = Lazy::new(|| {
-    GenesisConfig::from_json(include_str!("../../../../nearcore/res/genesis_config.json"))
-});
+pub static TEST_GENESIS_CONFIG: std::sync::LazyLock<GenesisConfig> =
+    std::sync::LazyLock::new(|| {
+        GenesisConfig::from_json(include_str!("../res/genesis_config.json"))
+    });
 
 pub enum NodeType {
     Validator,
     NonValidator,
 }
 
-pub fn start_all(node_type: NodeType) -> (Addr<ViewClientActor>, String) {
-    start_all_with_validity_period_and_no_epoch_sync(node_type, 100, false)
+pub fn start_all(
+    clock: Clock,
+    node_type: NodeType,
+) -> (Addr<ViewClientActor>, tcp::ListenerAddr, Arc<tempfile::TempDir>) {
+    start_all_with_validity_period(clock, node_type, 100, false)
 }
 
-pub fn start_all_with_validity_period_and_no_epoch_sync(
+pub fn start_all_with_validity_period(
+    clock: Clock,
     node_type: NodeType,
     transaction_validity_period: NumBlocks,
     enable_doomslug: bool,
-) -> (Addr<ViewClientActor>, String) {
-    let (client_addr, view_client_addr) = setup_no_network_with_validity_period_and_no_epoch_sync(
-        vec!["test1".parse().unwrap(), "test2".parse().unwrap()],
+) -> (Addr<ViewClientActor>, tcp::ListenerAddr, Arc<tempfile::TempDir>) {
+    let actor_handles = setup_no_network_with_validity_period(
+        clock,
+        vec!["test1".parse().unwrap()],
         if let NodeType::Validator = node_type {
             "test1".parse().unwrap()
         } else {
@@ -43,36 +55,36 @@ pub fn start_all_with_validity_period_and_no_epoch_sync(
         enable_doomslug,
     );
 
-    let addr = format!("127.0.0.1:{}", open_port());
-
-    #[cfg(feature = "test_features")]
-    let (peer_manager_addr, routing_table_addr) = make_peer_manager_routing_table_addr_pair();
-
+    let addr = tcp::ListenerAddr::reserve_for_test();
     start_http(
-        RpcConfig::new(&addr),
+        RpcConfig::new(addr),
         TEST_GENESIS_CONFIG.clone(),
-        client_addr.clone(),
-        view_client_addr.clone(),
+        actor_handles.client_actor.clone().with_auto_span_context().into_multi_sender(),
+        actor_handles.view_client_actor.clone().with_auto_span_context().into_multi_sender(),
+        actor_handles.rpc_handler_actor.clone().with_auto_span_context().into_multi_sender(),
+        noop().into_multi_sender(),
         #[cfg(feature = "test_features")]
-        peer_manager_addr,
-        #[cfg(feature = "test_features")]
-        routing_table_addr,
+        noop().into_multi_sender(),
+        Arc::new(DummyEntityDebugHandler {}),
     );
-    (view_client_addr, addr)
+    // setup_no_network_with_validity_period should use runtime_tempdir together with real runtime.
+    (actor_handles.view_client_actor, addr, actor_handles.runtime_tempdir.unwrap())
 }
 
 #[macro_export]
-#[allow(unused_macros)] // Suppress Rustc warnings even though this macro is used.
 macro_rules! test_with_client {
     ($node_type:expr, $client:ident, $block:expr) => {
         init_test_logger();
 
         near_actix_test_utils::run_actix(async {
-            let (_view_client_addr, addr) = test_utils::start_all($node_type);
+            let (_view_client_addr, addr, _runtime_tempdir) =
+                test_utils::start_all(near_time::Clock::real(), $node_type);
 
             let $client = new_client(&format!("http://{}", addr));
 
             actix::spawn(async move {
+                // If runtime tempdir is dropped some parts of the runtime would stop working.
+                let _runtime_tempdir = _runtime_tempdir;
                 $block.await;
                 System::current().stop();
             });
@@ -133,9 +145,9 @@ where
                         ))
                     })
                 }),
-                _ => Err(near_jsonrpc_primitives::errors::RpcError::parse_error(format!(
-                    "Failed to parse JSON RPC response"
-                ))),
+                _ => Err(near_jsonrpc_primitives::errors::RpcError::parse_error(
+                    "Failed to parse JSON RPC response".to_string(),
+                )),
             })
         })
         .boxed_local()

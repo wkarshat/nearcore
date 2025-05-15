@@ -21,6 +21,22 @@ class DeployContract:
     pass
 
 
+class DeployGlobalContract:
+    pass
+
+
+class UseGlobalContract:
+    pass
+
+
+class GlobalContractIdentifier:
+    pass
+
+
+class GlobalContractDeployMode:
+    pass
+
+
 class FunctionCall:
     pass
 
@@ -42,6 +58,14 @@ class DeleteKey:
 
 
 class DeleteAccount:
+    pass
+
+
+class SignedDelegate:
+    pass
+
+
+class DelegateAction:
     pass
 
 
@@ -96,6 +120,9 @@ tx_schema = [
                 ['addKey', AddKey],
                 ['deleteKey', DeleteKey],
                 ['deleteAccount', DeleteAccount],
+                ['delegate', SignedDelegate],
+                ['deployGlobalContract', DeployGlobalContract],
+                ['useGlobalContract', UseGlobalContract],
             ]
         }
     ],
@@ -108,11 +135,62 @@ tx_schema = [
         'fields': [['code', ['u8']]]
     }],
     [
+        DeployGlobalContract, {
+            'kind':
+                'struct',
+            'fields': [['code', ['u8']],
+                       ['deployMode', GlobalContractDeployMode]]
+        }
+    ],
+    [
+        GlobalContractDeployMode, {
+            'kind': 'enum',
+            'field': 'enum',
+            'values': [
+                ['codeHash', ()],
+                ['accountId', ()],
+            ]
+        }
+    ],
+    [
+        UseGlobalContract, {
+            'kind': 'struct',
+            'fields': [['contractIdentifier', GlobalContractIdentifier]]
+        }
+    ],
+    [
+        GlobalContractIdentifier, {
+            'kind': 'enum',
+            'field': 'enum',
+            'values': [
+                ['codeHash', [32]],
+                ['accountId', 'string'],
+            ]
+        }
+    ],
+    [
         FunctionCall, {
             'kind':
                 'struct',
             'fields': [['methodName', 'string'], ['args', ['u8']],
                        ['gas', 'u64'], ['deposit', 'u128']]
+        }
+    ],
+    [
+        SignedDelegate, {
+            'kind':
+                'struct',
+            'fields': [['delegateAction', DelegateAction],
+                       ['signature', Signature]]
+        }
+    ],
+    [
+        DelegateAction, {
+            'kind':
+                'struct',
+            'fields': [['senderId', 'string'], ['receiverId', 'string'],
+                       ['actions', [Action]], ['nonce', 'u64'],
+                       ['maxBlockHeight', 'u64'], ['publicKey', PublicKey]]
         }
     ],
     [Transfer, {

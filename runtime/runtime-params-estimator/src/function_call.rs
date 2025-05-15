@@ -1,64 +1,38 @@
-use crate::config::GasMetric;
-use crate::gas_cost::GasCost;
-use crate::vm_estimator::{create_context, least_squares_method};
-use near_primitives::contract::ContractCode;
-use near_primitives::runtime::config_store::RuntimeConfigStore;
-use near_primitives::types::{CompiledContractCache, Gas, ProtocolVersion};
-use near_store::{create_store, StoreCompiledContractCache};
-use near_vm_logic::mocks::mock_external::MockedExternal;
-use near_vm_runner::internal::VMKind;
-use nearcore::get_store_path;
-use num_rational::Ratio;
+use crate::config::{Config, GasMetric};
+use crate::gas_cost::{GasCost, LeastSquaresTolerance};
+use crate::vm_estimator::create_context;
+use near_parameters::RuntimeConfigStore;
+use near_parameters::vm::VMKind;
+use near_primitives::types::ProtocolVersion;
+use near_vm_runner::internal::VMKindExt;
+use near_vm_runner::logic::mocks::mock_external::MockedExternal;
+use near_vm_runner::{ContractCode, ContractRuntimeCache, FilesystemContractRuntimeCache};
 use std::fmt::Write;
 use std::sync::Arc;
 
-pub(crate) fn test_function_call(metric: GasMetric, vm_kind: VMKind) -> (Ratio<i128>, Ratio<i128>) {
+/// Estimates linear cost curve for a function call execution cost per byte of
+/// total contract code. The contract size is increased by adding more methods
+/// to it. This cost is pure VM cost, without the loading from storage.
+pub(crate) fn contract_loading_cost(config: &Config) -> (GasCost, GasCost) {
     let mut xs = vec![];
     let mut ys = vec![];
-    const REPEATS: u64 = 50;
-    for method_count in vec![5, 20, 30, 50, 100, 200, 1000] {
+    let repeats = config.iter_per_block as u64;
+    let warmup_repeats = config.warmup_iters_per_block as u64;
+    for method_count in [5, 20, 30, 50, 100, 200, 1000] {
         let contract = make_many_methods_contract(method_count);
-        let cost = compute_function_call_cost(metric, vm_kind, REPEATS, &contract);
-        println!("{:?} {:?} {} {}", vm_kind, metric, method_count, cost / REPEATS);
+        let cost = compute_function_call_cost(
+            config.metric,
+            config.vm_kind,
+            repeats,
+            warmup_repeats,
+            &contract,
+        );
         xs.push(contract.code().len() as u64);
-        ys.push(cost / REPEATS);
+        ys.push(cost / repeats);
     }
 
-    // Regression analysis only makes sense for additive metrics.
-    if metric == GasMetric::Time {
-        return (0.into(), 0.into());
-    }
-
-    let (cost_base, cost_byte, _) = least_squares_method(&xs, &ys);
-    println!(
-        "{:?} {:?} function call base {} gas, per byte {} gas",
-        vm_kind, metric, cost_base, cost_byte,
-    );
-    (cost_base, cost_byte)
-}
-
-#[test]
-fn test_function_call_time() {
-    // Run with
-    // cargo test --release --lib function_call::test_function_call_time
-    //    --features required  -- --exact --nocapture
-    test_function_call(GasMetric::Time, VMKind::Wasmer0);
-    test_function_call(GasMetric::Time, VMKind::Wasmer2);
-    test_function_call(GasMetric::Time, VMKind::Wasmtime);
-}
-
-#[test]
-fn test_function_call_icount() {
-    // Use smth like
-    // CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=./runner.sh \
-    // cargo test --release --features no_cpu_compatibility_checks,required  \
-    // --lib function_call::test_function_call_icount -- --exact --nocapture
-    // Where runner.sh is
-    // /host/nearcore/runtime/runtime-params-estimator/emu-cost/counter_plugin/qemu-x86_64 \
-    // -cpu Westmere-v1 -plugin file=/host/nearcore/runtime/runtime-params-estimator/emu-cost/counter_plugin/libcounter.so $@
-    test_function_call(GasMetric::ICount, VMKind::Wasmer0);
-    test_function_call(GasMetric::ICount, VMKind::Wasmer2);
-    test_function_call(GasMetric::ICount, VMKind::Wasmtime);
+    let tolerance = LeastSquaresTolerance::default();
+    GasCost::least_squares_method_gas_cost(&xs, &ys, &tolerance, config.debug)
 }
 
 fn make_many_methods_contract(method_count: i32) -> ContractCode {
@@ -66,79 +40,59 @@ fn make_many_methods_contract(method_count: i32) -> ContractCode {
     for i in 0..method_count {
         write!(
             &mut methods,
-            "
-            (export \"hello{}\" (func {i}))
-              (func (;{i};)
+            r#"
+            (export "hello{i}" (func {i}))
+              (func
                 i32.const {i}
                 drop
                 return
               )
-            ",
-            i = i
+            "#,
         )
         .unwrap();
     }
 
-    let code = format!(
-        "
-        (module
-            {}
-            )",
-        methods
-    );
+    let code = format!("(module {methods})");
     ContractCode::new(wat::parse_str(code).unwrap(), None)
 }
 
-pub fn compute_function_call_cost(
+fn compute_function_call_cost(
     gas_metric: GasMetric,
     vm_kind: VMKind,
     repeats: u64,
+    warmup_repeats: u64,
     contract: &ContractCode,
-) -> Gas {
-    let runtime = vm_kind.runtime().expect("runtime has not been enabled");
-    let workdir = tempfile::Builder::new().prefix("runtime_testbed").tempdir().unwrap();
-    let store = create_store(&get_store_path(workdir.path()));
-    let cache_store = Arc::new(StoreCompiledContractCache { store });
-    let cache: Option<&dyn CompiledContractCache> = Some(cache_store.as_ref());
+) -> GasCost {
+    let cache_store = FilesystemContractRuntimeCache::test().unwrap();
+    let cache: Option<&dyn ContractRuntimeCache> = Some(&cache_store);
     let protocol_version = ProtocolVersion::MAX;
     let config_store = RuntimeConfigStore::new(None);
     let runtime_config = config_store.get_config(protocol_version).as_ref();
     let vm_config = runtime_config.wasm_config.clone();
-    let fees = runtime_config.transaction_costs.clone();
-    let mut fake_external = MockedExternal::new();
+    let fees = runtime_config.fees.clone();
+    let mut fake_external = MockedExternal::with_code(contract.clone_for_tests());
     let fake_context = create_context(vec![]);
-    let promise_results = vec![];
 
     // Warmup.
-    if repeats != 1 {
-        let result = runtime.run(
-            contract,
-            "hello0",
-            &mut fake_external,
-            fake_context.clone(),
-            &vm_config,
-            &fees,
-            &promise_results,
-            protocol_version,
-            cache,
-        );
-        assert!(result.1.is_none());
+    for _ in 0..warmup_repeats {
+        let gas_counter = fake_context.make_gas_counter(&vm_config);
+        let runtime = vm_kind.runtime(vm_config.clone()).expect("runtime has not been enabled");
+        let result = runtime
+            .prepare(&fake_external, cache, gas_counter, "hello0")
+            .run(&mut fake_external, &fake_context, Arc::clone(&fees))
+            .expect("fatal error");
+        assert!(result.aborted.is_none());
     }
     // Run with gas metering.
     let start = GasCost::measure(gas_metric);
     for _ in 0..repeats {
-        let result = runtime.run(
-            contract,
-            "hello0",
-            &mut fake_external,
-            fake_context.clone(),
-            &vm_config,
-            &fees,
-            &promise_results,
-            protocol_version,
-            cache,
-        );
-        assert!(result.1.is_none());
+        let gas_counter = fake_context.make_gas_counter(&vm_config);
+        let runtime = vm_kind.runtime(vm_config.clone()).expect("runtime has not been enabled");
+        let result = runtime
+            .prepare(&fake_external, cache, gas_counter, "hello0")
+            .run(&mut fake_external, &fake_context, Arc::clone(&fees))
+            .expect("fatal_error");
+        assert!(result.aborted.is_none());
     }
-    start.elapsed().to_gas()
+    start.elapsed()
 }

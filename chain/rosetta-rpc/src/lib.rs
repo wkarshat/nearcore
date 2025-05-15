@@ -7,29 +7,34 @@ use actix::Addr;
 use actix_cors::Cors;
 use actix_web::{App, HttpServer, ResponseError};
 use paperclip::actix::{
-    api_v2_operation,
+    OpenApiExt, api_v2_operation,
     web::{self, Json},
-    OpenApiExt,
 };
 use strum::IntoEnumIterator;
 
-use near_chain_configs::Genesis;
-use near_client::{ClientActor, ViewClientActor};
-use near_primitives::borsh::BorshDeserialize;
-use near_primitives::serialize::BaseEncode;
-
 pub use config::RosettaRpcConfig;
+use near_chain_configs::Genesis;
+use near_client::{ClientActor, RpcHandlerActor, ViewClientActor};
+use near_o11y::WithSpanContextExt;
+use near_primitives::{account::AccountContract, borsh::BorshDeserialize};
 
 mod adapters;
 mod config;
 mod errors;
 mod models;
+pub mod test;
 mod types;
 mod utils;
 
 pub const BASE_PATH: &str = "";
 pub const API_VERSION: &str = "1.4.4";
 pub const BLOCKCHAIN: &str = "nearprotocol";
+
+/// Genesis together with genesis block identifier.
+struct GenesisWithIdentifier {
+    genesis: Genesis,
+    block_id: models::BlockIdentifier,
+}
 
 /// Verifies that network identifier provided by the user is what we expect.
 ///
@@ -51,7 +56,7 @@ async fn check_network_identifier(
     }
 
     let status = client_addr
-        .send(near_client::Status { is_health_check: false })
+        .send(near_client::Status { is_health_check: false, detailed: false }.with_span_context())
         .await?
         .map_err(|err| errors::ErrorKind::InternalError(err.to_string()))?;
     if status.chain_id != identifier.network {
@@ -74,7 +79,7 @@ async fn network_list(
     _body: Json<models::MetadataRequest>,
 ) -> Result<Json<models::NetworkListResponse>, models::Error> {
     let status = client_addr
-        .send(near_client::Status { is_health_check: false })
+        .send(near_client::Status { is_health_check: false, detailed: false }.with_span_context())
         .await?
         .map_err(|err| errors::ErrorKind::InternalError(err.to_string()))?;
     Ok(Json(models::NetworkListResponse {
@@ -92,7 +97,7 @@ async fn network_list(
 /// This endpoint returns the current status of the network requested. Any
 /// NetworkIdentifier returned by /network/list should be accessible here.
 async fn network_status(
-    genesis: web::Data<Arc<Genesis>>,
+    genesis: web::Data<GenesisWithIdentifier>,
     client_addr: web::Data<Addr<ClientActor>>,
     view_client_addr: web::Data<Addr<ViewClientActor>>,
     body: Json<models::NetworkRequest>,
@@ -101,34 +106,27 @@ async fn network_status(
 
     let status = check_network_identifier(&client_addr, network_identifier).await?;
 
-    let genesis_height = genesis.config.genesis_height;
-    let (network_info, genesis_block, earliest_block) = tokio::try_join!(
-        client_addr.send(near_client::GetNetworkInfo {}),
-        view_client_addr.send(near_client::GetBlock(
-            near_primitives::types::BlockId::Height(genesis_height).into(),
-        )),
-        view_client_addr.send(near_client::GetBlock(
-            near_primitives::types::BlockReference::SyncCheckpoint(
+    let (network_info, earliest_block) = tokio::try_join!(
+        client_addr.send(near_client::GetNetworkInfo {}.with_span_context()),
+        view_client_addr.send(
+            near_client::GetBlock(near_primitives::types::BlockReference::SyncCheckpoint(
                 near_primitives::types::SyncCheckpoint::EarliestAvailable
-            ),
-        )),
+            ),)
+            .with_span_context()
+        ),
     )?;
     let network_info = network_info.map_err(errors::ErrorKind::InternalError)?;
-    let genesis_block =
-        genesis_block.map_err(|err| errors::ErrorKind::InternalInvariantError(err.to_string()))?;
-    let earliest_block = earliest_block;
-
-    let genesis_block_identifier: models::BlockIdentifier = (&genesis_block.header).into();
+    let genesis_block_identifier = genesis.block_id.clone();
     let oldest_block_identifier: models::BlockIdentifier = earliest_block
         .ok()
-        .map(|block| (&block.header).into())
+        .map(|block| (&block).into())
         .unwrap_or_else(|| genesis_block_identifier.clone());
+
+    let final_block = crate::utils::get_final_block(&view_client_addr).await?;
     Ok(Json(models::NetworkStatusResponse {
-        current_block_identifier: models::BlockIdentifier {
-            index: status.sync_info.latest_block_height.try_into().unwrap(),
-            hash: status.sync_info.latest_block_hash.to_base(),
-        },
-        current_block_timestamp: status.sync_info.latest_block_time.timestamp_millis(),
+        current_block_identifier: (&final_block).into(),
+        current_block_timestamp: i64::try_from(final_block.header.timestamp_nanosec / 1_000_000)
+            .unwrap(),
         genesis_block_identifier,
         oldest_block_identifier,
         sync_status: if status.sync_info.syncing {
@@ -201,9 +199,10 @@ async fn network_options(
 /// given that a chain reorg event might cause the specific block at
 /// height `n` to be set to a different one.
 async fn block_details(
-    genesis: web::Data<Arc<Genesis>>,
+    genesis: web::Data<GenesisWithIdentifier>,
     client_addr: web::Data<Addr<ClientActor>>,
     view_client_addr: web::Data<Addr<ViewClientActor>>,
+    currencies: web::Data<Option<Vec<models::Currency>>>,
     body: Json<models::BlockRequest>,
 ) -> Result<Json<models::BlockResponse>, models::Error> {
     let Json(models::BlockRequest { network_identifier, block_identifier }) = body;
@@ -211,13 +210,11 @@ async fn block_details(
     check_network_identifier(&client_addr, network_identifier).await?;
 
     let block_id: near_primitives::types::BlockReference = block_identifier.try_into()?;
+    let block = crate::utils::get_block_if_final(&block_id, view_client_addr.get_ref())
+        .await?
+        .ok_or_else(|| errors::ErrorKind::NotFound("Block not found".into()))?;
 
-    let block = match view_client_addr.send(near_client::GetBlock(block_id.clone())).await? {
-        Ok(block) => block,
-        Err(_) => return Ok(Json(models::BlockResponse { block: None, other_transactions: None })),
-    };
-
-    let block_identifier: models::BlockIdentifier = (&block.header).into();
+    let block_identifier: models::BlockIdentifier = (&block).into();
 
     let parent_block_identifier = if block.header.prev_hash == Default::default() {
         // According to Rosetta API genesis block should have the parent block
@@ -225,22 +222,22 @@ async fn block_details(
         block_identifier.clone()
     } else {
         let parent_block = view_client_addr
-            .send(near_client::GetBlock(
-                near_primitives::types::BlockId::Hash(block.header.prev_hash).into(),
-            ))
+            .send(
+                near_client::GetBlock(
+                    near_primitives::types::BlockId::Hash(block.header.prev_hash).into(),
+                )
+                .with_span_context(),
+            )
             .await?
             .map_err(|err| errors::ErrorKind::InternalError(err.to_string()))?;
-
-        models::BlockIdentifier {
-            index: parent_block.header.height.try_into().unwrap(),
-            hash: parent_block.header.hash.to_base(),
-        }
+        (&parent_block).into()
     };
 
     let transactions = crate::adapters::collect_transactions(
-        Arc::clone(&genesis),
-        Addr::clone(&view_client_addr),
+        &genesis.genesis,
+        view_client_addr.get_ref(),
         &block,
+        currencies.get_ref(),
     )
     .await?;
 
@@ -256,6 +253,7 @@ async fn block_details(
 }
 
 #[api_v2_operation]
+/// cspell:ignore UTXOs
 /// Get a Block Transaction
 ///
 /// Get a transaction in a block by its Transaction Identifier. This endpoint
@@ -277,9 +275,10 @@ async fn block_details(
 /// NOTE: The current implementation is suboptimal as it processes the whole
 /// block to only return a single transaction.
 async fn block_transaction_details(
-    genesis: web::Data<Arc<Genesis>>,
+    genesis: web::Data<GenesisWithIdentifier>,
     client_addr: web::Data<Addr<ClientActor>>,
     view_client_addr: web::Data<Addr<ViewClientActor>>,
+    currencies: web::Data<Option<Vec<models::Currency>>>,
     body: Json<models::BlockTransactionRequest>,
 ) -> Result<Json<models::BlockTransactionResponse>, models::Error> {
     let Json(models::BlockTransactionRequest {
@@ -292,15 +291,15 @@ async fn block_transaction_details(
 
     let block_id: near_primitives::types::BlockReference = block_identifier.try_into()?;
 
-    let block = view_client_addr
-        .send(near_client::GetBlock(block_id.clone()))
+    let block = crate::utils::get_block_if_final(&block_id, view_client_addr.get_ref())
         .await?
-        .map_err(|err| errors::ErrorKind::NotFound(err.to_string()))?;
+        .ok_or_else(|| errors::ErrorKind::NotFound("Block not found".into()))?;
 
     let transaction = crate::adapters::collect_transactions(
-        Arc::clone(&genesis),
-        Addr::clone(&view_client_addr),
+        &genesis.genesis,
+        view_client_addr.get_ref(),
         &block,
+        currencies.get_ref(),
     )
     .await?
     .into_iter()
@@ -330,12 +329,16 @@ async fn block_transaction_details(
 async fn account_balance(
     client_addr: web::Data<Addr<ClientActor>>,
     view_client_addr: web::Data<Addr<ViewClientActor>>,
+    currencies: web::Data<Option<Vec<models::Currency>>>,
     body: Json<models::AccountBalanceRequest>,
 ) -> Result<Json<models::AccountBalanceResponse>, models::Error> {
+    let config_currencies = currencies;
+
     let Json(models::AccountBalanceRequest {
         network_identifier,
         block_identifier,
         account_identifier,
+        currencies,
     }) = body;
 
     check_network_identifier(&client_addr, network_identifier).await?;
@@ -348,15 +351,17 @@ async fn account_balance(
 
     // TODO: update error handling once we return structured errors from the
     // view_client handlers
-    let block = view_client_addr
-        .send(near_client::GetBlock(block_id.clone()))
+    let block = crate::utils::get_block_if_final(&block_id, view_client_addr.get_ref())
         .await?
-        .map_err(|err| errors::ErrorKind::NotFound(err.to_string()))?;
+        .ok_or_else(|| errors::ErrorKind::NotFound("Block not found".into()))?;
+
     let runtime_config =
         crate::utils::query_protocol_config(block.header.hash, view_client_addr.get_ref())
             .await?
             .runtime_config;
 
+    let account_id_for_access_key = account_identifier.address.clone();
+    let account_identifier_for_ft = account_identifier.clone();
     let account_id = account_identifier.address.into();
     let (block_hash, block_height, account_info) =
         match crate::utils::query_account(block_id, account_id, &view_client_addr).await {
@@ -364,7 +369,7 @@ async fn account_balance(
             Err(crate::errors::ErrorKind::NotFound(_)) => (
                 block.header.hash,
                 block.header.height,
-                near_primitives::account::Account::new(0, 0, Default::default(), 0).into(),
+                near_primitives::account::Account::new(0, 0, AccountContract::None, 0).into(),
             ),
             Err(err) => return Err(err.into()),
         };
@@ -382,14 +387,61 @@ async fn account_balance(
     } else {
         account_balances.liquid
     };
-
-    Ok(Json(models::AccountBalanceResponse {
-        block_identifier: models::BlockIdentifier {
-            hash: block_hash.to_base(),
-            index: block_height.try_into().unwrap(),
-        },
-        balances: vec![models::Amount::from_yoctonear(balance)],
-    }))
+    let nonces = if let Some(metadata) = account_identifier.metadata {
+        Some(
+            crate::utils::get_nonces(
+                &view_client_addr,
+                account_id_for_access_key,
+                metadata.public_keys,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if let Some(currencies) = currencies {
+        let mut balances: Vec<models::Amount> = Vec::default();
+        for currency in currencies {
+            let ft_balance = crate::adapters::nep141::get_fungible_token_balance_for_account(
+                &view_client_addr,
+                &block.header,
+                &currency
+                    .clone()
+                    .metadata
+                    .or_else(|| {
+                        // retrieve contract address from global config if not provided in query
+                        config_currencies.as_ref().clone().and_then(|currencies| {
+                            currencies.iter().find_map(|c| {
+                                if c.symbol == currency.symbol { c.metadata.clone() } else { None }
+                            })
+                        })
+                    })
+                    .ok_or_else(|| {
+                        errors::ErrorKind::NotFound(format!(
+                            "Unknown currency `{}`, try providing the contract address",
+                            currency.symbol
+                        ))
+                    })?
+                    .contract_address
+                    .clone(),
+                &account_identifier_for_ft,
+            )
+            .await?;
+            balances.push(models::Amount::from_fungible_token(ft_balance, currency))
+        }
+        balances.push(models::Amount::from_yoctonear(balance));
+        Ok(Json(models::AccountBalanceResponse {
+            block_identifier: models::BlockIdentifier::new(block_height, &block_hash),
+            balances,
+            metadata: nonces,
+        }))
+    } else {
+        Ok(Json(models::AccountBalanceResponse {
+            block_identifier: models::BlockIdentifier::new(block_height, &block_hash),
+            balances: vec![models::Amount::from_yoctonear(balance)],
+            metadata: nonces,
+        }))
+    }
 }
 
 #[api_v2_operation]
@@ -460,6 +512,7 @@ async fn construction_derive(
         account_identifier: models::AccountIdentifier {
             address: address.parse().unwrap(),
             sub_account: None,
+            metadata: None,
         },
     }))
 }
@@ -486,6 +539,7 @@ async fn construction_preprocess(
         required_public_keys: vec![models::AccountIdentifier {
             address: near_actions.sender_account_id.clone().into(),
             sub_account: None,
+            metadata: None,
         }],
         options: models::ConstructionMetadataOptions {
             signer_account_id: near_actions.sender_account_id.into(),
@@ -533,7 +587,7 @@ async fn construction_metadata(
 
     Ok(Json(models::ConstructionMetadataResponse {
         metadata: models::ConstructionMetadata {
-            recent_block_hash: block_hash.to_base(),
+            recent_block_hash: block_hash.to_string(),
             signer_public_access_key_nonce: access_key.nonce.saturating_add(1),
         },
     }))
@@ -566,8 +620,7 @@ async fn construction_payloads(
     check_network_identifier(&client_addr, network_identifier).await?;
 
     let signer_public_access_key: near_crypto::PublicKey = public_keys
-        .iter()
-        .next()
+        .first()
         .ok_or_else(|| {
             errors::ErrorKind::InvalidInput("exactly one public key is expected".to_string())
         })?
@@ -586,21 +639,23 @@ async fn construction_payloads(
     } = operations.try_into()?;
     let models::ConstructionMetadata { recent_block_hash, signer_public_access_key_nonce } =
         metadata;
-    let unsigned_transaction = near_primitives::transaction::Transaction {
-        block_hash: recent_block_hash.parse().map_err(|err| {
-            errors::ErrorKind::InvalidInput(format!(
-                "block hash could not be parsed due to: {:?}",
-                err
-            ))
-        })?,
-        signer_id: signer_account_id.clone(),
-        public_key: signer_public_access_key.clone(),
-        nonce: signer_public_access_key_nonce,
-        receiver_id: receiver_account_id,
-        actions,
-    };
+    let unsigned_transaction = near_primitives::transaction::Transaction::V0(
+        near_primitives::transaction::TransactionV0 {
+            block_hash: recent_block_hash.parse().map_err(|err| {
+                errors::ErrorKind::InvalidInput(format!(
+                    "block hash could not be parsed due to: {:?}",
+                    err
+                ))
+            })?,
+            signer_id: signer_account_id.clone(),
+            public_key: signer_public_access_key.clone(),
+            nonce: signer_public_access_key_nonce,
+            receiver_id: receiver_account_id,
+            actions,
+        },
+    );
 
-    let (transaction_hash, _) = unsigned_transaction.get_hash_and_size().clone();
+    let (transaction_hash, _) = unsigned_transaction.get_hash_and_size();
 
     Ok(Json(models::ConstructionPayloadsResponse {
         unsigned_transaction: unsigned_transaction.into(),
@@ -631,8 +686,7 @@ async fn construction_combine(
     check_network_identifier(&client_addr, network_identifier).await?;
 
     let signature = signatures
-        .iter()
-        .next()
+        .first()
         .ok_or_else(|| {
             errors::ErrorKind::InvalidInput("exactly one signature is expected".to_string())
         })?
@@ -641,12 +695,12 @@ async fn construction_combine(
             errors::ErrorKind::InvalidInput(err.to_string())
         })?;
 
-    let signed_transction = near_primitives::transaction::SignedTransaction::new(
+    let signed_transaction = near_primitives::transaction::SignedTransaction::new(
         signature,
         unsigned_transaction.into_inner(),
     );
 
-    Ok(Json(models::ConstructionCombineResponse { signed_transaction: signed_transction.into() }))
+    Ok(Json(models::ConstructionCombineResponse { signed_transaction: signed_transaction.into() }))
 }
 
 #[api_v2_operation]
@@ -664,12 +718,7 @@ async fn construction_parse(
 
     check_network_identifier(&client_addr, network_identifier).await?;
 
-    let near_primitives::transaction::Transaction {
-        actions,
-        signer_id: sender_account_id,
-        receiver_id: receiver_account_id,
-        ..
-    } = if signed {
+    let transaction = if signed {
         near_primitives::transaction::SignedTransaction::try_from_slice(&transaction.into_inner())
             .map_err(|err| {
                 errors::ErrorKind::InvalidInput(format!(
@@ -689,10 +738,13 @@ async fn construction_parse(
     };
 
     let account_identifier_signers =
-        if signed { vec![sender_account_id.clone().into()] } else { vec![] };
+        if signed { vec![transaction.signer_id().clone().into()] } else { vec![] };
 
-    let near_actions =
-        crate::adapters::NearActions { sender_account_id, receiver_account_id, actions };
+    let near_actions = crate::adapters::NearActions {
+        sender_account_id: transaction.signer_id().clone(),
+        receiver_account_id: transaction.receiver_id().clone(),
+        actions: transaction.take_actions(),
+    };
 
     Ok(Json(models::ConstructionParseResponse {
         account_identifier_signers,
@@ -731,6 +783,7 @@ async fn construction_hash(
 /// mempool. Otherwise, it should return an error.
 async fn construction_submit(
     client_addr: web::Data<Addr<ClientActor>>,
+    tx_handler_addr: web::Data<Addr<RpcHandlerActor>>,
     body: Json<models::ConstructionSubmitRequest>,
 ) -> Result<Json<models::TransactionIdentifierResponse>, models::Error> {
     let Json(models::ConstructionSubmitRequest { network_identifier, signed_transaction }) = body;
@@ -738,28 +791,30 @@ async fn construction_submit(
     check_network_identifier(&client_addr, network_identifier).await?;
 
     let transaction_hash = signed_transaction.as_ref().get_hash();
-    let transaction_submittion = client_addr
-        .send(near_network::types::NetworkClientMessages::Transaction {
-            transaction: signed_transaction.into_inner(),
-            is_forwarded: false,
-            check_only: false,
-        })
+    let transaction_submission = tx_handler_addr
+        .send(
+            near_client::ProcessTxRequest {
+                transaction: signed_transaction.into_inner(),
+                is_forwarded: false,
+                check_only: false,
+            }
+            .with_span_context(),
+        )
         .await?;
-    match transaction_submittion {
-        near_network::types::NetworkClientResponses::ValidTx
-        | near_network::types::NetworkClientResponses::RequestRouted => {
+    match transaction_submission {
+        near_client::ProcessTxResponse::ValidTx | near_client::ProcessTxResponse::RequestRouted => {
             Ok(Json(models::TransactionIdentifierResponse {
                 transaction_identifier: models::TransactionIdentifier::transaction(
                     &transaction_hash,
                 ),
             }))
         }
-        near_network::types::NetworkClientResponses::InvalidTx(error) => {
+        near_client::ProcessTxResponse::InvalidTx(error) => {
             Err(errors::ErrorKind::InvalidInput(error.to_string()).into())
         }
         _ => Err(errors::ErrorKind::InternalInvariantError(format!(
-            "Transaction submition return unexpected result: {:?}",
-            transaction_submittion
+            "Transaction submission return unexpected result: {:?}",
+            transaction_submission
         ))
         .into()),
     }
@@ -783,12 +838,16 @@ fn get_cors(cors_allowed_origins: &[String]) -> Cors {
 
 pub fn start_rosetta_rpc(
     config: crate::config::RosettaRpcConfig,
-    genesis: Arc<Genesis>,
+    genesis: Genesis,
+    genesis_block_hash: &near_primitives::hash::CryptoHash,
     client_addr: Addr<ClientActor>,
     view_client_addr: Addr<ViewClientActor>,
-) -> actix_web::dev::Server {
-    let crate::config::RosettaRpcConfig { addr, cors_allowed_origins, limits } = config;
-    HttpServer::new(move || {
+    tx_handler_addr: Addr<RpcHandlerActor>,
+) -> actix_web::dev::ServerHandle {
+    let crate::config::RosettaRpcConfig { addr, cors_allowed_origins, limits, currencies } = config;
+    let block_id = models::BlockIdentifier::new(genesis.config.genesis_height, genesis_block_hash);
+    let genesis = Arc::new(GenesisWithIdentifier { genesis, block_id });
+    let server = HttpServer::new(move || {
         let json_config = web::JsonConfig::default()
             .limit(limits.input_payload_max_size)
             .error_handler(|err, _req| {
@@ -804,9 +863,11 @@ pub fn start_rosetta_rpc(
         App::new()
             .app_data(json_config)
             .wrap(actix_web::middleware::Logger::default())
-            .data(Arc::clone(&genesis))
-            .data(client_addr.clone())
-            .data(view_client_addr.clone())
+            .app_data(web::Data::from(genesis.clone()))
+            .app_data(web::Data::new(client_addr.clone()))
+            .app_data(web::Data::new(view_client_addr.clone()))
+            .app_data(web::Data::new(tx_handler_addr.clone()))
+            .app_data(web::Data::new(currencies.clone()))
             .wrap(get_cors(&cors_allowed_origins))
             .wrap_api()
             .service(web::resource("/network/list").route(web::post().to(network_list)))
@@ -852,5 +913,11 @@ pub fn start_rosetta_rpc(
     .unwrap()
     .shutdown_timeout(5)
     .disable_signals()
-    .run()
+    .run();
+
+    let handle = server.handle();
+
+    tokio::spawn(server);
+
+    handle
 }

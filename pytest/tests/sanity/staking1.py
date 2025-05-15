@@ -18,10 +18,12 @@ TIMEOUT = 150
 config = None
 nodes = start_cluster(
     2, 1, 1, config,
-    [["epoch_length", 10], ["block_producer_kickout_threshold", 40]],
-    {2: {
-        "tracked_shards": [0]
-    }})
+    [["epoch_length", 10], ["block_producer_kickout_threshold", 40]], {
+        2: {
+            "tracked_shards_config": "AllShards",
+            "store.state_snapshot_config.state_snapshot_type": "Enabled",
+        }
+    })
 
 started = time.time()
 
@@ -46,7 +48,7 @@ nodes[0].send_tx(tx)
 logger.info("Initial stakes: %s" % get_stakes())
 for height, _ in utils.poll_blocks(nodes[0], timeout=TIMEOUT):
     if 'test2' in get_validators():
-        logger.info("Normalin, normalin")
+        logger.info("Normal in, normal in")
         assert 20 <= height <= 25, height
         break
 

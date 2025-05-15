@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# cspell:ignore autolegend, dataid, feedgnuplot
+
 log=./io_log.txt
 base=.
 mark=`date +"%Y-%m-%d-%H-%M-%S"`
@@ -16,7 +18,7 @@ dir=/tmp/data$acc
 rm -rf $dir
 $base/../../target/release/neard  --home $dir init \
     --test-seed=alice.near --account-id=test.near --fast
-$base/emu-cost/counter_plugin/qemu-x86_64  -d plugin -cpu Westmere-v1 -R 8G \
+$base/emu-cost/counter_plugin/qemu-x86_64  -d plugin -cpu Haswell-v4 -R 8G \
       -plugin file=$base/emu-cost/counter_plugin/libcounter.so,arg="started",arg="on_every_close"  \
       $base/../../target/release/genesis-populate --home $dir --additional-accounts-num $acc 2>&1 | tee -a $log
 rm -rf $dir

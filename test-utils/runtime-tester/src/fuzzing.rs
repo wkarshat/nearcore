@@ -1,5 +1,6 @@
 use crate::run_test::{BlockConfig, NetworkConfig, RuntimeConfig, Scenario, TransactionConfig};
-use near_crypto::{InMemorySigner, KeyType, PublicKey};
+use near_chain_configs::{NEAR_BASE, test_utils::TESTING_INIT_BALANCE};
+use near_crypto::{InMemorySigner, KeyType, PublicKey, Signer};
 use near_primitives::{
     account::{AccessKey, AccessKeyPermission, FunctionCallPermission},
     transaction::{
@@ -8,13 +9,10 @@ use near_primitives::{
     },
     types::{AccountId, Balance, BlockHeight, Nonce},
 };
-use nearcore::config::{NEAR_BASE, TESTING_INIT_BALANCE};
 
-use byteorder::{ByteOrder, LittleEndian};
 use libfuzzer_sys::arbitrary::{Arbitrary, Result, Unstructured};
 
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of;
 use std::str::FromStr;
 
 pub type ContractId = usize;
@@ -47,7 +45,13 @@ impl Arbitrary<'_> for Scenario {
         while blocks.len() < MAX_BLOCKS && u.len() > BlockConfig::size_hint(0).0 {
             blocks.push(BlockConfig::arbitrary(u, &mut scope)?);
         }
-        Ok(Scenario { network_config, runtime_config, blocks, use_in_memory_store: true })
+        Ok(Scenario {
+            network_config,
+            runtime_config,
+            blocks,
+            use_in_memory_store: true,
+            is_fuzzing: true,
+        })
     }
 
     fn size_hint(_depth: usize) -> (usize, Option<usize>) {
@@ -110,7 +114,7 @@ impl TransactionConfig {
             Ok(TransactionConfig {
                 nonce: scope.nonce(),
                 signer_id: signer_account.id.clone(),
-                receiver_id: receiver_account.id.clone(),
+                receiver_id: receiver_account.id,
                 signer: scope.full_access_signer(u, &signer_account)?,
                 actions: vec![Action::Transfer(TransferAction { deposit: amount })],
             })
@@ -144,12 +148,7 @@ impl TransactionConfig {
             let new_account = scope.new_account(u)?;
 
             let signer = scope.full_access_signer(u, &signer_account)?;
-            let new_public_key = InMemorySigner::from_seed(
-                new_account.id.clone(),
-                KeyType::ED25519,
-                new_account.id.as_ref(),
-            )
-            .public_key;
+            let new_public_key = InMemorySigner::test_signer(&new_account.id).public_key();
             Ok(TransactionConfig {
                 nonce: scope.nonce(),
                 signer_id: signer_account.id,
@@ -157,13 +156,13 @@ impl TransactionConfig {
                 signer,
                 actions: vec![
                     Action::CreateAccount(CreateAccountAction {}),
-                    Action::AddKey(AddKeyAction {
+                    Action::AddKey(Box::new(AddKeyAction {
                         public_key: new_public_key,
                         access_key: AccessKey {
                             nonce: 0,
                             permission: AccessKeyPermission::FullAccess,
                         },
-                    }),
+                    })),
                     Action::Transfer(TransferAction { deposit: NEAR_BASE }),
                 ],
             })
@@ -189,10 +188,10 @@ impl TransactionConfig {
                 Ok(TransactionConfig {
                     nonce: scope.nonce(),
                     signer_id: signer_account.id.clone(),
-                    receiver_id: receiver_account.id.clone(),
+                    receiver_id: receiver_account.id,
                     signer,
                     actions: vec![Action::DeleteAccount(DeleteAccountAction {
-                        beneficiary_id: beneficiary_id.id.clone(),
+                        beneficiary_id: beneficiary_id.id,
                     })],
                 })
             });
@@ -241,7 +240,8 @@ impl TransactionConfig {
                 }
             };
 
-            let signer = scope.function_call_signer(u, &signer_account, &receiver_account.id)?;
+            let signer =
+                scope.function_call_signer(u, &signer_account, receiver_account.id.as_str())?;
 
             let mut receiver_functions = vec![];
             if let Some(contract_id) = receiver_account.deployed_contract {
@@ -268,7 +268,7 @@ impl TransactionConfig {
 
             while actions.len() < actions_num && u.len() > Function::size_hint(0).1.unwrap() {
                 let function = u.choose(&receiver_functions)?;
-                actions.push(Action::FunctionCall(function.arbitrary(u)?));
+                actions.push(Action::FunctionCall(Box::new(function.arbitrary(u)?)));
             }
 
             Ok(TransactionConfig {
@@ -293,11 +293,11 @@ impl TransactionConfig {
                 signer_id: signer_account.id.clone(),
                 receiver_id: signer_account.id.clone(),
                 signer,
-                actions: vec![Action::AddKey(scope.add_new_key(
+                actions: vec![Action::AddKey(Box::new(scope.add_new_key(
                     u,
                     scope.usize_id(&signer_account),
                     nonce,
-                )?)],
+                )?))],
             })
         });
 
@@ -325,7 +325,7 @@ impl TransactionConfig {
                 signer_id: signer_account.id.clone(),
                 receiver_id: signer_account.id.clone(),
                 signer,
-                actions: vec![Action::DeleteKey(DeleteKeyAction { public_key })],
+                actions: vec![Action::DeleteKey(Box::new(DeleteKeyAction { public_key }))],
             })
         });
 
@@ -359,7 +359,7 @@ pub struct Account {
 
 #[derive(Clone)]
 pub struct Key {
-    pub signer: InMemorySigner,
+    pub signer: Signer,
     pub access_key: AccessKey,
 }
 
@@ -554,33 +554,20 @@ impl Scope {
             KeyType::ED25519,
             format!("test{}.{}", account_id, nonce).as_str(),
         );
+        let public_key = signer.public_key();
         self.accounts[account_id].keys.insert(
             nonce,
-            Key {
-                signer: signer.clone(),
-                access_key: AccessKey { nonce, permission: permission.clone() },
-            },
+            Key { signer, access_key: AccessKey { nonce, permission: permission.clone() } },
         );
-        Ok(AddKeyAction {
-            public_key: signer.public_key,
-            access_key: AccessKey { nonce, permission },
-        })
+        Ok(AddKeyAction { public_key, access_key: AccessKey { nonce, permission } })
     }
 
-    pub fn full_access_signer(
-        &self,
-        u: &mut Unstructured,
-        account: &Account,
-    ) -> Result<InMemorySigner> {
+    pub fn full_access_signer(&self, u: &mut Unstructured, account: &Account) -> Result<Signer> {
         let account_idx = self.usize_id(account);
         let possible_signers = self.accounts[account_idx].full_access_keys();
         if possible_signers.is_empty() {
             // this transaction will be invalid
-            Ok(InMemorySigner::from_seed(
-                self.accounts[account_idx].id.clone(),
-                KeyType::ED25519,
-                self.accounts[account_idx].id.as_ref(),
-            ))
+            Ok(InMemorySigner::test_signer(&self.accounts[account_idx].id))
         } else {
             Ok(u.choose(&possible_signers)?.clone())
         }
@@ -591,16 +578,12 @@ impl Scope {
         u: &mut Unstructured,
         account: &Account,
         receiver_id: &str,
-    ) -> Result<InMemorySigner> {
+    ) -> Result<Signer> {
         let account_idx = self.usize_id(account);
         let possible_signers = self.accounts[account_idx].function_call_keys(receiver_id);
         if possible_signers.is_empty() {
             // this transaction will be invalid
-            Ok(InMemorySigner::from_seed(
-                self.accounts[account_idx].id.clone(),
-                KeyType::ED25519,
-                self.accounts[account_idx].id.as_ref(),
-            ))
+            Ok(InMemorySigner::test_signer(&self.accounts[account_idx].id))
         } else {
             Ok(u.choose(&possible_signers)?.clone())
         }
@@ -613,7 +596,7 @@ impl Scope {
     ) -> Result<PublicKey> {
         let account_idx = self.usize_id(account);
         let (nonce, key) = self.accounts[account_idx].random_key(u)?;
-        let public_key = key.signer.public_key.clone();
+        let public_key = key.signer.public_key();
         self.accounts[account_idx].keys.remove(&nonce);
         Ok(public_key)
     }
@@ -625,10 +608,8 @@ impl Account {
         keys.insert(
             0,
             Key {
-                signer: InMemorySigner::from_seed(
-                    AccountId::from_str(id.as_str()).expect("Invalid account_id"),
-                    KeyType::ED25519,
-                    id.as_ref(),
+                signer: InMemorySigner::test_signer(
+                    &AccountId::from_str(id.as_str()).expect("Invalid account_id"),
                 ),
                 access_key: AccessKey { nonce: 0, permission: AccessKeyPermission::FullAccess },
             },
@@ -641,7 +622,7 @@ impl Account {
         }
     }
 
-    pub fn full_access_keys(&self) -> Vec<InMemorySigner> {
+    pub fn full_access_keys(&self) -> Vec<Signer> {
         let mut full_access_keys = vec![];
         for (_, key) in &self.keys {
             if key.access_key.permission == AccessKeyPermission::FullAccess {
@@ -651,7 +632,7 @@ impl Account {
         full_access_keys
     }
 
-    pub fn function_call_keys(&self, receiver_id: &str) -> Vec<InMemorySigner> {
+    pub fn function_call_keys(&self, receiver_id: &str) -> Vec<Signer> {
         let mut function_call_keys = vec![];
         for (_, key) in &self.keys {
             match &key.access_key.permission {
@@ -674,91 +655,120 @@ impl Account {
 
 impl Function {
     pub fn arbitrary(&self, u: &mut Unstructured) -> Result<FunctionCallAction> {
-        let mut res =
-            FunctionCallAction { method_name: String::new(), args: vec![], gas: GAS_1, deposit: 0 };
+        let method_name;
+        let mut args = Vec::new();
         match self {
             // #################
             // # Test contract #
             // #################
             Function::StorageUsage => {
-                res.method_name = "ext_storage_usage".to_string();
+                method_name = "ext_storage_usage";
             }
             Function::BlockIndex => {
-                res.method_name = "ext_block_index".to_string();
+                method_name = "ext_block_index";
             }
             Function::BlockTimestamp => {
-                res.method_name = "ext_block_timestamp".to_string();
+                method_name = "ext_block_timestamp";
             }
             Function::PrepaidGas => {
-                res.method_name = "ext_prepaid_gas".to_string();
+                method_name = "ext_prepaid_gas";
             }
             Function::RandomSeed => {
-                res.method_name = "ext_random_seed".to_string();
+                method_name = "ext_random_seed";
             }
             Function::PredecessorAccountId => {
-                res.method_name = "ext_predecessor_account_id".to_string();
+                method_name = "ext_predecessor_account_id";
             }
             Function::SignerAccountPk => {
-                res.method_name = "ext_signer_account_pk".to_string();
+                method_name = "ext_signer_account_pk";
             }
             Function::SignerAccountId => {
-                res.method_name = "ext_signer_account_id".to_string();
+                method_name = "ext_signer_account_id";
             }
             Function::CurrentAccountId => {
-                res.method_name = "ext_current_account_id".to_string();
+                method_name = "ext_current_account_id";
             }
             Function::AccountBalance => {
-                res.method_name = "ext_account_balance".to_string();
+                method_name = "ext_account_balance";
             }
             Function::AttachedDeposit => {
-                res.method_name = "ext_attached_deposit".to_string();
+                method_name = "ext_attached_deposit";
             }
             Function::ValidatorTotalStake => {
-                res.method_name = "ext_validators_total_stake".to_string();
+                method_name = "ext_validators_total_stake";
             }
             Function::ExtSha256 => {
-                const VALUES_LEN: usize = 20;
-                let mut args = [0u8; VALUES_LEN * size_of::<u64>()];
-                let mut values = vec![];
-                for _ in 0..VALUES_LEN {
-                    values.push(u.arbitrary::<u64>()?);
-                }
-                LittleEndian::write_u64_into(&values, &mut args);
-                res.method_name = "ext_sha256".to_string();
-                res.args = args.to_vec();
+                let len = u.int_in_range(0..=100)?;
+                method_name = "ext_sha256";
+                args = u.bytes(len)?.to_vec();
             }
             Function::UsedGas => {
-                res.method_name = "ext_used_gas".to_string();
+                method_name = "ext_used_gas";
             }
             Function::WriteKeyValue => {
-                let key = u.int_in_range::<u64>(0..=1_000)?;
-                let value = u.int_in_range::<u64>(0..=1_000)?;
-                let mut args = [0u8; 2 * size_of::<u64>()];
-                LittleEndian::write_u64_into(&[key, value], &mut args);
-                res.method_name = "write_key_value".to_string();
-                res.args = args.to_vec();
+                let key = u.int_in_range::<u64>(0..=1_000)?.to_le_bytes();
+                let value = u.int_in_range::<u64>(0..=1_000)?.to_le_bytes();
+                method_name = "write_key_value";
+                args = [&key[..], &value[..]].concat();
             }
             Function::WriteBlockHeight => {
-                res.method_name = "write_block_height".to_string();
+                method_name = "write_block_height";
             }
             // ########################
             // # Contract for fuzzing #
             // ########################
             Function::SumOfNumbers => {
-                let args = u.int_in_range::<u64>(1..=10)?.to_le_bytes();
-                res.method_name = "sum_of_numbers".to_string();
-                res.args = args.to_vec();
+                method_name = "sum_of_numbers";
+                args = u.int_in_range::<u64>(1..=10)?.to_le_bytes().to_vec();
             }
             Function::DataReceipt => {
-                let args = (*u.choose(&[10, 100, 1000, 10000, 100000])? as u64).to_le_bytes();
-                res.method_name = "data_receipt_with_size".to_string();
-                res.args = args.to_vec();
+                method_name = "data_receipt_with_size";
+                args = u.choose(&[10u64, 100, 1000, 10000, 100000])?.to_le_bytes().to_vec();
             }
         };
-        Ok(res)
+        Ok(FunctionCallAction {
+            method_name: method_name.to_string(),
+            args: args,
+            gas: GAS_1,
+            deposit: 0,
+        })
     }
 
     fn size_hint(_depth: usize) -> (usize, Option<usize>) {
         (0, Some(20))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Scenario;
+
+    fn do_fuzz(scenario: &Scenario) -> Result<(), String> {
+        let stats = scenario.run().result.map_err(|e| e.to_string())?;
+        for block_stats in stats.blocks_stats {
+            if block_stats.block_production_time > std::time::Duration::from_secs(2) {
+                return Err(format!(
+                    "block at height {} was produced in {:?}",
+                    block_stats.height, block_stats.block_production_time
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn fuzz(scenario: &Scenario) {
+        if let Err(err) = do_fuzz(scenario) {
+            let file = "failed_scenario.json";
+            serde_json::to_writer(&std::fs::File::create(file).unwrap(), &scenario).unwrap();
+            panic!("Bad scenario: {}, {}", file, err);
+        }
+    }
+
+    #[test]
+    fn scenario_fuzzer() {
+        bolero::check!()
+            .with_iterations(100) // Limit to 100 iterations, the default of 1000 would be too slow
+            .with_arbitrary::<Scenario>()
+            .for_each(fuzz)
     }
 }

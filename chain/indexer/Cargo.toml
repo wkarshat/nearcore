@@ -1,26 +1,53 @@
 [package]
 name = "near-indexer"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
+
+[lints]
+workspace = true
 
 [dependencies]
-actix = "=0.11.0-beta.2"
-anyhow = "1.0.51"
-async-recursion = "0.3.2"
-tracing = "0.1.13"
-futures = "0.3.5"
-rocksdb = "0.16.0"
-serde = { version = "1", features = [ "derive" ] }
-serde_json = "1.0.55"
-tokio = { version = "1.1", features = ["time", "sync"] }
+actix.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+rocksdb.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
-nearcore = { path = "../../nearcore" }
-near-client = { path = "../client" }
-near-chain-configs = { path = "../../core/chain-configs" }
-near-crypto = { path = "../../core/crypto" }
-near-primitives = { path = "../../core/primitives" }
-node-runtime = { path = "../../runtime/runtime" }
+nearcore.workspace = true
+near-client.workspace = true
+near-chain-configs.workspace = true
+near-config-utils.workspace = true
+near-dyn-configs.workspace = true
+near-epoch-manager.workspace = true
+near-indexer-primitives.workspace = true
+near-o11y.workspace = true
+near-parameters.workspace = true
+near-primitives.workspace = true
+near-store.workspace = true
+node-runtime.workspace = true
+
+[features]
+calimero_zero_storage = ["near-primitives/calimero_zero_storage"]
+nightly = [
+    "near-chain-configs/nightly",
+    "near-client/nightly",
+    "near-dyn-configs/nightly",
+    "near-epoch-manager/nightly",
+    "near-indexer-primitives/nightly",
+    "near-o11y/nightly",
+    "near-parameters/nightly",
+    "near-primitives/nightly",
+    "near-store/nightly",
+    "nearcore/nightly",
+    "node-runtime/nightly",
+]
+
+[package.metadata.cargo-machete]
+ignored = ["near-dyn-configs"]

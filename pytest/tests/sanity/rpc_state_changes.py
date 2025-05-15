@@ -15,7 +15,7 @@ import deepdiff
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / 'lib'))
 from cluster import start_cluster
 from key import Key
-from utils import load_test_contract
+from utils import load_test_contract, wait_for_blocks
 import transaction
 
 nodes = start_cluster(
@@ -54,9 +54,10 @@ def test_changes_with_new_account_with_access_key():
     4. Observe the changes in the block where the receipt lands.
     """
 
+    base_account_id = nodes[0].signer_key.account_id
     # re-use the key as a new account access key
     new_key = Key(
-        account_id='rpc_key_value_changes_full_access',
+        account_id=f'rpc_key_value_changes.{base_account_id}',
         pk=nodes[1].signer_key.pk,
         sk=nodes[1].signer_key.sk,
     )
@@ -70,6 +71,7 @@ def test_changes_with_new_account_with_access_key():
         balance=10**24,
         nonce=7,
         block_hash=latest_block_hash)
+    wait_for_blocks(nodes[0], target=5)
     new_account_response = nodes[0].send_tx_and_wait(create_account_tx, 10)
 
     # Step 2
@@ -429,13 +431,13 @@ def test_key_value_changes():
     key = struct.pack('<Q', 42)
     key_base64 = base64.b64encode(key).decode('ascii')
 
-    def set_value(value, *, nounce):
+    def set_value(value, *, nonce):
         args = key + struct.pack('<Q', value)
         tx = transaction.sign_function_call_tx(function_caller_key,
                                                contract_key.account_id,
                                                'write_key_value', args,
                                                300000000000000, 100000000000,
-                                               nounce, latest_block_hash)
+                                               nonce, latest_block_hash)
         response = nodes[1].send_tx_and_wait(tx, 10)
         try:
             status = response['result']['receipts_outcome'][0]['outcome'][
@@ -446,9 +448,9 @@ def test_key_value_changes():
             "Expected successful execution, but the output was: %s" % response)
         return response
 
-    thread = threading.Thread(target=lambda: set_value(10, nounce=20))
+    thread = threading.Thread(target=lambda: set_value(10, nonce=20))
     thread.start()
-    response = set_value(20, nounce=30)
+    response = set_value(20, nonce=30)
     thread.join()
 
     tx_block_hash = response['result']['transaction_outcome']['block_hash']

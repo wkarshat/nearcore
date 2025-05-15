@@ -1,14 +1,18 @@
 [package]
 name = "keypair-generator"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
+
+[lints]
+workspace = true
 
 [dependencies]
-clap = "2.33.0"
+clap.workspace = true
 
-nearcore = { path = "../../nearcore" }
-near-crypto = { path = "../../core/crypto" }
+nearcore.workspace = true
+near-crypto.workspace = true

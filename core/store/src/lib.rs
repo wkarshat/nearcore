@@ -1,532 +1,210 @@
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
-use std::ops::Deref;
-use std::path::Path;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::{fmt, io};
+#![cfg_attr(enable_const_type_id, feature(const_type_id))]
 
-use borsh::{BorshDeserialize, BorshSerialize};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use cached::{Cached, SizedCache};
-
-pub use db::DBCol::{self, *};
-pub use db::{
-    CHUNK_TAIL_KEY, FINAL_HEAD_KEY, FORK_TAIL_KEY, HEADER_HEAD_KEY, HEAD_KEY,
-    LARGEST_TARGET_HEIGHT_KEY, LATEST_KNOWN_KEY, NUM_COLS, SHOULD_COL_GC, SKIP_COL_GC, TAIL_KEY,
+pub use crate::columns::DBCol;
+pub use crate::config::{Mode, StoreConfig};
+pub use crate::db::{
+    CHUNK_TAIL_KEY, COLD_HEAD_KEY, FINAL_HEAD_KEY, FORK_TAIL_KEY, GENESIS_STATE_ROOTS_KEY,
+    HEAD_KEY, HEADER_HEAD_KEY, LARGEST_TARGET_HEIGHT_KEY, LATEST_KNOWN_KEY, STATE_SNAPSHOT_KEY,
+    STATE_SYNC_DUMP_KEY, TAIL_KEY,
 };
-use near_crypto::PublicKey;
-use near_primitives::account::{AccessKey, Account};
-use near_primitives::contract::ContractCode;
-pub use near_primitives::errors::StorageError;
-use near_primitives::hash::CryptoHash;
-use near_primitives::receipt::{DelayedReceiptIndices, Receipt, ReceivedData};
-use near_primitives::serialize::to_base;
-pub use near_primitives::shard_layout::ShardUId;
-use near_primitives::trie_key::{trie_key_parsers, TrieKey};
-use near_primitives::types::{AccountId, CompiledContractCache, StateRoot};
-
-pub use crate::db::refcount::decode_value_with_rc;
-use crate::db::refcount::encode_value_with_rc;
-use crate::db::{
-    DBOp, DBTransaction, Database, RocksDB, GENESIS_JSON_HASH_KEY, GENESIS_STATE_ROOTS_KEY,
+use crate::db::{DBTransaction, Database, StoreStatistics, metadata};
+pub use crate::node_storage::opener::{
+    StoreMigrator, StoreOpener, StoreOpenerError, checkpoint_hot_storage_and_cleanup_columns,
+    clear_columns,
 };
+pub use crate::node_storage::{NodeStorage, Temperature};
+pub use crate::store::{Store, StoreUpdate};
+pub use crate::trie::update::{TrieUpdate, TrieUpdateIterator, TrieUpdateValuePtr};
 pub use crate::trie::{
-    iterator::TrieIterator, split_state, update::TrieUpdate, update::TrieUpdateIterator,
-    update::TrieUpdateValuePtr, ApplyStatePartResult, KeyForStateChanges, PartialStorage,
-    ShardTries, Trie, TrieChanges, WrappedTrieChanges,
+    ApplyStatePartResult, KeyForStateChanges, KeyLookupMode, NibbleSlice, PartialStorage,
+    PrefetchApi, PrefetchError, RawTrieNode, RawTrieNodeWithSize, STATE_SNAPSHOT_COLUMNS,
+    ShardTries, StateSnapshot, StateSnapshotConfig, Trie, TrieAccess, TrieCache,
+    TrieCachingStorage, TrieChanges, TrieConfig, TrieDBStorage, TrieStorage, WrappedTrieChanges,
+    estimator,
 };
+pub use crate::utils::*;
+pub use near_primitives::errors::{MissingTrieValueContext, StorageError};
+pub use near_primitives::shard_layout::ShardUId;
 
+pub mod adapter;
+pub mod archive;
+mod columns;
+pub mod config;
+pub mod contract;
 pub mod db;
+pub mod flat;
+pub mod genesis;
+pub mod metrics;
 pub mod migrations;
-pub mod test_utils;
-mod trie;
-
-#[derive(Clone)]
-pub struct Store {
-    storage: Pin<Arc<dyn Database>>,
-}
-
-impl Store {
-    pub fn new(storage: Pin<Arc<dyn Database>>) -> Store {
-        Store { storage }
-    }
-
-    pub fn get(&self, column: DBCol, key: &[u8]) -> Result<Option<Vec<u8>>, io::Error> {
-        self.storage.get(column, key).map_err(|e| e.into())
-    }
-
-    pub fn get_ser<T: BorshDeserialize>(
-        &self,
-        column: DBCol,
-        key: &[u8],
-    ) -> Result<Option<T>, io::Error> {
-        match self.storage.get(column, key) {
-            Ok(Some(bytes)) => match T::try_from_slice(bytes.as_ref()) {
-                Ok(result) => Ok(Some(result)),
-                Err(e) => Err(e),
-            },
-            Ok(None) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn exists(&self, column: DBCol, key: &[u8]) -> Result<bool, io::Error> {
-        self.storage.get(column, key).map(|value| value.is_some()).map_err(|e| e.into())
-    }
-
-    pub fn store_update(&self) -> StoreUpdate {
-        StoreUpdate::new(self.storage.clone())
-    }
-
-    pub fn iter<'a>(
-        &'a self,
-        column: DBCol,
-    ) -> Box<dyn Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a> {
-        self.storage.iter(column)
-    }
-
-    pub fn iter_without_rc_logic<'a>(
-        &'a self,
-        column: DBCol,
-    ) -> Box<dyn Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a> {
-        self.storage.iter_without_rc_logic(column)
-    }
-
-    pub fn iter_prefix<'a>(
-        &'a self,
-        column: DBCol,
-        key_prefix: &'a [u8],
-    ) -> Box<dyn Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a> {
-        self.storage.iter_prefix(column, key_prefix)
-    }
-
-    pub fn iter_prefix_ser<'a, T: BorshDeserialize>(
-        &'a self,
-        column: DBCol,
-        key_prefix: &'a [u8],
-    ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, T), io::Error>> + 'a> {
-        Box::new(
-            self.storage
-                .iter_prefix(column, key_prefix)
-                .map(|(key, value)| Ok((key.to_vec(), T::try_from_slice(value.as_ref())?))),
-        )
-    }
-
-    pub fn save_to_file(&self, column: DBCol, filename: &Path) -> Result<(), std::io::Error> {
-        let mut file = File::create(filename)?;
-        for (key, value) in self.storage.iter_without_rc_logic(column) {
-            file.write_u32::<LittleEndian>(key.len() as u32)?;
-            file.write_all(&key)?;
-            file.write_u32::<LittleEndian>(value.len() as u32)?;
-            file.write_all(&value)?;
-        }
-        Ok(())
-    }
-
-    pub fn load_from_file(&self, column: DBCol, filename: &Path) -> Result<(), std::io::Error> {
-        let file = File::open(filename)?;
-        let mut file = BufReader::new(file);
-        let mut transaction = self.storage.transaction();
-        let mut key = Vec::new();
-        let mut value = Vec::new();
-        loop {
-            let key_len = match file.read_u32::<LittleEndian>() {
-                Ok(key_len) => key_len as usize,
-                Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(err),
-            };
-            key.resize(key_len, 0);
-            file.read_exact(&mut key)?;
-
-            let value_len = file.read_u32::<LittleEndian>()? as usize;
-            value.resize(value_len, 0);
-            file.read_exact(&mut value)?;
-
-            transaction.put(column, &key, &value);
-        }
-        self.storage.write(transaction).map_err(|e| e.into())
-    }
-
-    pub fn get_rocksdb(&self) -> Option<&RocksDB> {
-        self.storage.as_rocksdb()
-    }
-}
-
-/// Keeps track of current changes to the database and can commit all of them to the database.
-pub struct StoreUpdate {
-    storage: Pin<Arc<dyn Database>>,
-    transaction: DBTransaction,
-    /// Optionally has reference to the trie to clear cache on the commit.
-    tries: Option<ShardTries>,
-}
-
-impl StoreUpdate {
-    pub fn new(storage: Pin<Arc<dyn Database>>) -> Self {
-        let transaction = storage.transaction();
-        StoreUpdate { storage, transaction, tries: None }
-    }
-
-    pub fn new_with_tries(tries: ShardTries) -> Self {
-        let storage = tries.get_store().storage.clone();
-        let transaction = storage.transaction();
-        StoreUpdate { storage, transaction, tries: Some(tries) }
-    }
-
-    pub fn update_refcount(&mut self, column: DBCol, key: &[u8], value: &[u8], rc_delta: i64) {
-        debug_assert!(column.is_rc());
-        let value = encode_value_with_rc(value, rc_delta);
-        self.transaction.update_refcount(column, key, value)
-    }
-
-    pub fn set(&mut self, column: DBCol, key: &[u8], value: &[u8]) {
-        self.transaction.put(column, key, value)
-    }
-
-    pub fn set_ser<T: BorshSerialize>(
-        &mut self,
-        column: DBCol,
-        key: &[u8],
-        value: &T,
-    ) -> Result<(), io::Error> {
-        debug_assert!(!column.is_rc());
-        let data = value.try_to_vec()?;
-        self.set(column, key, &data);
-        Ok(())
-    }
-
-    pub fn delete(&mut self, column: DBCol, key: &[u8]) {
-        self.transaction.delete(column, key);
-    }
-
-    pub fn delete_all(&mut self, column: DBCol) {
-        self.transaction.delete_all(column);
-    }
-
-    /// Merge another store update into this one.
-    pub fn merge(&mut self, other: StoreUpdate) {
-        if let Some(tries) = other.tries {
-            if self.tries.is_none() {
-                self.tries = Some(tries);
-            } else {
-                debug_assert!(self.tries.as_ref().unwrap().is_same(&tries));
-            }
-        }
-
-        self.merge_transaction(other.transaction);
-    }
-
-    /// Merge DB Transaction.
-    pub fn merge_transaction(&mut self, transaction: DBTransaction) {
-        for op in transaction.ops {
-            match op {
-                DBOp::Insert { col, key, value } => self.transaction.put(col, &key, &value),
-                DBOp::Delete { col, key } => self.transaction.delete(col, &key),
-                DBOp::UpdateRefcount { col, key, value } => {
-                    self.transaction.update_refcount(col, &key, &value)
-                }
-                DBOp::DeleteAll { col } => self.transaction.delete_all(col),
-            }
-        }
-    }
-
-    pub fn commit(self) -> Result<(), io::Error> {
-        debug_assert!(
-            {
-                let non_refcount_keys = self
-                    .transaction
-                    .ops
-                    .iter()
-                    .filter_map(|op| match op {
-                        DBOp::Insert { col, key, .. } => Some((*col as u8, key)),
-                        DBOp::Delete { col, key } => Some((*col as u8, key)),
-                        DBOp::UpdateRefcount { .. } => None,
-                        DBOp::DeleteAll { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                non_refcount_keys.len()
-                    == non_refcount_keys.iter().collect::<std::collections::HashSet<_>>().len()
-            },
-            "Transaction overwrites itself: {:?}",
-            self
-        );
-        if let Some(tries) = self.tries {
-            assert_eq!(
-                tries.get_store().storage.deref() as *const _,
-                self.storage.deref() as *const _
-            );
-            tries.update_cache(&self.transaction)?;
-        }
-        self.storage.write(self.transaction).map_err(|e| e.into())
-    }
-}
-
-impl fmt::Debug for StoreUpdate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Store Update {{")?;
-        for op in self.transaction.ops.iter() {
-            match op {
-                DBOp::Insert { col, key, .. } => writeln!(f, "  + {:?} {}", col, to_base(key))?,
-                DBOp::UpdateRefcount { col, key, .. } => {
-                    writeln!(f, "  +- {:?} {}", col, to_base(key))?
-                }
-                DBOp::Delete { col, key } => writeln!(f, "  - {:?} {}", col, to_base(key))?,
-                DBOp::DeleteAll { col } => writeln!(f, "  delete all {:?}", col)?,
-            }
-        }
-        writeln!(f, "}}")
-    }
-}
-
-pub fn read_with_cache<'a, T: BorshDeserialize + 'a>(
-    storage: &Store,
-    col: DBCol,
-    cache: &'a mut SizedCache<Vec<u8>, T>,
-    key: &[u8],
-) -> io::Result<Option<&'a T>> {
-    let key_vec = key.to_vec();
-    if cache.cache_get(&key_vec).is_some() {
-        return Ok(Some(cache.cache_get(&key_vec).unwrap()));
-    }
-    if let Some(result) = storage.get_ser(col, key)? {
-        cache.cache_set(key.to_vec(), result);
-        return Ok(cache.cache_get(&key_vec));
-    }
-    Ok(None)
-}
-
-pub fn create_store(path: &Path) -> Arc<Store> {
-    let db = Arc::pin(RocksDB::new(path).expect("Failed to open the database"));
-    Arc::new(Store::new(db))
-}
-
-/// Reads an object from Trie.
-/// # Errors
-/// see StorageError
-pub fn get<T: BorshDeserialize>(
-    state_update: &TrieUpdate,
-    key: &TrieKey,
-) -> Result<Option<T>, StorageError> {
-    state_update.get(key).and_then(|opt| {
-        opt.map_or_else(
-            || Ok(None),
-            |data| {
-                T::try_from_slice(&data)
-                    .map_err(|_| {
-                        StorageError::StorageInconsistentState("Failed to deserialize".to_string())
-                    })
-                    .map(Some)
-            },
-        )
-    })
-}
-
-/// Writes an object into Trie.
-pub fn set<T: BorshSerialize>(state_update: &mut TrieUpdate, key: TrieKey, value: &T) {
-    let data = value.try_to_vec().expect("Borsh serializer is not expected to ever fail");
-    state_update.set(key, data);
-}
-
-pub fn set_account(state_update: &mut TrieUpdate, account_id: AccountId, account: &Account) {
-    set(state_update, TrieKey::Account { account_id }, account)
-}
-
-pub fn get_account(
-    state_update: &TrieUpdate,
-    account_id: &AccountId,
-) -> Result<Option<Account>, StorageError> {
-    get(state_update, &TrieKey::Account { account_id: account_id.clone() })
-}
-
-pub fn set_received_data(
-    state_update: &mut TrieUpdate,
-    receiver_id: AccountId,
-    data_id: CryptoHash,
-    data: &ReceivedData,
-) {
-    set(state_update, TrieKey::ReceivedData { receiver_id, data_id }, data);
-}
-
-pub fn get_received_data(
-    state_update: &TrieUpdate,
-    receiver_id: &AccountId,
-    data_id: CryptoHash,
-) -> Result<Option<ReceivedData>, StorageError> {
-    get(state_update, &TrieKey::ReceivedData { receiver_id: receiver_id.clone(), data_id })
-}
-
-pub fn set_postponed_receipt(state_update: &mut TrieUpdate, receipt: &Receipt) {
-    let key = TrieKey::PostponedReceipt {
-        receiver_id: receipt.receiver_id.clone(),
-        receipt_id: receipt.receipt_id,
-    };
-    set(state_update, key, receipt);
-}
-
-pub fn remove_postponed_receipt(
-    state_update: &mut TrieUpdate,
-    receiver_id: &AccountId,
-    receipt_id: CryptoHash,
-) {
-    state_update.remove(TrieKey::PostponedReceipt { receiver_id: receiver_id.clone(), receipt_id });
-}
-
-pub fn get_postponed_receipt(
-    state_update: &TrieUpdate,
-    receiver_id: &AccountId,
-    receipt_id: CryptoHash,
-) -> Result<Option<Receipt>, StorageError> {
-    get(state_update, &TrieKey::PostponedReceipt { receiver_id: receiver_id.clone(), receipt_id })
-}
-
-pub fn get_delayed_receipt_indices(
-    state_update: &TrieUpdate,
-) -> Result<DelayedReceiptIndices, StorageError> {
-    Ok(get(state_update, &TrieKey::DelayedReceiptIndices)?.unwrap_or_default())
-}
-
-pub fn set_access_key(
-    state_update: &mut TrieUpdate,
-    account_id: AccountId,
-    public_key: PublicKey,
-    access_key: &AccessKey,
-) {
-    set(state_update, TrieKey::AccessKey { account_id, public_key }, access_key);
-}
-
-pub fn remove_access_key(
-    state_update: &mut TrieUpdate,
-    account_id: AccountId,
-    public_key: PublicKey,
-) {
-    state_update.remove(TrieKey::AccessKey { account_id, public_key });
-}
-
-pub fn get_access_key(
-    state_update: &TrieUpdate,
-    account_id: &AccountId,
-    public_key: &PublicKey,
-) -> Result<Option<AccessKey>, StorageError> {
-    get(
-        state_update,
-        &TrieKey::AccessKey { account_id: account_id.clone(), public_key: public_key.clone() },
-    )
-}
-
-pub fn get_access_key_raw(
-    state_update: &TrieUpdate,
-    raw_key: &[u8],
-) -> Result<Option<AccessKey>, StorageError> {
-    get(
-        state_update,
-        &trie_key_parsers::parse_trie_key_access_key_from_raw_key(raw_key)
-            .expect("access key in the state should be correct"),
-    )
-}
-
-pub fn set_code(state_update: &mut TrieUpdate, account_id: AccountId, code: &ContractCode) {
-    state_update.set(TrieKey::ContractCode { account_id }, code.code().to_vec());
-}
-
-pub fn get_code(
-    state_update: &TrieUpdate,
-    account_id: &AccountId,
-    code_hash: Option<CryptoHash>,
-) -> Result<Option<ContractCode>, StorageError> {
-    state_update
-        .get(&TrieKey::ContractCode { account_id: account_id.clone() })
-        .map(|opt| opt.map(|code| ContractCode::new(code, code_hash)))
-}
-
-/// Removes account, code and all access keys associated to it.
-pub fn remove_account(
-    state_update: &mut TrieUpdate,
-    account_id: &AccountId,
-) -> Result<(), StorageError> {
-    state_update.remove(TrieKey::Account { account_id: account_id.clone() });
-    state_update.remove(TrieKey::ContractCode { account_id: account_id.clone() });
-
-    // Removing access keys
-    let public_keys = state_update
-        .iter(&trie_key_parsers::get_raw_prefix_for_access_keys(account_id))?
-        .map(|raw_key| {
-            trie_key_parsers::parse_public_key_from_access_key_key(&raw_key?, account_id).map_err(
-                |_e| {
-                    StorageError::StorageInconsistentState(
-                        "Can't parse public key from raw key for AccessKey".to_string(),
-                    )
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for public_key in public_keys {
-        state_update.remove(TrieKey::AccessKey { account_id: account_id.clone(), public_key });
-    }
-
-    // Removing contract data
-    let data_keys = state_update
-        .iter(&trie_key_parsers::get_raw_prefix_for_contract_data(account_id, &[]))?
-        .map(|raw_key| {
-            trie_key_parsers::parse_data_key_from_contract_data_key(&raw_key?, account_id)
-                .map_err(|_e| {
-                    StorageError::StorageInconsistentState(
-                        "Can't parse data key from raw key for ContractData".to_string(),
-                    )
-                })
-                .map(Vec::from)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for key in data_keys {
-        state_update.remove(TrieKey::ContractData { account_id: account_id.clone(), key });
-    }
-    Ok(())
-}
-
-pub fn get_genesis_state_roots(store: &Store) -> Result<Option<Vec<StateRoot>>, std::io::Error> {
-    store.get_ser::<Vec<StateRoot>>(DBCol::ColBlockMisc, GENESIS_STATE_ROOTS_KEY)
-}
-
-pub fn get_genesis_hash(store: &Store) -> Result<Option<CryptoHash>, std::io::Error> {
-    store.get_ser::<CryptoHash>(DBCol::ColBlockMisc, GENESIS_JSON_HASH_KEY)
-}
-
-pub fn set_genesis_hash(store_update: &mut StoreUpdate, genesis_hash: &CryptoHash) {
-    store_update
-        .set_ser::<CryptoHash>(DBCol::ColBlockMisc, GENESIS_JSON_HASH_KEY, genesis_hash)
-        .expect("Borsh cannot fail");
-}
-
-pub fn set_genesis_state_roots(store_update: &mut StoreUpdate, genesis_roots: &Vec<StateRoot>) {
-    store_update
-        .set_ser::<Vec<StateRoot>>(DBCol::ColBlockMisc, GENESIS_STATE_ROOTS_KEY, genesis_roots)
-        .expect("Borsh cannot fail");
-}
-
-pub struct StoreCompiledContractCache {
-    pub store: Arc<Store>,
-}
-
-/// Cache for compiled contracts code using Store for keeping data.
-/// We store contracts in VM-specific format in DBCol::ColCachedContractCode.
-/// Key must take into account VM being used and its configuration, so that
-/// we don't cache non-gas metered binaries, for example.
-impl CompiledContractCache for StoreCompiledContractCache {
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), std::io::Error> {
-        let mut store_update = self.store.store_update();
-        store_update.set(DBCol::ColCachedContractCode, key, value);
-        store_update.commit()
-    }
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, std::io::Error> {
-        self.store.get(DBCol::ColCachedContractCode, key)
-    }
-}
+mod node_storage;
+mod store;
+pub mod trie;
+mod utils;
 
 #[cfg(test)]
 mod tests {
+    use super::{DBCol, NodeStorage, Store};
+
+    fn test_clear_column(store: Store) {
+        assert_eq!(store.get(DBCol::State, &[1; 8]).unwrap(), None);
+        {
+            let mut store_update = store.store_update();
+            store_update.increment_refcount(DBCol::State, &[1; 8], &[1]);
+            store_update.increment_refcount(DBCol::State, &[2; 8], &[2]);
+            store_update.increment_refcount(DBCol::State, &[3; 8], &[3]);
+            store_update.commit().unwrap();
+        }
+        assert_eq!(store.get(DBCol::State, &[1; 8]).unwrap().as_deref(), Some(&[1][..]));
+        {
+            let mut store_update = store.store_update();
+            store_update.delete_all(DBCol::State);
+            store_update.commit().unwrap();
+        }
+        assert_eq!(store.get(DBCol::State, &[1; 8]).unwrap(), None);
+    }
+
     #[test]
-    fn test_no_cache_disabled() {
-        #[cfg(feature = "no_cache")]
-        panic!("no cache is enabled");
+    fn clear_column_rocksdb() {
+        let (_tmp_dir, opener) = NodeStorage::test_opener();
+        test_clear_column(opener.open().unwrap().get_hot_store());
+    }
+
+    #[test]
+    fn clear_column_testdb() {
+        test_clear_column(crate::test_utils::create_test_store());
+    }
+
+    /// Asserts that elements in the vector are sorted.
+    #[track_caller]
+    fn assert_sorted(want_count: usize, keys: Vec<Box<[u8]>>) {
+        assert_eq!(want_count, keys.len());
+        for (pos, pair) in keys.windows(2).enumerate() {
+            let (fst, snd) = (&pair[0], &pair[1]);
+            assert!(fst <= snd, "{fst:?} > {snd:?} at {pos}");
+        }
+    }
+
+    /// Checks that keys are sorted when iterating.
+    fn test_iter_order_impl(store: Store) {
+        use rand::Rng;
+
+        // An arbitrary non-rc non-insert-only column we can write data into.
+        const COLUMN: DBCol = DBCol::RecentOutboundConnections;
+        assert!(!COLUMN.is_rc());
+        assert!(!COLUMN.is_insert_only());
+
+        const COUNT: usize = 10_000;
+        const PREFIXES: [[u8; 4]; 6] =
+            [*b"foo0", *b"foo1", *b"foo2", *b"foo\xff", *b"fop\0", *b"\xff\xff\xff\xff"];
+
+        // Fill column with random keys.  We're inserting multiple sets of keys
+        // with different four-byte prefixes..  Each set is `COUNT` keys (for
+        // total of `PREFIXES.len()*COUNT` keys).
+        let mut rng: rand::rngs::StdRng = rand::SeedableRng::seed_from_u64(0x3243f6a8885a308d);
+        let mut update = store.store_update();
+        let mut buf = [0u8; 20];
+        for prefix in &PREFIXES {
+            buf[..prefix.len()].clone_from_slice(prefix);
+            for _ in 0..COUNT {
+                rng.fill(&mut buf[prefix.len()..]);
+                update.set(COLUMN, &buf, &buf);
+            }
+        }
+        update.commit().unwrap();
+
+        fn collect<'a>(iter: crate::db::DBIterator<'a>) -> Vec<Box<[u8]>> {
+            iter.map(Result::unwrap).map(|(key, _)| key).collect()
+        }
+
+        // Check that full scan produces keys in proper order.
+        assert_sorted(PREFIXES.len() * COUNT, collect(store.iter(COLUMN)));
+        assert_sorted(PREFIXES.len() * COUNT, collect(store.iter_raw_bytes(COLUMN)));
+        assert_sorted(PREFIXES.len() * COUNT, collect(store.iter_prefix(COLUMN, b"")));
+
+        // Check that prefix scan produces keys in proper order.
+        for prefix in &PREFIXES {
+            let keys = collect(store.iter_prefix(COLUMN, prefix));
+            for (pos, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    prefix,
+                    &key[0..4],
+                    "Expected {prefix:?} prefix but got {key:?} key at {pos}"
+                );
+            }
+            assert_sorted(COUNT, keys);
+        }
+    }
+
+    #[test]
+    fn rocksdb_iter_order() {
+        let (_tempdir, opener) = NodeStorage::test_opener();
+        test_iter_order_impl(opener.open().unwrap().get_hot_store());
+    }
+
+    #[test]
+    fn testdb_iter_order() {
+        test_iter_order_impl(crate::test_utils::create_test_store());
+    }
+
+    /// Check saving and reading columns to/from a file.
+    #[test]
+    fn test_save_to_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+
+        {
+            let store = crate::test_utils::create_test_store();
+            let mut store_update = store.store_update();
+            store_update.increment_refcount(DBCol::State, &[1; 8], &[1]);
+            store_update.increment_refcount(DBCol::State, &[2; 8], &[2]);
+            store_update.increment_refcount(DBCol::State, &[2; 8], &[2]);
+            store_update.commit().unwrap();
+            store.save_state_to_file(tmp.path()).unwrap();
+        }
+
+        // Verify expected encoding.
+        {
+            let mut buffer = Vec::new();
+            std::io::Read::read_to_end(tmp.as_file_mut(), &mut buffer).unwrap();
+            #[rustfmt::skip]
+            assert_eq!(&[
+                /* column: */ 0, /* key len: */ 8, 0, 0, 0, /* key: */ 1, 1, 1, 1, 1, 1, 1, 1,
+                                 /* val len: */ 9, 0, 0, 0, /* val: */ 1, 1, 0, 0, 0, 0, 0, 0, 0,
+                /* column: */ 0, /* key len: */ 8, 0, 0, 0, /* key: */ 2, 2, 2, 2, 2, 2, 2, 2,
+                                 /* val len: */ 9, 0, 0, 0, /* val: */ 2, 2, 0, 0, 0, 0, 0, 0, 0,
+                /* end mark: */ 255,
+            ][..], buffer.as_slice());
+        }
+
+        {
+            // Fresh storage, should have no data.
+            let store = crate::test_utils::create_test_store();
+            assert_eq!(None, store.get(DBCol::State, &[1; 8]).unwrap());
+            assert_eq!(None, store.get(DBCol::State, &[2; 8]).unwrap());
+
+            // Read data from file.
+            store.load_state_from_file(tmp.path()).unwrap();
+            assert_eq!(Some(&[1u8][..]), store.get(DBCol::State, &[1; 8]).unwrap().as_deref());
+            assert_eq!(Some(&[2u8][..]), store.get(DBCol::State, &[2; 8]).unwrap().as_deref());
+
+            // Key &[2] should have refcount of two so once decreased it should
+            // still exist.
+            let mut store_update = store.store_update();
+            store_update.decrement_refcount(DBCol::State, &[1; 8]);
+            store_update.decrement_refcount(DBCol::State, &[2; 8]);
+            store_update.commit().unwrap();
+            assert_eq!(None, store.get(DBCol::State, &[1; 8]).unwrap());
+            assert_eq!(Some(&[2u8][..]), store.get(DBCol::State, &[2; 8]).unwrap().as_deref());
+        }
+
+        // Verify detection of corrupt file.
+        let file = std::fs::File::options().write(true).open(tmp.path()).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len.saturating_sub(1)).unwrap();
+        core::mem::drop(file);
+        let store = crate::test_utils::create_test_store();
+        assert_eq!(
+            std::io::ErrorKind::InvalidData,
+            store.load_state_from_file(tmp.path()).unwrap_err().kind()
+        );
     }
 }

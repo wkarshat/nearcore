@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use futures::{future::LocalBoxFuture, FutureExt};
+use futures::{FutureExt, future::LocalBoxFuture};
 
 use near_crypto::{PublicKey, Signer};
 use near_jsonrpc_primitives::errors::ServerError;
 use near_primitives::account::AccessKey;
+use near_primitives::action::delegate::{DelegateAction, NonDelegateAction, SignedDelegateAction};
 use near_primitives::hash::CryptoHash;
 use near_primitives::receipt::Receipt;
+use near_primitives::test_utils::create_user_test_signer;
 use near_primitives::transaction::{
     Action, AddKeyAction, CreateAccountAction, DeleteAccountAction, DeleteKeyAction,
     DeployContractAction, ExecutionOutcome, FunctionCallAction, SignedTransaction, StakeAction,
@@ -23,7 +25,26 @@ pub use crate::user::runtime_user::RuntimeUser;
 pub mod rpc_user;
 pub mod runtime_user;
 
-const POISONED_LOCK_ERR: &str = "The lock was poisoned.";
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitError {
+    Server(ServerError),
+    OutcomeNotFound,
+}
+
+impl std::error::Error for CommitError {}
+impl std::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitError::Server(s) => f.write_fmt(format_args!(
+                "server error occurred while committing a transaction: {}",
+                s
+            )),
+            CommitError::OutcomeNotFound => {
+                f.write_str("transaction outcome not found while committing it (tx invalid...)")
+            }
+        }
+    }
+}
 
 pub trait User {
     fn view_account(&self, account_id: &AccountId) -> Result<AccountView, String>;
@@ -35,6 +56,9 @@ pub trait User {
     fn view_contract_code(&self, account_id: &AccountId) -> Result<ContractCodeView, String>;
 
     fn view_state(&self, account_id: &AccountId, prefix: &[u8]) -> Result<ViewStateResult, String>;
+
+    /// Returns whether the account is locked (has no access keys).
+    fn is_locked(&self, account_id: &AccountId) -> Result<bool, String>;
 
     fn view_call(
         &self,
@@ -48,9 +72,13 @@ pub trait User {
     fn commit_transaction(
         &self,
         signed_transaction: SignedTransaction,
-    ) -> Result<FinalExecutionOutcomeView, ServerError>;
+    ) -> Result<FinalExecutionOutcomeView, CommitError>;
 
-    fn add_receipt(&self, receipt: Receipt) -> Result<(), ServerError>;
+    fn add_receipts(
+        &self,
+        receipts: Vec<Receipt>,
+        _use_flat_storage: bool,
+    ) -> Result<(), ServerError>;
 
     fn get_access_key_nonce_for_signer(&self, account_id: &AccountId) -> Result<u64, String> {
         self.get_access_key(account_id, &self.signer().public_key())
@@ -61,15 +89,15 @@ pub trait User {
 
     fn get_best_block_hash(&self) -> Option<CryptoHash>;
 
-    fn get_block(&self, height: BlockHeight) -> Option<BlockView>;
+    fn get_block_by_height(&self, height: BlockHeight) -> Option<BlockView>;
 
-    fn get_block_by_hash(&self, block_hash: CryptoHash) -> Option<BlockView>;
+    fn get_block(&self, block_hash: CryptoHash) -> Option<BlockView>;
 
-    fn get_chunk(&self, height: BlockHeight, shard_id: ShardId) -> Option<ChunkView>;
+    fn get_chunk_by_height(&self, height: BlockHeight, shard_id: ShardId) -> Option<ChunkView>;
 
-    fn get_transaction_result(&self, hash: &CryptoHash) -> ExecutionOutcomeView;
+    fn get_transaction_result(&self, hash: &CryptoHash) -> Option<ExecutionOutcomeView>;
 
-    fn get_transaction_final_result(&self, hash: &CryptoHash) -> FinalExecutionOutcomeView;
+    fn get_transaction_final_result(&self, hash: &CryptoHash) -> Option<FinalExecutionOutcomeView>;
 
     fn get_state_root(&self) -> CryptoHash;
 
@@ -79,16 +107,16 @@ pub trait User {
         public_key: &PublicKey,
     ) -> Result<AccessKeyView, String>;
 
-    fn signer(&self) -> Arc<dyn Signer>;
+    fn signer(&self) -> Arc<Signer>;
 
-    fn set_signer(&mut self, signer: Arc<dyn Signer>);
+    fn set_signer(&mut self, signer: Arc<Signer>);
 
     fn sign_and_commit_actions(
         &self,
         signer_id: AccountId,
         receiver_id: AccountId,
         actions: Vec<Action>,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         let block_hash = self.get_best_block_hash().unwrap_or_default();
         let signed_transaction = SignedTransaction::from_actions(
             self.get_access_key_nonce_for_signer(&signer_id).unwrap_or_default() + 1,
@@ -97,6 +125,7 @@ pub trait User {
             &*self.signer(),
             actions,
             block_hash,
+            0,
         );
         self.commit_transaction(signed_transaction)
     }
@@ -106,7 +135,7 @@ pub trait User {
         signer_id: AccountId,
         receiver_id: AccountId,
         amount: Balance,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id,
             receiver_id,
@@ -118,7 +147,7 @@ pub trait User {
         &self,
         signer_id: AccountId,
         code: Vec<u8>,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
@@ -134,16 +163,16 @@ pub trait User {
         args: Vec<u8>,
         gas: Gas,
         deposit: Balance,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id,
             contract_id,
-            vec![Action::FunctionCall(FunctionCallAction {
+            vec![Action::FunctionCall(Box::new(FunctionCallAction {
                 method_name: method_name.to_string(),
                 args,
                 gas,
                 deposit,
-            })],
+            }))],
         )
     }
 
@@ -153,14 +182,17 @@ pub trait User {
         new_account_id: AccountId,
         public_key: PublicKey,
         amount: Balance,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id,
             new_account_id,
             vec![
                 Action::CreateAccount(CreateAccountAction {}),
                 Action::Transfer(TransferAction { deposit: amount }),
-                Action::AddKey(AddKeyAction { public_key, access_key: AccessKey::full_access() }),
+                Action::AddKey(Box::new(AddKeyAction {
+                    public_key,
+                    access_key: AccessKey::full_access(),
+                })),
             ],
         )
     }
@@ -170,11 +202,11 @@ pub trait User {
         signer_id: AccountId,
         public_key: PublicKey,
         access_key: AccessKey,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
-            vec![Action::AddKey(AddKeyAction { public_key, access_key })],
+            vec![Action::AddKey(Box::new(AddKeyAction { public_key, access_key }))],
         )
     }
 
@@ -182,11 +214,11 @@ pub trait User {
         &self,
         signer_id: AccountId,
         public_key: PublicKey,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
-            vec![Action::DeleteKey(DeleteKeyAction { public_key })],
+            vec![Action::DeleteKey(Box::new(DeleteKeyAction { public_key }))],
         )
     }
 
@@ -196,13 +228,13 @@ pub trait User {
         old_public_key: PublicKey,
         new_public_key: PublicKey,
         access_key: AccessKey,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
             vec![
-                Action::DeleteKey(DeleteKeyAction { public_key: old_public_key }),
-                Action::AddKey(AddKeyAction { public_key: new_public_key, access_key }),
+                Action::DeleteKey(Box::new(DeleteKeyAction { public_key: old_public_key })),
+                Action::AddKey(Box::new(AddKeyAction { public_key: new_public_key, access_key })),
             ],
         )
     }
@@ -212,7 +244,7 @@ pub trait User {
         signer_id: AccountId,
         receiver_id: AccountId,
         beneficiary_id: AccountId,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id,
             receiver_id,
@@ -224,7 +256,7 @@ pub trait User {
         &self,
         signer_id: AccountId,
         receiver_id: AccountId,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.delete_account_with_beneficiary_set(signer_id.clone(), receiver_id, signer_id)
     }
 
@@ -233,11 +265,48 @@ pub trait User {
         signer_id: AccountId,
         public_key: PublicKey,
         stake: Balance,
-    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
-            vec![Action::Stake(StakeAction { stake, public_key })],
+            vec![Action::Stake(Box::new(StakeAction { stake, public_key }))],
+        )
+    }
+
+    /// Wrap the given actions in a delegate action and execute them.
+    ///
+    /// The signer signs the delegate action to be sent to the receiver. The
+    /// relayer packs that in a transaction and signs it .
+    fn meta_tx(
+        &self,
+        signer_id: AccountId,
+        receiver_id: AccountId,
+        relayer_id: AccountId,
+        actions: Vec<Action>,
+    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+        let inner_signer = create_user_test_signer(&signer_id);
+        let user_nonce = self
+            .get_access_key(&signer_id, &inner_signer.public_key())
+            .expect("failed reading user's nonce for access key")
+            .nonce;
+        let delegate_action = DelegateAction {
+            sender_id: signer_id.clone(),
+            receiver_id,
+            actions: actions
+                .into_iter()
+                .map(|action| NonDelegateAction::try_from(action).unwrap())
+                .collect(),
+            nonce: user_nonce + 1,
+            max_block_height: 100,
+            public_key: inner_signer.public_key(),
+        };
+        let signature = inner_signer.sign(delegate_action.get_nep461_hash().as_bytes());
+        let signed_delegate_action = SignedDelegateAction { delegate_action, signature };
+
+        self.sign_and_commit_actions(
+            relayer_id,
+            signer_id,
+            vec![Action::Delegate(Box::new(signed_delegate_action))],
         )
     }
 }
@@ -266,7 +335,10 @@ pub trait AsyncUser: Send + Sync {
         transaction: SignedTransaction,
     ) -> LocalBoxFuture<'static, Result<(), ServerError>>;
 
-    fn add_receipt(&self, receipt: Receipt) -> LocalBoxFuture<'static, Result<(), ServerError>>;
+    fn add_receipts(
+        &self,
+        receipts: &[Receipt],
+    ) -> LocalBoxFuture<'static, Result<(), ServerError>>;
 
     fn get_account_nonce(
         &self,

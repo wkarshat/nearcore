@@ -1,23 +1,22 @@
-use std::io;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use near_chain::{Block, ChainGenesis, Provenance};
+use integration_tests::env::test_env::TestEnv;
+use near_chain::{Block, Provenance};
 use near_chain_configs::Genesis;
-use near_client::test_utils::TestEnv;
+use near_client::ProcessTxResponse;
 use near_client_primitives::types::Error;
-use near_crypto::InMemorySigner;
+use near_crypto::Signer;
+use near_epoch_manager::EpochManager;
+use near_parameters::RuntimeConfigStore;
 use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::{Action, SignedTransaction};
 use near_primitives::types::{AccountId, BlockHeight, BlockHeightDelta, Gas, Nonce};
-use near_store::create_store;
+use near_store::genesis::initialize_genesis_state;
 use near_store::test_utils::create_test_store;
-use nearcore::TrackedConfig;
-use nearcore::{config::GenesisExt, NightshadeRuntime};
-
-use near_primitives::runtime::config_store::RuntimeConfigStore;
-use serde::{Deserialize, Serialize};
+use near_vm_runner::{ContractRuntimeCache, FilesystemContractRuntimeCache};
+use nearcore::NightshadeRuntime;
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct ScenarioResult<T, E> {
     pub result: std::result::Result<T, E>,
@@ -38,9 +37,9 @@ impl Scenario {
             self.network_config.seeds.iter().map(|x| x.parse().unwrap()).collect();
         let clients = vec![accounts[0].clone()];
         let mut genesis = Genesis::test(accounts, 1);
-        let mut runtime_config = near_primitives::runtime::config::RuntimeConfig::test();
-        runtime_config.wasm_config.limit_config.max_total_prepaid_gas =
-            self.runtime_config.max_total_prepaid_gas;
+        let mut runtime_config = near_parameters::RuntimeConfig::test();
+        let wasm_config = Arc::make_mut(&mut runtime_config.wasm_config);
+        wasm_config.limit_config.max_total_prepaid_gas = self.runtime_config.max_total_prepaid_gas;
         genesis.config.epoch_length = self.runtime_config.epoch_length;
         genesis.config.gas_limit = self.runtime_config.gas_limit;
         let runtime_config_store = RuntimeConfigStore::with_one_config(runtime_config);
@@ -48,22 +47,32 @@ impl Scenario {
         let (tempdir, store) = if self.use_in_memory_store {
             (None, create_test_store())
         } else {
-            let tempdir = tempfile::tempdir()
-                .unwrap_or_else(|err| panic!("failed to create temporary directory: {}", err));
-            let store = create_store(&nearcore::get_store_path(tempdir.path()));
-            (Some(tempdir), store)
+            let (tempdir, opener) = near_store::NodeStorage::test_opener();
+            let store = opener.open().unwrap();
+            (Some(tempdir), store.get_hot_store())
         };
+        let home_dir = tempdir.as_ref().map(|d| d.path());
+        initialize_genesis_state(store.clone(), &genesis, home_dir);
+        let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+        let home_dir = home_dir.unwrap_or_else(|| Path::new("."));
+        let contract_cache = FilesystemContractRuntimeCache::new(home_dir, None::<&str>)
+            .expect("filesystem contract cache")
+            .handle();
+        let runtime = NightshadeRuntime::test_with_runtime_config_store(
+            home_dir,
+            store.clone(),
+            contract_cache,
+            &genesis.config,
+            epoch_manager.clone(),
+            runtime_config_store,
+        );
 
-        let mut env = TestEnv::builder(ChainGenesis::from(&genesis))
+        let mut env = TestEnv::builder(&genesis.config)
             .clients(clients.clone())
             .validators(clients)
-            .runtime_adapters(vec![Arc::new(NightshadeRuntime::test_with_runtime_config_store(
-                if let Some(tempdir) = &tempdir { tempdir.path() } else { Path::new(".") },
-                store,
-                &genesis,
-                TrackedConfig::new_empty(),
-                runtime_config_store,
-            ))])
+            .stores(vec![store])
+            .epoch_managers(vec![epoch_manager])
+            .runtimes(vec![runtime])
             .build();
 
         let result = self.process_blocks(&mut env);
@@ -71,7 +80,7 @@ impl Scenario {
     }
 
     fn process_blocks(&self, env: &mut TestEnv) -> Result<RuntimeStats, Error> {
-        let mut last_block = env.clients[0].chain.get_block_by_height(0).unwrap().clone();
+        let mut last_block = env.clients[0].chain.get_block_by_height(0).unwrap();
 
         let mut runtime_stats = RuntimeStats::default();
 
@@ -81,10 +90,16 @@ impl Scenario {
             for tx in &block.transactions {
                 let signed_tx = tx.to_signed_transaction(&last_block);
                 block_stats.tx_hashes.push(signed_tx.get_hash());
-                env.clients[0].process_tx(signed_tx, false, false);
+                if !self.is_fuzzing {
+                    // fuzzing can generate invalid transactions
+                    assert_eq!(
+                        env.rpc_handlers[0].process_tx(signed_tx, false, false),
+                        ProcessTxResponse::ValidTx
+                    );
+                }
             }
 
-            let start_time = Instant::now();
+            let start_time = cpu_time::ProcessTime::now();
 
             last_block = env.clients[0]
                 .produce_block(block.height)?
@@ -100,47 +115,48 @@ impl Scenario {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scenario {
     pub network_config: NetworkConfig,
     pub runtime_config: RuntimeConfig,
     pub blocks: Vec<BlockConfig>,
     pub use_in_memory_store: bool,
+    pub is_fuzzing: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NetworkConfig {
     pub seeds: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RuntimeConfig {
     pub max_total_prepaid_gas: Gas,
     pub gas_limit: Gas,
     pub epoch_length: BlockHeightDelta,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BlockConfig {
     pub height: BlockHeight,
     pub transactions: Vec<TransactionConfig>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TransactionConfig {
     pub nonce: Nonce,
     pub signer_id: AccountId,
     pub receiver_id: AccountId,
-    pub signer: InMemorySigner,
+    pub signer: Signer,
     pub actions: Vec<Action>,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
 pub struct RuntimeStats {
     pub blocks_stats: Vec<BlockStats>,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
 pub struct BlockStats {
     pub height: u64,
     pub block_production_time: Duration,
@@ -168,6 +184,7 @@ impl TransactionConfig {
             &self.signer,
             self.actions.clone(),
             *last_block.hash(),
+            0,
         )
     }
 }
@@ -185,8 +202,8 @@ mod test {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use log::info;
-    use near_logger_utils::init_test_logger;
+    use near_o11y::testonly::init_test_logger;
+    use tracing::info;
 
     #[test]
     #[ignore]

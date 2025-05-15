@@ -2,6 +2,8 @@
 # Spins up a node, then waits for couple epochs
 # and spins up another node
 # Makes sure that eventually the second node catches up
+#
+# cspell:words notx manytx onetx
 # Three modes:
 #   - notx: no transactions are sent, just checks that
 #     the second node starts and catches up
@@ -24,26 +26,21 @@ assert mode in ['notx', 'onetx', 'manytx']
 
 from cluster import init_cluster, spin_up_node, load_config
 from configured_logger import logger
+import state_sync_lib
 import utils
 
 START_AT_BLOCK = int(sys.argv[2])
 TIMEOUT = 150 + START_AT_BLOCK * 10
 
 config = load_config()
+
+node_config = state_sync_lib.get_state_sync_config_combined()
+
 near_root, node_dirs = init_cluster(
     2, 1, 1, config,
     [["min_gas_price", 0], ["max_inflation_rate", [0, 1]], ["epoch_length", 10],
-     ["block_producer_kickout_threshold", 80]], {
-         0: {
-             "tracked_shards": [0]
-         },
-         1: {
-             "tracked_shards": [0]
-         },
-         2: {
-             "tracked_shards": [0]
-         }
-     })
+     ["block_producer_kickout_threshold", 80]],
+    {x: node_config for x in range(3)})
 
 started = time.time()
 
@@ -109,7 +106,7 @@ if mode == 'manytx':
             % (ctx.get_balances(), ctx.expected_balances))
         time.sleep(1)
 
-    # requery the balances from the newly started node
+    # again query the balances from the newly started node
     ctx.nodes.append(node2)
     ctx.act_to_val = [2, 2, 2]
 

@@ -8,7 +8,6 @@ a local test cluster using neard binary at `../target/debug/neard`.
 There is also some capacity of starting the cluster on remote
 machines.
 
-
 ## Running tests
 
 ### Running tests locally
@@ -43,7 +42,7 @@ used.  The `../nightly/README.md` file describes this is more detail.
 
 The test library has code for executing tests while running the nodes
 on remote Google Cloud machines.  Presumably that code worked in the
-past but I, mina86, haven’t tried it and am a bit sceptical as to
+past but I, mina86, haven’t tried it and am a bit skeptical as to
 whether it is still functional.  Regardless, for anyone who wants to
 try it out, the instructions are as follows:
 
@@ -54,13 +53,12 @@ Prerequisites:
 
 Steps:
 
-1. Choose or upload a near binary here: https://console.cloud.google.com/storage/browser/nearprotocol_nearcore_release?project=near-core
+1. Choose or upload a near binary here: <https://console.cloud.google.com/storage/browser/nearprotocol_nearcore_release?project=near-core>
 2. Fill the binary filename in remote.json.  Modify zones as needed,
    they’ll be used in round-robin manner.
 3. `NEAR_PYTEST_CONFIG=remote.json python tests/...`
 4. Run `python tests/delete_remote_nodes.py` to make sure the remote
    nodes are shut down properly (especially if tests failed early).
-
 
 ## Creating new tests
 
@@ -73,8 +71,15 @@ nightly test set the pull request check will fail.
 Even though this directory is called `pytest`, the tests need to work
 when executed via `python3`.  This means that they need to execute the
 tests when run as the main module rather than just defining the tests
-function.  To make that happen it’s best to define `test_<foo>`
-functions with test bodies and than execute all those functions in
+function.  To make that happen it’s best to implement the tests using
+the python's unittest framework but trigger them manually from within
+the `__main__` condition like so:
+
+    if __name__ == "__main__":
+        unittest.main()
+
+Alternatively, using the legacy way, the tests can be defined as
+`test_<foo>` functions with test bodies and then executed in
 a code fragment guarded by `if __name__ == '__main__'` condition.
 
 If the test operates on the nodes running in a cluster, it will very
@@ -171,7 +176,7 @@ located in `../runtime/near-test-contracts/res` directory.
 The `NAYDUCK=1`, `NIGHTLY_RUNNER=1` and `NAYDUCK_TIMEOUT=<timeout>`
 environment variables are set when tests are run on NayDuck.  If
 necessary and no other option exists, the first two can be used to
-change test’s behaviour to accommodate it running on the testing
+change test’s behavior to accommodate it running on the testing
 infrastructure as opposed to local machine.  Meanwhile,
 `NAYDUCK_TIMEOUT` specifies how much time in seconds test has to run
 before NayDuck decides the test failed.
@@ -199,3 +204,17 @@ to standard output instead.
 
 The command should be executed in the `pytest` directory so that it’ll
 pick up configuration from the `.style.yapf` file.
+
+### Productivity tips
+
+- The nayduck tests often rely on utilities
+located in pytest/lib and are imported using the following statement:
+`sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / 'lib'))`
+In order to make VSCode see that import you can add this path to the python
+extra paths config. In order to do so add the following into the settings file:
+
+```
+    "python.analysis.extraPaths": [
+        "pytest/lib"
+    ]
+```

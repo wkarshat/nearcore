@@ -53,23 +53,13 @@ class Handler(ProxyHandler):
                 self.hash_to_metadata[hash_] = (height, shard_id)
 
             if msg_kind == 'VersionedPartialEncodedChunk':
-                header = msg.Routed.body.VersionedPartialEncodedChunk.inner_header(
+                inner_header = msg.Routed.body.VersionedPartialEncodedChunk.inner_header(
                 )
-                header_version = msg.Routed.body.VersionedPartialEncodedChunk.header_version(
-                )
-                if header_version == 'V3':
-                    height = header.V2.height_created
-                    shard_id = header.V2.shard_id
-                else:
-                    height = header.height_created
-                    shard_id = header.shard_id
+                height = inner_header.height_created
+                shard_id = inner_header.shard_id
 
-                if header_version == 'V1':
-                    hash_ = ShardChunkHeaderV1.chunk_hash(header)
-                elif header_version == 'V2':
-                    hash_ = ShardChunkHeaderV2.chunk_hash(header)
-                elif header_version == 'V3':
-                    hash_ = ShardChunkHeaderV3.chunk_hash(header)
+                hash_ = msg.Routed.body.VersionedPartialEncodedChunk.chunk_hash(
+                )
                 self.hash_to_metadata[hash_] = (height, shard_id)
 
             if msg_kind == 'PartialEncodedChunkRequest':
@@ -91,6 +81,25 @@ class Handler(ProxyHandler):
         return True
 
 
+# TODO(mina86): Make it a utility class
+class Timeout:
+
+    def __init__(self, seconds: float) -> None:
+        if seconds <= 0:
+            raise ValueError('seconds must be positive')
+        self.__start = time.monotonic()
+        self.__end = self.__start + seconds
+
+    def check(self) -> bool:
+        return time.monotonic() < self.__end
+
+    def elapsed_seconds(self) -> float:
+        return time.monotonic() - self.__start
+
+    def left_seconds(self) -> float:
+        return self.__end - time.monotonic()
+
+
 if __name__ == '__main__':
     manager = multiprocessing.Manager()
     hash_to_metadata = manager.dict()
@@ -103,11 +112,23 @@ if __name__ == '__main__':
                 requests=requests,
                 responses=responses))
 
-    started = time.time()
+    timeout = Timeout(TIMEOUT)
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
 
     config = load_config()
+
+    archival_node_config_changes = {
+        "archive": True,
+        "tracked_shards_config": "AllShards",
+        "network": {
+            "ttl_account_id_router": {
+                "secs": 1,
+                "nanos": 0
+            }
+        },
+    }
+
     near_root, node_dirs = init_cluster(
         2,
         3,
@@ -133,32 +154,8 @@ if __name__ == '__main__':
             ],
             ["total_supply", "6120000000000000000000000000000000"]
         ],
-        {
-            4: {
-                "tracked_shards": [0, 1],
-                "archive": True
-            },
-            3: {
-                "archive": True,
-                "tracked_shards": [1],
-                "network": {
-                    "ttl_account_id_router": {
-                        "secs": 1,
-                        "nanos": 0
-                    }
-                }
-            },
-            2: {
-                "archive": True,
-                "tracked_shards": [0],
-                "network": {
-                    "ttl_account_id_router": {
-                        "secs": 1,
-                        "nanos": 0
-                    }
-                }
-            }
-        })
+        # Configure node2, node3, and node4 to be an archival node.
+        {i: archival_node_config_changes for i in [2, 3, 4]})
 
     boot_node = spin_up_node(config, near_root, node_dirs[0], 0, proxy=proxy)
     node1 = spin_up_node(config,
@@ -174,7 +171,7 @@ if __name__ == '__main__':
     logging.info(f'Getting to height {HEIGHTS_BEFORE_ROTATE}')
     utils.wait_for_blocks(boot_node,
                           target=HEIGHTS_BEFORE_ROTATE,
-                          timeout=TIMEOUT)
+                          timeout=timeout.left_seconds())
 
     node2 = spin_up_node(config,
                          near_root,
@@ -211,7 +208,7 @@ if __name__ == '__main__':
 
         logging.info("Waiting for rotation to occur")
         while True:
-            assert time.time() - started < TIMEOUT, get_validators(boot_node)
+            assert timeout.check(), get_validators(boot_node)
             if set(get_validators(boot_node)) == set(expected_vals):
                 break
             else:
@@ -227,47 +224,57 @@ if __name__ == '__main__':
     logging.info(f'Getting to height {target}')
     height_to_sync_to, _ = utils.wait_for_blocks(node2,
                                                  target=target,
-                                                 timeout=TIMEOUT)
+                                                 timeout=timeout.left_seconds())
 
     logging.info("Spinning up one more node")
     node4 = spin_up_node(config, near_root, node_dirs[4], 4, boot_node=node2)
 
-    logging.info("Waiting for the new node to sync. We are %s seconds in" %
-                 (time.time() - started))
+    logging.info('Waiting for the new node to sync.  '
+                 f'We are {timeout.elapsed_seconds()} seconds in')
     while True:
-        assert time.time() - started < TIMEOUT
+        assert timeout.check()
         sync_info = node4.get_status()['sync_info']
         if not sync_info['syncing']:
             new_height = sync_info['latest_block_height']
-            assert new_height > height_to_sync_to, "new height %s height to sync to %s" % (
-                new_height, height_to_sync_to)
+            assert new_height > height_to_sync_to, (
+                f'new height {new_height} height to sync to {height_to_sync_to}'
+            )
             break
         time.sleep(1)
 
     logging.info("Checking the messages sent and received")
 
-    # The first two blocks are certainly more than two epochs in the
-    # past compared to head, and thus should be requested from
-    # archival nodes. Check that it's the case.
-    # Start from 10 to account for possibly skipped blocks while the nodes were starting
-    for h in range(12, HEIGHTS_BEFORE_ROTATE):
-        for shard in [0, 1]:
-            if (h, shard, 2) in requests:
-                assert (h, shard, 2) in responses, h
-                assert (h, shard, 3) not in responses, h
-            elif (h, shard, 3) in requests:
-                assert (h, shard, 3) in responses, h
-                assert (h, shard, 2) not in responses, h
+    # The first two blocks are certainly more than two epochs in the past
+    # compared to head, and thus should be requested from archival nodes. Check
+    # that it's the case.  Start from 10 to account for possibly skipped blocks
+    # while the nodes were starting.
+    for height in range(12, HEIGHTS_BEFORE_ROTATE):
+        for shard in (0, 1):
+            for node in (2, 3):
+                other = 5 - node
+                if (height, shard, node) in requests:
+                    assert (height, shard, node) in responses, (height, shard,
+                                                                node)
+                    assert (height, shard,
+                            other) not in requests, (height, shard, other)
+                    assert (height, shard,
+                            other) not in responses, (height, shard, other)
+                    break
             else:
-                assert False, f"Missing request for shard {shard} in block {h}"
+                assert False, f'Missing request for shard {shard} in block {height}'
 
-    # The last 5 blocks with epoch_length=10 will certainly be in the
-    # same epoch as head, or in the previous epoch, and thus should
-    # be requested from the block producers
-    for h in range(new_height - 5, new_height - 1):
-        for shard in [0, 1]:
-            for producer in [2, 3]:
-                assert (h, shard, producer) in requests, h
-                assert (h, shard, producer) in responses, h
+    # The last 5 blocks with epoch_length=10 will certainly be in the same epoch
+    # as head, or in the previous epoch, and thus should be requested from the
+    # block producers.  Note that in our case block producers are also archival
+    # nodes so we’re again checking nodes 2 and 3.
+    for height in range(new_height - 5, new_height - 1):
+        for shard in (0, 1):
+            found = False
+            for node in (2, 3):
+                if (height, shard, node) in requests:
+                    assert (height, shard, node) in responses, (height, shard,
+                                                                node)
+                    found = True
+            assert found, f'Missing request for shard {shard} in block {height}'
 
-    logging.info("Done. Took %s seconds" % (time.time() - started))
+    logging.info(f'Done.  Took {timeout.elapsed_seconds()} seconds')

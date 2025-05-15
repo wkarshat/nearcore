@@ -26,7 +26,7 @@ def main():
         sys.exit(__doc__.rstrip())
 
 
-GENESIS_REPO_PATH = 'nearcore/res/genesis_config.json'
+GENESIS_REPO_PATH = 'chain/jsonrpc/jsonrpc-tests/res/genesis_config.json'
 REPO_FULL_PATH = pathlib.Path(__file__).resolve().parent.parent.parent
 GENESIS_FULL_PATH = REPO_FULL_PATH / GENESIS_REPO_PATH
 SCRIPT_REPO_PATH = pathlib.Path(__file__).resolve().relative_to(REPO_FULL_PATH)
@@ -34,9 +34,13 @@ SCRIPT_REPO_PATH = pathlib.Path(__file__).resolve().relative_to(REPO_FULL_PATH)
 
 def near_init_genesis():
     with tempfile.TemporaryDirectory() as tempdir:
-        subprocess.check_call(
-            ('cargo', 'run', '-p', 'neard', '--bin', 'neard', '--', '--home',
-             tempdir, 'init', '--chain-id', 'sample'))
+        args = ['--home', tempdir, 'init', '--chain-id', 'sample']
+        prebuilt_neard = os.environ.get("CURRENT_NEARD")
+        if prebuilt_neard is not None:
+            subprocess.check_call([prebuilt_neard] + args)
+        else:
+            subprocess.check_call(
+                ['cargo', 'run', '-p', 'neard', '--bin', 'neard', '--'] + args)
         with open(os.path.join(tempdir, 'genesis.json')) as rd:
             genesis = json.load(rd, object_pairs_hook=collections.OrderedDict)
     genesis['records'] = []

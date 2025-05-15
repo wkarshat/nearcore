@@ -14,10 +14,11 @@ from cluster import start_cluster
 from configured_logger import logger
 import utils
 
-TARGET_HEIGHT = 60
+EPOCH_LENGTH = 20
+TARGET_HEIGHT = EPOCH_LENGTH * 6
 TIMEOUT = 30
 
-consensus_config = {
+nodes_config = {
     "consensus": {
         "min_block_production_delay": {
             "secs": 0,
@@ -31,12 +32,14 @@ consensus_config = {
             "secs": 0,
             "nanos": 400000000
         }
-    }
+    },
+    # Enabling explicitly state sync, default value is False
+    "state_sync_enabled": True
 }
 
 nodes = start_cluster(
     3, 0, 1, None,
-    [["epoch_length", 10], ["num_block_producer_seats", 5],
+    [["epoch_length", EPOCH_LENGTH], ["num_block_producer_seats", 5],
      ["num_block_producer_seats_per_shard", [5]],
      ["total_supply", "4210000000000000000000000000000000"],
      ["validators", 0, "amount", "260000000000000000000000000000000"],
@@ -44,9 +47,9 @@ nodes = start_cluster(
          "records", 0, "Account", "account", "locked",
          "260000000000000000000000000000000"
      ]], {
-         0: consensus_config,
-         1: consensus_config,
-         2: consensus_config
+         0: nodes_config,
+         1: nodes_config,
+         2: nodes_config
      })
 
 logger.info('kill node1 and node2')
@@ -68,4 +71,4 @@ nodes[2].start(boot_node=nodes[2])
 time.sleep(2)
 
 target = nodes[0].get_latest_block().height
-utils.wait_for_blocks(nodes[2], target=target, timeout=TIMEOUT)
+utils.wait_for_blocks(nodes[2], target=target)

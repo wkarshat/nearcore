@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.38.x
+
+* Make `build_streamer_message` public to allow custom indexer to reuse this function (e.g. build an indexer that streams optimistic block finalities, indexer that streams only blocks satisfying some condition, etc.)
+* Add local cache for delayed local receipts to avoid fetching blocks from the node every time we need to find a delayed local receipt
+  * Add metric to watch how far back in the history we went to find a delayed local receipt when cache didn't work
+* Remove unnecessary `#[async_recursion]` from `build_streamer_message` function
+* Clean up some useless debug logs and add more useful ones
+
+## 1.32.x
+
+* Add `nightly` feature to NEAR Indexer Framework to respect this feature for `nearcore` lib (required for `betanet`)
+
+## 1.26.0
+
+* `state_changes` field is moved from the top-level `StreamerMessage` to `IndexerShard` struct to align better with the sharded nature of NEAR protocol. In the future, when nearcore will be able to track only a subset of shards, this API will work naturally, so we take pro-active measures to solidify the APIs
+* All the NEAR Indexer Framework types were extracted to a separate crate `near-indexer-primitives`
+* Increase the streamer size from 16 to 100 in order to increase the speed of streaming messages (affects reindexing jobs)
+
+## Breaking changes
+
+The field `state_changes` is moved from the root of `StreamerMessage`
+to the `IndexerShard.state_changes` and now contains only changes related
+to the specific shard.
+
 ## 0.10.1
 
 * (mainnet only) Add additional handler to inject restored receipts to the block #47317863. See [PR 4248](https://github.com/near/nearcore/pull/4248) for reference
@@ -25,20 +49,21 @@ Since the change of reading genesis method to optimize memory usage. You'd be ab
 ## 0.9.0 (do not use this version, it contains a bug)
 
 * Introduce `IndexerShard` structure which contains corresponding chunks and `IndexerExecutionOutcomeWithReceipt`
-* `receipt` field in `IndexerExecutionOutcomeWithReceipt` is no longer optional as it used to be always set anyway, 
-so now we explicitly communicate this relation ("every outcome has a corresponding receipt") through the type system
+* `receipt` field in `IndexerExecutionOutcomeWithReceipt` is no longer optional as it used to be always set anyway,
+  so now we explicitly communicate this relation ("every outcome has a corresponding receipt") through the type system
 * Introduce `IndexerExecutionOutcomeWithOptionalReceipt` which is the same as `IndexerExecutionOutcomeWithReceipt`
-but with optional `receipt` field.
+  but with optional `receipt` field.
 
 ## Breaking changes
 
 * `IndexerChunkView` doesn't contain field `receipt_execution_outcomes` anymore, this field has been moved to `IndexerShard`
 * `StreamerMessage` structure was aligned more with NEAR Protocol specification and now looks like:
+
   ```
   StreamerMessage {
     block: BlockView,
     shards: Vec<IndexerShard>,
-    state_changes: StateChangesView,  
+    state_changes: StateChangesView,
   }
   ```
 
@@ -64,7 +89,7 @@ created and started on the Indexer implementation, not on the Indexer Framework 
 
 ## Breaking changes
 
-* `StreamerMessage` now contains `StateChangesView` which is an alias for  `Vec<StateChangesWithCauseView>`, previously it contained `StateChangesKindsView`
+* `StreamerMessage` now contains `StateChangesView` which is an alias for `Vec<StateChangesWithCauseView>`, previously it contained `StateChangesKindsView`
 
 ## 0.6.0
 
@@ -73,7 +98,7 @@ created and started on the Indexer implementation, not on the Indexer Framework 
 ## Breaking changes
 
 * `IndexerConfig` was extended with another field `await_for_node_synced`. Corresponding enum is `AwaitForNodeSyncedEnum` with variants:
-  * `WaitForFullSync` - await for node to be fully synced (previous default behaviour)
+  * `WaitForFullSync` - await for node to be fully synced (previous default behavior)
   * `StreamWhileSyncing`- start streaming right away while node is syncing (it's useful in case of Indexing from genesis)
 
 ## 0.5.0
@@ -83,6 +108,7 @@ created and started on the Indexer implementation, not on the Indexer Framework 
 ## Breaking changes
 
 Since #3529 nearcore stores `ExecutionOutcome`s in their execution order, and we can also attribute outcomes to specific chunk. That's why:
+
 * `receipt_execution_outcomes` was moved from `StreamerMessage` to a relevant `IndexerChunkView`
 * `ExecutionOutcomesWithReceipts` type alias was removed (just use `Vec<IndexerExecutionOutcomeWithReceipt>` instead)
 
@@ -93,8 +119,8 @@ Since #3529 nearcore stores `ExecutionOutcome`s in their execution order, and we
 ## Breaking changes
 
 * For local receipt to have a relation to specific chunk we have prepended them to original receipts in particular chunk
-as in the most cases local receipts are executed before normal receipts. That's why there is no reason to have `local_receipts`
-field in `StreamerMessage` struct anymore. `local_receipts` field was removed.
+  as in the most cases local receipts are executed before normal receipts. That's why there is no reason to have `local_receipts`
+  field in `StreamerMessage` struct anymore. `local_receipts` field was removed.
 
 ## 0.3.1
 
@@ -102,11 +128,10 @@ field in `StreamerMessage` struct anymore. `local_receipts` field was removed.
 
 ## 0.3.0
 
-
 ### Breaking changes
 
 * To extended the `receipt_execution_outcomes` with information about the corresponding receipt we had to break the API
-(the old outcome structure is just one layer deeper now [under `execution_outcome` field])
+  (the old outcome structure is just one layer deeper now [under `execution_outcome` field])
 
 ## 0.2.0
 

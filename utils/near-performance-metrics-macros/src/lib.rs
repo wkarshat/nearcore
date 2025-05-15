@@ -1,6 +1,3 @@
-extern crate proc_macro;
-extern crate syn;
-
 use proc_macro::TokenStream;
 use quote::quote;
 
@@ -49,13 +46,11 @@ pub fn perf(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// This function assumes it wraps around a method with `&mut self, msg: NetworkClientMessages,
 /// ctx: &mut Self::Context<Self>` as arguments. There is currently a requirement that the second
 /// argument is called msg. There is an assumption that the argument called `msg` is an enum, which
-/// has `#[derive(AsStaticStr)]`.
+/// has `#[derive(AsRefStr)]`.
 ///
 /// # Examples
 /// ```ignore
-/// use strum::AsStaticStr;
-///
-/// #[derive(AsStaticStr)]
+/// #[derive(strum::AsRefStr)]
 /// pub enum MyMessage {
 ///      ExampleMessage()
 /// }
@@ -79,41 +74,28 @@ fn perf_internal(_attr: TokenStream, item: TokenStream, debug: bool) -> TokenStr
     let item: syn::Item = syn::parse(item).expect("failed to parse input");
 
     if let syn::Item::Fn(mut func) = item {
-        let block = func.clone().block;
-
-        let function_body = quote! { #block };
+        let function_body = func.block;
 
         let new_body: TokenStream = if debug {
-            let b: TokenStream = quote! {
-                fn xxx() {
-                    use near_performance_metrics::stats::measure_performance_with_debug;
+            quote! (
+                {
                     near_performance_metrics::stats::measure_performance_with_debug(std::any::type_name::<Self>(), msg, move |msg| {
                         #function_body
                     })
                 }
-            }.into();
-            b
+            ).into()
         } else {
-            let b: TokenStream = quote! {
-                fn xxx() {
-                    use near_performance_metrics::stats::measure_performance;
-                    near_performance_metrics::stats::measure_performance(std::any::type_name::<Self>(), msg, move |msg| {
+            quote! (
+                {
+                    near_performance_metrics::stats::measure_performance(std::any::type_name::<Self>(), (), move |_| {
                         #function_body
                     })
                 }
-             }.into();
-            b
+             ).into()
         };
+        func.block = syn::parse::<syn::Block>(new_body).expect("failed to parse input").into();
 
-        if let syn::Item::Fn(func2) = syn::parse(new_body).expect("failed to parse input") {
-            func.block = func2.block;
-        } else {
-            panic!("failed to parse example function");
-        }
-
-        let result_item = syn::Item::Fn(func);
-        let output = quote! { #result_item };
-        output.into()
+        quote! ( #func ).into()
     } else {
         panic!("not a function");
     }

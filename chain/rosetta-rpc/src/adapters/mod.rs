@@ -1,40 +1,44 @@
-use std::sync::Arc;
-
 use actix::Addr;
-
 use near_chain_configs::Genesis;
 use near_client::ViewClientActor;
-
+use near_o11y::WithSpanContextExt;
 use validated_operations::ValidatedOperation;
 
+pub(crate) mod nep141;
+pub(crate) mod transactions;
 mod validated_operations;
 
 /// NEAR Protocol defines initial state in genesis records and treats the first
-/// block differently (e.g. it cannot contain any transactions: https://stackoverflow.com/a/63347167/1178806).
+/// block differently (e.g. [it cannot contain any
+/// transactions](https://stackoverflow.com/a/63347167/1178806).
 ///
-/// Genesis records can be huge (order of gigabytes of JSON data), and Rosetta
-/// API does not define any pagination, and suggests to use
-/// `other_transactions` to deal with this: https://community.rosetta-api.org/t/how-to-return-data-without-being-able-to-paginate/98
+/// Genesis records can be huge (order of gigabytes of JSON data).  Rosetta API
+/// doesn’t define any pagination and suggests to use `other_transactions` to
+/// deal with this:
+/// <https://community.rosetta-api.org/t/how-to-return-data-without-being-able-to-paginate/98>
 /// We choose to do a proper implementation for the genesis block later.
 async fn convert_genesis_records_to_transaction(
-    genesis: Arc<Genesis>,
-    view_client_addr: Addr<ViewClientActor>,
+    genesis: &Genesis,
+    view_client_addr: &Addr<ViewClientActor>,
     block: &near_primitives::views::BlockView,
 ) -> crate::errors::Result<crate::models::Transaction> {
-    let genesis_account_ids = genesis.records.as_ref().iter().filter_map(|record| {
+    let mut genesis_account_ids = std::collections::HashSet::new();
+    genesis.for_each_record(|record| {
         if let near_primitives::state_record::StateRecord::Account { account_id, .. } = record {
-            Some(account_id)
-        } else {
-            None
+            genesis_account_ids.insert(account_id.clone());
         }
     });
-    let genesis_accounts = crate::utils::query_accounts(
+    // Collect genesis accounts into a BTreeMap rather than a HashMap so that
+    // the order of accounts is deterministic.  This is needed because we need
+    // operations to be created in deterministic order (so that their indexes
+    // stay the same).
+    let genesis_accounts: std::collections::BTreeMap<_, _> = crate::utils::query_accounts(
         &near_primitives::types::BlockId::Hash(block.header.hash).into(),
-        genesis_account_ids,
-        &view_client_addr,
+        genesis_account_ids.iter(),
+        view_client_addr,
     )
     .await?;
-    let runtime_config = crate::utils::query_protocol_config(block.header.hash, &view_client_addr)
+    let runtime_config = crate::utils::query_protocol_config(block.header.hash, view_client_addr)
         .await?
         .runtime_config;
 
@@ -51,6 +55,7 @@ async fn convert_genesis_records_to_transaction(
                 account: crate::models::AccountIdentifier {
                     address: account_id.clone(),
                     sub_account: None,
+                    metadata: None,
                 },
                 amount: Some(crate::models::Amount::from_yoctonear(account_balances.liquid)),
                 type_: crate::models::OperationType::Transfer,
@@ -66,6 +71,7 @@ async fn convert_genesis_records_to_transaction(
                 account: crate::models::AccountIdentifier {
                     address: account_id.clone(),
                     sub_account: Some(crate::models::SubAccount::LiquidBalanceForStorage.into()),
+                    metadata: None,
                 },
                 amount: Some(crate::models::Amount::from_yoctonear(
                     account_balances.liquid_for_storage,
@@ -83,6 +89,7 @@ async fn convert_genesis_records_to_transaction(
                 account: crate::models::AccountIdentifier {
                     address: account_id.clone(),
                     sub_account: Some(crate::models::SubAccount::Locked.into()),
+                    metadata: None,
                 },
                 amount: Some(crate::models::Amount::from_yoctonear(account_balances.locked)),
                 type_: crate::models::OperationType::Transfer,
@@ -98,6 +105,7 @@ async fn convert_genesis_records_to_transaction(
             &block.header.hash,
         ),
         operations,
+        related_transactions: Vec::new(),
         metadata: crate::models::TransactionMetadata {
             type_: crate::models::TransactionType::Block,
         },
@@ -105,14 +113,22 @@ async fn convert_genesis_records_to_transaction(
 }
 
 pub(crate) async fn convert_block_to_transactions(
-    view_client_addr: Addr<ViewClientActor>,
+    view_client_addr: &Addr<ViewClientActor>,
     block: &near_primitives::views::BlockView,
+    currencies: &Option<Vec<crate::models::Currency>>,
 ) -> crate::errors::Result<Vec<crate::models::Transaction>> {
     let state_changes = view_client_addr
-        .send(near_client::GetStateChangesInBlock { block_hash: block.header.hash })
+        .send(
+            near_client::GetStateChangesInBlock { block_hash: block.header.hash }
+                .with_span_context(),
+        )
         .await?
         .unwrap();
 
+    // TODO(mina86): Do we actually need ‘seen’?  I’m kinda confused at this
+    // point how changes are stored in the database and whether view_client can
+    // return duplicate AccountTouched entries.
+    let mut seen = std::collections::HashSet::new();
     let touched_account_ids = state_changes
         .into_iter()
         .filter_map(|x| {
@@ -122,282 +138,64 @@ pub(crate) async fn convert_block_to_transactions(
                 None
             }
         })
-        .collect::<std::collections::HashSet<_>>();
+        .filter(move |account_id| {
+            // TODO(mina86): Convert this to seen.get_or_insert_with(account_id,
+            // Clone::clone) once hash_set_entry stabilizes.
+            seen.insert(account_id.clone())
+        })
+        .collect::<Vec<_>>();
 
     let prev_block_id = near_primitives::types::BlockReference::from(
         near_primitives::types::BlockId::Hash(block.header.prev_hash),
     );
     let accounts_previous_state =
-        crate::utils::query_accounts(&prev_block_id, touched_account_ids.iter(), &view_client_addr)
+        crate::utils::query_accounts(&prev_block_id, touched_account_ids.iter(), view_client_addr)
             .await?;
 
     let accounts_changes = view_client_addr
-        .send(near_client::GetStateChanges {
-            block_hash: block.header.hash,
-            state_changes_request:
-                near_primitives::views::StateChangesRequestView::AccountChanges {
-                    account_ids: touched_account_ids.into_iter().collect(),
-                },
-        })
+        .send(
+            near_client::GetStateChanges {
+                block_hash: block.header.hash,
+                state_changes_request:
+                    near_primitives::views::StateChangesRequestView::AccountChanges {
+                        account_ids: touched_account_ids,
+                    },
+            }
+            .with_span_context(),
+        )
         .await??;
 
-    let runtime_config = crate::utils::query_protocol_config(block.header.hash, &view_client_addr)
+    let runtime_config = crate::utils::query_protocol_config(block.header.hash, view_client_addr)
         .await?
         .runtime_config;
-    let transactions = convert_block_changes_to_transactions(
+    let exec_to_rx = transactions::ExecutionToReceipts::for_block(
+        &view_client_addr,
+        block.header.hash,
+        currencies,
+    )
+    .await?;
+    transactions::convert_block_changes_to_transactions(
+        view_client_addr,
         &runtime_config,
         &block.header.hash,
         accounts_changes,
         accounts_previous_state,
-    )?;
-    Ok(transactions.into_iter().map(|(_transaction_hash, transaction)| transaction).collect())
-}
-
-/// Constructs a transaction identifier from the cause of a state change.
-fn convert_cause_to_transaction_id(
-    block_hash: &near_primitives::hash::CryptoHash,
-    cause: near_primitives::views::StateChangeCauseView,
-) -> crate::errors::Result<crate::models::TransactionIdentifier> {
-    use crate::models::TransactionIdentifier;
-    use near_primitives::views::StateChangeCauseView;
-    match cause {
-        StateChangeCauseView::TransactionProcessing { tx_hash } => {
-            Ok(TransactionIdentifier::transaction(&tx_hash))
-        }
-        StateChangeCauseView::ActionReceiptProcessingStarted { receipt_hash }
-        | StateChangeCauseView::ActionReceiptGasReward { receipt_hash }
-        | StateChangeCauseView::ReceiptProcessing { receipt_hash }
-        | StateChangeCauseView::PostponedReceipt { receipt_hash } => {
-            Ok(TransactionIdentifier::receipt(&receipt_hash))
-        }
-        StateChangeCauseView::InitialState => {
-            Ok(TransactionIdentifier::block_event("block", block_hash))
-        }
-        StateChangeCauseView::ValidatorAccountsUpdate => {
-            Ok(TransactionIdentifier::block_event("block-validators-update", block_hash))
-        }
-        StateChangeCauseView::UpdatedDelayedReceipts => {
-            Ok(TransactionIdentifier::block_event("block-delayed-receipts", block_hash))
-        }
-        StateChangeCauseView::NotWritableToDisk => {
-            Err(crate::errors::ErrorKind::InternalInvariantError(
-                "State Change 'NotWritableToDisk' should never be observed".to_string(),
-            ))
-        }
-        StateChangeCauseView::Migration => {
-            Ok(TransactionIdentifier::block_event("migration", block_hash))
-        }
-        StateChangeCauseView::Resharding => Err(crate::errors::ErrorKind::InternalInvariantError(
-            "State Change 'Resharding' should never be observed".to_string(),
-        )),
-    }
-}
-
-fn convert_block_changes_to_transactions(
-    runtime_config: &near_primitives::runtime::config::RuntimeConfig,
-    block_hash: &near_primitives::hash::CryptoHash,
-    accounts_changes: near_primitives::views::StateChangesView,
-    mut accounts_previous_state: std::collections::HashMap<
-        near_primitives::types::AccountId,
-        near_primitives::views::AccountView,
-    >,
-) -> crate::errors::Result<std::collections::HashMap<String, crate::models::Transaction>> {
-    let mut transactions = std::collections::HashMap::<String, crate::models::Transaction>::new();
-    for account_change in accounts_changes {
-        let transaction_identifier =
-            convert_cause_to_transaction_id(block_hash, account_change.cause)?;
-        let current_transaction = transactions
-            .entry(transaction_identifier.hash.clone())
-            .or_insert_with(move || crate::models::Transaction {
-                transaction_identifier,
-                operations: vec![],
-                metadata: crate::models::TransactionMetadata {
-                    type_: crate::models::TransactionType::Transaction,
-                },
-            });
-
-        let operations = &mut current_transaction.operations;
-        match account_change.value {
-            near_primitives::views::StateChangeValueView::AccountUpdate { account_id, account } => {
-                let previous_account_state = accounts_previous_state.get(&account_id);
-
-                let previous_account_balances = previous_account_state
-                    .map(|account| {
-                        crate::utils::RosettaAccountBalances::from_account(account, runtime_config)
-                    })
-                    .unwrap_or_else(crate::utils::RosettaAccountBalances::zero);
-
-                let new_account_balances =
-                    crate::utils::RosettaAccountBalances::from_account(&account, runtime_config);
-
-                if previous_account_balances.liquid != new_account_balances.liquid {
-                    operations.push(crate::models::Operation {
-                        operation_identifier: crate::models::OperationIdentifier::new(operations),
-                        related_operations: None,
-                        account: crate::models::AccountIdentifier {
-                            address: account_id.clone().into(),
-                            sub_account: None,
-                        },
-                        amount: Some(crate::models::Amount::from_yoctonear_diff(
-                            crate::utils::SignedDiff::cmp(
-                                previous_account_balances.liquid,
-                                new_account_balances.liquid,
-                            ),
-                        )),
-                        type_: crate::models::OperationType::Transfer,
-                        status: Some(crate::models::OperationStatusKind::Success),
-                        metadata: None,
-                    });
-                }
-
-                if previous_account_balances.liquid_for_storage
-                    != new_account_balances.liquid_for_storage
-                {
-                    operations.push(crate::models::Operation {
-                        operation_identifier: crate::models::OperationIdentifier::new(operations),
-                        related_operations: None,
-                        account: crate::models::AccountIdentifier {
-                            address: account_id.clone().into(),
-                            sub_account: Some(
-                                crate::models::SubAccount::LiquidBalanceForStorage.into(),
-                            ),
-                        },
-                        amount: Some(crate::models::Amount::from_yoctonear_diff(
-                            crate::utils::SignedDiff::cmp(
-                                previous_account_balances.liquid_for_storage,
-                                new_account_balances.liquid_for_storage,
-                            ),
-                        )),
-                        type_: crate::models::OperationType::Transfer,
-                        status: Some(crate::models::OperationStatusKind::Success),
-                        metadata: None,
-                    });
-                }
-
-                if previous_account_balances.locked != new_account_balances.locked {
-                    operations.push(crate::models::Operation {
-                        operation_identifier: crate::models::OperationIdentifier::new(operations),
-                        related_operations: None,
-                        account: crate::models::AccountIdentifier {
-                            address: account_id.clone().into(),
-                            sub_account: Some(crate::models::SubAccount::Locked.into()),
-                        },
-                        amount: Some(crate::models::Amount::from_yoctonear_diff(
-                            crate::utils::SignedDiff::cmp(
-                                previous_account_balances.locked,
-                                new_account_balances.locked,
-                            ),
-                        )),
-                        type_: crate::models::OperationType::Transfer,
-                        status: Some(crate::models::OperationStatusKind::Success),
-                        metadata: None,
-                    });
-                }
-
-                accounts_previous_state.insert(account_id, account);
-            }
-
-            near_primitives::views::StateChangeValueView::AccountDeletion { account_id } => {
-                let previous_account_state = accounts_previous_state.get(&account_id);
-
-                let previous_account_balances =
-                    if let Some(previous_account_state) = previous_account_state {
-                        crate::utils::RosettaAccountBalances::from_account(
-                            previous_account_state,
-                            runtime_config,
-                        )
-                    } else {
-                        continue;
-                    };
-                let new_account_balances = crate::utils::RosettaAccountBalances::zero();
-
-                if previous_account_balances.liquid != new_account_balances.liquid {
-                    operations.push(crate::models::Operation {
-                        operation_identifier: crate::models::OperationIdentifier::new(operations),
-                        related_operations: None,
-                        account: crate::models::AccountIdentifier {
-                            address: account_id.clone().into(),
-                            sub_account: None,
-                        },
-                        amount: Some(crate::models::Amount::from_yoctonear_diff(
-                            crate::utils::SignedDiff::cmp(
-                                previous_account_balances.liquid,
-                                new_account_balances.liquid,
-                            ),
-                        )),
-                        type_: crate::models::OperationType::Transfer,
-                        status: Some(crate::models::OperationStatusKind::Success),
-                        metadata: None,
-                    });
-                }
-
-                if previous_account_balances.liquid_for_storage
-                    != new_account_balances.liquid_for_storage
-                {
-                    operations.push(crate::models::Operation {
-                        operation_identifier: crate::models::OperationIdentifier::new(operations),
-                        related_operations: None,
-                        account: crate::models::AccountIdentifier {
-                            address: account_id.clone().into(),
-                            sub_account: Some(
-                                crate::models::SubAccount::LiquidBalanceForStorage.into(),
-                            ),
-                        },
-                        amount: Some(crate::models::Amount::from_yoctonear_diff(
-                            crate::utils::SignedDiff::cmp(
-                                previous_account_balances.liquid_for_storage,
-                                new_account_balances.liquid_for_storage,
-                            ),
-                        )),
-                        type_: crate::models::OperationType::Transfer,
-                        status: Some(crate::models::OperationStatusKind::Success),
-                        metadata: None,
-                    });
-                }
-
-                if previous_account_balances.locked != new_account_balances.locked {
-                    operations.push(crate::models::Operation {
-                        operation_identifier: crate::models::OperationIdentifier::new(operations),
-                        related_operations: None,
-                        account: crate::models::AccountIdentifier {
-                            address: account_id.clone().into(),
-                            sub_account: Some(crate::models::SubAccount::Locked.into()),
-                        },
-                        amount: Some(crate::models::Amount::from_yoctonear_diff(
-                            crate::utils::SignedDiff::cmp(
-                                previous_account_balances.locked,
-                                new_account_balances.locked,
-                            ),
-                        )),
-                        type_: crate::models::OperationType::Transfer,
-                        status: Some(crate::models::OperationStatusKind::Success),
-                        metadata: None,
-                    });
-                }
-
-                accounts_previous_state.remove(&account_id);
-            }
-            unexpected_value => {
-                return Err(crate::errors::ErrorKind::InternalInvariantError(format!(
-                    "queried AccountChanges, but received {:?}.",
-                    unexpected_value
-                )))
-            }
-        }
-    }
-
-    Ok(transactions)
+        exec_to_rx,
+    )
+    .await
+    .map(|dict| dict.into_values().collect())
 }
 
 pub(crate) async fn collect_transactions(
-    genesis: Arc<Genesis>,
-    view_client_addr: Addr<ViewClientActor>,
+    genesis: &Genesis,
+    view_client_addr: &Addr<ViewClientActor>,
     block: &near_primitives::views::BlockView,
+    currencies: &Option<Vec<crate::models::Currency>>,
 ) -> crate::errors::Result<Vec<crate::models::Transaction>> {
     if block.header.prev_hash == Default::default() {
         Ok(vec![convert_genesis_records_to_transaction(genesis, view_client_addr, block).await?])
     } else {
-        convert_block_to_transactions(view_client_addr, block).await
+        convert_block_to_transactions(view_client_addr, block, currencies).await
     }
 }
 
@@ -411,7 +209,7 @@ pub(crate) async fn collect_transactions(
 /// There are some helper Operation Types defined since a single operation
 /// has only a single "account" field, so to indicate "sender" and "receiver"
 /// we use two operations (e.g. InitiateAddKey and AddKey).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NearActions {
     pub sender_account_id: near_primitives::types::AccountId,
     pub receiver_account_id: near_primitives::types::AccountId,
@@ -536,6 +334,7 @@ impl From<NearActions> for Vec<crate::models::Operation> {
                         validated_operations::TransferOperation {
                             account: sender_account_identifier.clone(),
                             amount: -transfer_amount.clone(),
+                            predecessor_id: Some(sender_account_identifier.clone()),
                         }
                         .into_operation(sender_transfer_operation_id.clone()),
                     );
@@ -544,6 +343,7 @@ impl From<NearActions> for Vec<crate::models::Operation> {
                         validated_operations::TransferOperation {
                             account: receiver_account_identifier.clone(),
                             amount: transfer_amount,
+                            predecessor_id: Some(sender_account_identifier.clone()),
                         }
                         .into_related_operation(
                             crate::models::OperationIdentifier::new(&operations),
@@ -553,18 +353,6 @@ impl From<NearActions> for Vec<crate::models::Operation> {
                 }
 
                 near_primitives::transaction::Action::Stake(action) => {
-                    operations.push(
-                        validated_operations::StakeOperation {
-                            account: receiver_account_identifier.clone(),
-                            amount: action.stake,
-                            public_key: (&action.public_key).into(),
-                        }
-                        .into_operation(crate::models::OperationIdentifier::new(&operations)),
-                    );
-                }
-
-                #[cfg(feature = "protocol_feature_chunk_only_producers")]
-                near_primitives::transaction::Action::StakeChunkOnly(action) => {
                     operations.push(
                         validated_operations::StakeOperation {
                             account: receiver_account_identifier.clone(),
@@ -608,6 +396,7 @@ impl From<NearActions> for Vec<crate::models::Operation> {
                             validated_operations::TransferOperation {
                                 account: sender_account_identifier.clone(),
                                 amount: -attached_amount.clone(),
+                                predecessor_id: Some(sender_account_identifier.clone()),
                             }
                             .into_operation(fund_transfer_operation_id.clone()),
                         );
@@ -637,6 +426,67 @@ impl From<NearActions> for Vec<crate::models::Operation> {
                     );
                     operations.push(deploy_contract_operation);
                 }
+                near_primitives::transaction::Action::Delegate(action) => {
+                    let initiate_signed_delegate_action_operation_id =
+                        crate::models::OperationIdentifier::new(&operations);
+                    operations.push(
+                        validated_operations::InitiateSignedDelegateActionOperation {
+                            sender_account: sender_account_identifier.clone(),
+                        }
+                        .into_operation(initiate_signed_delegate_action_operation_id.clone()),
+                    );
+
+                    let signed_delegate_action_operation_id =
+                        crate::models::OperationIdentifier::new(&operations);
+
+                    operations.push(
+                        validated_operations::signed_delegate_action::SignedDelegateActionOperation {
+                            receiver_id: receiver_account_identifier.clone(),
+                            signature: action.signature,
+                        }
+                        .into_related_operation(
+                            signed_delegate_action_operation_id.clone(),
+                            vec![initiate_signed_delegate_action_operation_id],
+                        )
+                    );
+
+                    let initiate_delegate_action_operation_id =
+                        crate::models::OperationIdentifier::new(&operations);
+
+                    operations.push(validated_operations::initiate_delegate_action::InitiateDelegateActionOperation{
+                        sender_account: action.delegate_action.sender_id.clone().into()
+                    }.into_related_operation(initiate_delegate_action_operation_id.clone(), vec![signed_delegate_action_operation_id]));
+
+                    let delegate_action_operation_id =
+                        crate::models::OperationIdentifier::new(&operations);
+                    let delegate_action_operation: validated_operations::DelegateActionOperation =
+                        action.delegate_action.clone().into();
+
+                    operations.push(delegate_action_operation.into_related_operation(
+                        delegate_action_operation_id,
+                        vec![initiate_delegate_action_operation_id],
+                    ));
+
+                    // We know that there are no delegate actions inside so this is guaranteed to
+                    // be a single-level recursion.
+                    let delegated_operations: Vec<crate::models::Operation> = NearActions {
+                        sender_account_id: action.delegate_action.sender_id.clone(),
+                        receiver_account_id: action.delegate_action.receiver_id.clone(),
+                        actions: action
+                            .delegate_action
+                            .actions
+                            .into_iter()
+                            .map(|a| a.into())
+                            .collect::<Vec<near_primitives::transaction::Action>>(),
+                    }
+                    .into();
+
+                    operations.extend(delegated_operations);
+                } // TODO(#8469): Implement delegate action support, for now they are ignored.
+                near_primitives::transaction::Action::DeployGlobalContract(_)
+                | near_primitives::transaction::Action::UseGlobalContract(_) => {
+                    // TODO(#12639): Implement global contracts support, ignored for now.
+                }
             }
         }
         operations
@@ -653,12 +503,15 @@ impl TryFrom<Vec<crate::models::Operation>> for NearActions {
     /// Operations. The implementations are bijective (there is a test below).
     fn try_from(operations: Vec<crate::models::Operation>) -> Result<Self, Self::Error> {
         let mut sender_account_id = crate::utils::InitializeOnce::new(
-            "A single transaction cannot be send from multiple senders",
+            "A single transaction cannot be sent from multiple senders",
         );
         let mut receiver_account_id = crate::utils::InitializeOnce::new(
-            "A single transaction cannot be send to multiple recipients",
+            "A single transaction cannot be sent to multiple recipients",
         );
-        let mut actions = vec![];
+        let mut delegate_proxy_account_id = crate::utils::InitializeOnce::new(
+            "A single transaction cannot be sent by multiple proxies",
+        );
+        let mut actions: Vec<near_primitives::transaction::Action> = vec![];
 
         // Iterate over operations backwards to handle the related operations
         let mut operations = operations.into_iter().rev();
@@ -763,8 +616,7 @@ impl TryFrom<Vec<crate::models::Operation>> for NearActions {
                     if !receiver_transfer_operation.amount.value.is_positive() {
                         return Err(crate::errors::ErrorKind::InvalidInput(
                             "Receiver TRANSFER operations must have positive `amount`".to_string(),
-                        )
-                        .into());
+                        ));
                     }
 
                     let sender_transfer_operation =
@@ -852,12 +704,10 @@ impl TryFrom<Vec<crate::models::Operation>> for NearActions {
                             return Err(crate::errors::ErrorKind::InvalidInput(
                                 "The sum of amounts of Sender TRANSFER and Receiver FUNCTION_CALL operations must be zero"
                                     .to_string(),
-                            )
-                            .into());
+                            ));
                         }
                         sender_account_id.try_set(&transfer_operation.account)?;
                     }
-
                     actions.push(
                         near_primitives::transaction::FunctionCallAction {
                             method_name: function_call_operation.method_name,
@@ -868,18 +718,79 @@ impl TryFrom<Vec<crate::models::Operation>> for NearActions {
                         .into(),
                     )
                 }
+                crate::models::OperationType::DelegateAction => {
+                    let delegate_action_operation =
+                        validated_operations::delegate_action::DelegateActionOperation::try_from(
+                            tail_operation,
+                        )?;
 
+                    let initiate_delegate_action_operation = validated_operations::initiate_delegate_action::InitiateDelegateActionOperation::try_from_option(operations.next())?;
+
+                    let signed_delegate_action_operation = validated_operations::signed_delegate_action::SignedDelegateActionOperation::try_from_option(operations.next())?;
+                    // the "sender" of this group of operations is considered to be the delegating account, not the proxy
+                    sender_account_id.try_set(&signed_delegate_action_operation.receiver_id)?;
+
+                    let initiate_signed_delegate_action_operation = validated_operations::initiate_signed_delegate_action::InitiateSignedDelegateActionOperation::try_from_option(operations.next())?;
+                    delegate_proxy_account_id
+                        .try_set(&initiate_signed_delegate_action_operation.sender_account)?;
+
+                    let delegate_action: near_primitives::transaction::Action =
+                        near_primitives::action::delegate::SignedDelegateAction {
+                            delegate_action: near_primitives::action::delegate::DelegateAction {
+                                sender_id: initiate_delegate_action_operation
+                                    .sender_account
+                                    .address
+                                    .into(),
+                                receiver_id: delegate_action_operation.receiver_id.address.into(),
+                                actions: {
+                                    let mut non_delegate_actions = vec![];
+                                    for action in actions {
+                                        non_delegate_actions.push(match action.try_into() {
+                                            Ok(a) => a,
+                                            Err(_) => {
+                                                return Err(
+                                                    crate::errors::ErrorKind::InvalidInput(
+                                                        "Nested delegate actions not allowed"
+                                                            .to_string(),
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    non_delegate_actions
+                                },
+                                nonce: delegate_action_operation.nonce,
+                                max_block_height: delegate_action_operation.max_block_height,
+                                public_key: match (&delegate_action_operation.public_key).try_into()
+                                {
+                                    Ok(o) => o,
+                                    Err(_) => {
+                                        return Err(crate::errors::ErrorKind::InvalidInput(
+                                            "Invalid public key on delegate action".to_string(),
+                                        ));
+                                    }
+                                },
+                            },
+                            signature: signed_delegate_action_operation.signature,
+                        }
+                        .into();
+
+                    actions = vec![delegate_action];
+                }
                 crate::models::OperationType::InitiateCreateAccount
                 | crate::models::OperationType::InitiateDeleteAccount
                 | crate::models::OperationType::InitiateAddKey
                 | crate::models::OperationType::InitiateDeleteKey
                 | crate::models::OperationType::InitiateDeployContract
                 | crate::models::OperationType::InitiateFunctionCall
+                | crate::models::OperationType::SignedDelegateAction
+                | crate::models::OperationType::InitiateSignedDelegateAction
+                | crate::models::OperationType::InitiateDelegateAction
                 | crate::models::OperationType::DeleteAccount => {
                     return Err(crate::errors::ErrorKind::InvalidInput(format!(
                         "Unexpected operation `{:?}`",
                         tail_operation.type_
-                    )))
+                    )));
                 }
             }
         }
@@ -897,12 +808,25 @@ impl TryFrom<Vec<crate::models::Operation>> for NearActions {
             })?
             .address
             .into();
+
+        let delegate_proxy_account_id: Option<near_account_id::AccountId> =
+            delegate_proxy_account_id.into_inner().map(|a| a.address.into());
+        let sender_account_id: Option<near_account_id::AccountId> =
+            sender_account_id.into_inner().map(|a| a.address.into());
+
+        let actual_receiver_account_id = if delegate_proxy_account_id.is_some() {
+            sender_account_id.clone().unwrap_or_else(|| receiver_account_id.clone())
+        } else {
+            receiver_account_id.clone()
+        };
+        let actual_sender_account_id =
+            delegate_proxy_account_id.or_else(|| sender_account_id.clone()).unwrap_or_else(|| {
+                // in case of reflexive action
+                receiver_account_id.clone()
+            });
         Ok(Self {
-            sender_account_id: sender_account_id
-                .into_inner()
-                .map(|account_identifier| account_identifier.address.into())
-                .unwrap_or_else(|| receiver_account_id.clone()),
-            receiver_account_id,
+            sender_account_id: actual_sender_account_id,
+            receiver_account_id: actual_receiver_account_id,
             actions,
         })
     }
@@ -910,178 +834,72 @@ impl TryFrom<Vec<crate::models::Operation>> for NearActions {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-
-    #[test]
-    fn test_convert_block_changes_to_transactions() {
-        let runtime_config = near_primitives::runtime::config::RuntimeConfig::test();
-        let block_hash = near_primitives::hash::CryptoHash::default();
-        let nfvalidator1_receipt_processing_hash = near_primitives::hash::CryptoHash([1u8; 32]);
-        let nfvalidator2_action_receipt_gas_reward_hash =
-            near_primitives::hash::CryptoHash([2u8; 32]);
-        let accounts_changes = vec![
-            near_primitives::views::StateChangeWithCauseView {
-                cause: near_primitives::views::StateChangeCauseView::ValidatorAccountsUpdate,
-                value: near_primitives::views::StateChangeValueView::AccountUpdate {
-                    account_id: "nfvalidator1.near".parse().unwrap(),
-                    account: near_primitives::views::AccountView {
-                        amount: 5000000000000000000,
-                        code_hash: near_primitives::hash::CryptoHash::default(),
-                        locked: 400000000000000000000000000000,
-                        storage_paid_at: 0,
-                        storage_usage: 200000,
-                    },
-                },
-            },
-            near_primitives::views::StateChangeWithCauseView {
-                cause: near_primitives::views::StateChangeCauseView::ReceiptProcessing {
-                    receipt_hash: nfvalidator1_receipt_processing_hash,
-                },
-                value: near_primitives::views::StateChangeValueView::AccountUpdate {
-                    account_id: "nfvalidator1.near".parse().unwrap(),
-                    account: near_primitives::views::AccountView {
-                        amount: 4000000000000000000,
-                        code_hash: near_primitives::hash::CryptoHash::default(),
-                        locked: 400000000000000000000000000000,
-                        storage_paid_at: 0,
-                        storage_usage: 200000,
-                    },
-                },
-            },
-            near_primitives::views::StateChangeWithCauseView {
-                cause: near_primitives::views::StateChangeCauseView::ValidatorAccountsUpdate,
-                value: near_primitives::views::StateChangeValueView::AccountUpdate {
-                    account_id: "nfvalidator2.near".parse().unwrap(),
-                    account: near_primitives::views::AccountView {
-                        amount: 7000000000000000000,
-                        code_hash: near_primitives::hash::CryptoHash::default(),
-                        locked: 400000000000000000000000000000,
-                        storage_paid_at: 0,
-                        storage_usage: 200000,
-                    },
-                },
-            },
-            near_primitives::views::StateChangeWithCauseView {
-                cause: near_primitives::views::StateChangeCauseView::ActionReceiptGasReward {
-                    receipt_hash: nfvalidator2_action_receipt_gas_reward_hash,
-                },
-                value: near_primitives::views::StateChangeValueView::AccountUpdate {
-                    account_id: "nfvalidator2.near".parse().unwrap(),
-                    account: near_primitives::views::AccountView {
-                        amount: 8000000000000000000,
-                        code_hash: near_primitives::hash::CryptoHash::default(),
-                        locked: 400000000000000000000000000000,
-                        storage_paid_at: 0,
-                        storage_usage: 200000,
-                    },
-                },
-            },
-        ];
-        let mut accounts_previous_state = std::collections::HashMap::new();
-        accounts_previous_state.insert(
-            "nfvalidator1.near".parse().unwrap(),
-            near_primitives::views::AccountView {
-                amount: 4000000000000000000,
-                code_hash: near_primitives::hash::CryptoHash::default(),
-                locked: 400000000000000000000000000000,
-                storage_paid_at: 0,
-                storage_usage: 200000,
-            },
-        );
-        accounts_previous_state.insert(
-            "nfvalidator2.near".parse().unwrap(),
-            near_primitives::views::AccountView {
-                amount: 6000000000000000000,
-                code_hash: near_primitives::hash::CryptoHash::default(),
-                locked: 400000000000000000000000000000,
-                storage_paid_at: 0,
-                storage_usage: 200000,
-            },
-        );
-        let transactions = convert_block_changes_to_transactions(
-            &runtime_config,
-            &block_hash,
-            accounts_changes,
-            accounts_previous_state,
-        )
-        .unwrap();
-        assert_eq!(transactions.len(), 3);
-        assert!(transactions.iter().all(|(transaction_hash, transaction)| {
-            &transaction.transaction_identifier.hash == transaction_hash
-        }));
-
-        let validators_update_transaction =
-            &transactions[&format!("block-validators-update:{}", block_hash)];
-        insta::assert_debug_snapshot!(
-            "validators_update_transaction",
-            validators_update_transaction
-        );
-
-        let nfvalidator1_receipt_processing_transaction =
-            &transactions[&format!("receipt:{}", nfvalidator1_receipt_processing_hash)];
-        insta::assert_debug_snapshot!(
-            "nfvalidator1_receipt_processing_transaction",
-            nfvalidator1_receipt_processing_transaction
-        );
-
-        let nfvalidator2_action_receipt_gas_reward_transaction =
-            &transactions[&format!("receipt:{}", nfvalidator2_action_receipt_gas_reward_hash)];
-        insta::assert_debug_snapshot!(
-            "nfvalidator2_action_receipt_gas_reward_transaction",
-            nfvalidator2_action_receipt_gas_reward_transaction
-        );
-    }
+    use near_crypto::{KeyType, SecretKey};
+    use near_primitives::action::delegate::{DelegateAction, SignedDelegateAction};
+    use near_primitives::transaction::{Action, TransferAction};
 
     #[test]
     fn test_near_actions_bijection() {
         let create_account_actions =
             vec![near_primitives::transaction::CreateAccountAction {}.into()];
-        let delete_account_actions = vec![near_primitives::transaction::DeleteAccountAction {
-            beneficiary_id: "beneficiary.near".parse().unwrap(),
-        }
-        .into()];
-        let add_key_actions = vec![near_primitives::transaction::AddKeyAction {
-            access_key: near_primitives::account::AccessKey::full_access(),
-            public_key: near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)
-                .public_key(),
-        }
-        .into()];
-        let delete_key_actions = vec![near_primitives::transaction::DeleteKeyAction {
-            public_key: near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)
-                .public_key(),
-        }
-        .into()];
-        let transfer_actions = vec![near_primitives::transaction::TransferAction {
-            deposit: near_primitives::types::Balance::MAX,
-        }
-        .into()];
-        let stake_actions = vec![near_primitives::transaction::StakeAction {
-            stake: 456,
-            public_key: near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)
-                .public_key(),
-        }
-        .into()];
-        let deploy_contract_actions = vec![near_primitives::transaction::DeployContractAction {
-            code: b"binary-data".to_vec(),
-        }
-        .into()];
-        let function_call_without_balance_actions =
-            vec![near_primitives::transaction::FunctionCallAction {
+        let delete_account_actions = vec![
+            near_primitives::transaction::DeleteAccountAction {
+                beneficiary_id: "beneficiary.near".parse().unwrap(),
+            }
+            .into(),
+        ];
+        let add_key_actions = vec![
+            near_primitives::transaction::AddKeyAction {
+                access_key: near_primitives::account::AccessKey::full_access(),
+                public_key: near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)
+                    .public_key(),
+            }
+            .into(),
+        ];
+        let delete_key_actions = vec![
+            near_primitives::transaction::DeleteKeyAction {
+                public_key: near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)
+                    .public_key(),
+            }
+            .into(),
+        ];
+        let transfer_actions = vec![
+            near_primitives::transaction::TransferAction {
+                deposit: near_primitives::types::Balance::MAX,
+            }
+            .into(),
+        ];
+        let stake_actions = vec![
+            near_primitives::transaction::StakeAction {
+                stake: 456,
+                public_key: near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)
+                    .public_key(),
+            }
+            .into(),
+        ];
+        let deploy_contract_actions = vec![
+            near_primitives::transaction::DeployContractAction { code: b"binary-data".to_vec() }
+                .into(),
+        ];
+        let function_call_without_balance_actions = vec![
+            near_primitives::transaction::FunctionCallAction {
                 method_name: "method-name".parse().unwrap(),
                 args: b"args".to_vec(),
                 gas: 100500,
                 deposit: 0,
             }
-            .into()];
-        let function_call_with_balance_actions =
-            vec![near_primitives::transaction::FunctionCallAction {
+            .into(),
+        ];
+        let function_call_with_balance_actions = vec![
+            near_primitives::transaction::FunctionCallAction {
                 method_name: "method-name".parse().unwrap(),
                 args: b"args".to_vec(),
                 gas: 100500,
                 deposit: near_primitives::types::Balance::MAX,
             }
-            .into()];
+            .into(),
+        ];
 
         let wallet_style_create_account_actions =
             [create_account_actions.to_vec(), add_key_actions.to_vec(), transfer_actions.to_vec()]
@@ -1159,6 +977,37 @@ mod tests {
     }
 
     #[test]
+    fn test_delegate_actions_bijection() {
+        // dummy key
+        let sk = SecretKey::from_seed(KeyType::ED25519, "");
+
+        let original_near_actions = NearActions {
+            sender_account_id: "proxy.near".parse().unwrap(),
+            receiver_account_id: "account.near".parse().unwrap(),
+            actions: vec![Action::Delegate(Box::new(SignedDelegateAction {
+                delegate_action: DelegateAction {
+                    sender_id: "account.near".parse().unwrap(),
+                    receiver_id: "receiver.near".parse().unwrap(),
+                    actions: vec![
+                        Action::Transfer(TransferAction { deposit: 1 }).try_into().unwrap(),
+                    ],
+                    nonce: 0,
+                    max_block_height: 0,
+                    public_key: sk.public_key(),
+                },
+                signature: sk.sign(&[0]),
+            }))],
+        };
+
+        let operations: Vec<crate::models::Operation> =
+            original_near_actions.clone().try_into().unwrap();
+
+        let converted_near_actions = NearActions::try_from(operations).unwrap();
+
+        assert_eq!(converted_near_actions, original_near_actions);
+    }
+
+    #[test]
     fn test_near_actions_invalid_transfer_no_amount() {
         let operations = vec![crate::models::Operation {
             type_: crate::models::OperationType::Transfer,
@@ -1213,8 +1062,8 @@ mod tests {
                 type_: crate::models::OperationType::Transfer,
                 account: "receiver.near".parse().unwrap(),
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
-                operation_identifier: receiver_transfer_operation_id.clone(),
-                related_operations: Some(vec![sender_transfer_operation_id.clone()]),
+                operation_identifier: receiver_transfer_operation_id,
+                related_operations: Some(vec![sender_transfer_operation_id]),
                 status: None,
                 metadata: None,
             },
@@ -1246,8 +1095,8 @@ mod tests {
                 type_: crate::models::OperationType::Transfer,
                 account: "receiver.near".parse().unwrap(),
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
-                operation_identifier: receiver_transfer_operation_id.clone(),
-                related_operations: Some(vec![sender_transfer_operation_id.clone()]),
+                operation_identifier: receiver_transfer_operation_id,
+                related_operations: Some(vec![sender_transfer_operation_id]),
                 status: None,
                 metadata: None,
             },
@@ -1279,8 +1128,8 @@ mod tests {
                 type_: crate::models::OperationType::Transfer,
                 account: "receiver.near".parse().unwrap(),
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
-                operation_identifier: receiver_transfer_operation_id.clone(),
-                related_operations: Some(vec![sender_transfer_operation_id.clone()]),
+                operation_identifier: receiver_transfer_operation_id,
+                related_operations: Some(vec![sender_transfer_operation_id]),
                 status: None,
                 metadata: None,
             },
@@ -1312,8 +1161,8 @@ mod tests {
                 type_: crate::models::OperationType::Transfer,
                 account: "receiver.near".parse().unwrap(),
                 amount: Some(crate::models::Amount::from_yoctonear(0)),
-                operation_identifier: receiver_transfer_operation_id.clone(),
-                related_operations: Some(vec![sender_transfer_operation_id.clone()]),
+                operation_identifier: receiver_transfer_operation_id,
+                related_operations: Some(vec![sender_transfer_operation_id]),
                 status: None,
                 metadata: None,
             },
@@ -1359,8 +1208,8 @@ mod tests {
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
                 operation_identifier: function_call_operation_id,
                 related_operations: Some(vec![
-                    fund_transfer_function_call_operation_id.clone(),
-                    initiate_function_call_operation_id.clone(),
+                    fund_transfer_function_call_operation_id,
+                    initiate_function_call_operation_id,
                 ]),
                 status: None,
                 metadata: Some(crate::models::OperationMetadata {
@@ -1412,8 +1261,8 @@ mod tests {
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
                 operation_identifier: function_call_operation_id,
                 related_operations: Some(vec![
-                    fund_transfer_function_call_operation_id.clone(),
-                    initiate_function_call_operation_id.clone(),
+                    fund_transfer_function_call_operation_id,
+                    initiate_function_call_operation_id,
                 ]),
                 status: None,
                 metadata: Some(crate::models::OperationMetadata {
@@ -1465,8 +1314,8 @@ mod tests {
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
                 operation_identifier: function_call_operation_id,
                 related_operations: Some(vec![
-                    fund_transfer_function_call_operation_id.clone(),
-                    initiate_function_call_operation_id.clone(),
+                    fund_transfer_function_call_operation_id,
+                    initiate_function_call_operation_id,
                 ]),
                 status: None,
                 metadata: Some(crate::models::OperationMetadata {
@@ -1518,8 +1367,8 @@ mod tests {
                 amount: Some(crate::models::Amount::from_yoctonear(1)),
                 operation_identifier: function_call_operation_id,
                 related_operations: Some(vec![
-                    fund_transfer_function_call_operation_id.clone(),
-                    initiate_function_call_operation_id.clone(),
+                    fund_transfer_function_call_operation_id,
+                    initiate_function_call_operation_id,
                 ]),
                 status: None,
                 metadata: Some(crate::models::OperationMetadata {
@@ -1571,8 +1420,8 @@ mod tests {
                 amount: Some(-crate::models::Amount::from_yoctonear(1)),
                 operation_identifier: function_call_operation_id,
                 related_operations: Some(vec![
-                    fund_transfer_function_call_operation_id.clone(),
-                    initiate_function_call_operation_id.clone(),
+                    fund_transfer_function_call_operation_id,
+                    initiate_function_call_operation_id,
                 ]),
                 status: None,
                 metadata: Some(crate::models::OperationMetadata {

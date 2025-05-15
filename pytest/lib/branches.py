@@ -9,17 +9,28 @@ import requests
 import semver
 from configured_logger import logger
 
+# cspell:words BASEHREF
 _UNAME = os.uname()[0]
 _IS_DARWIN = _UNAME == 'Darwin'
 _BASEHREF = 'https://s3-us-west-1.amazonaws.com/build.nearprotocol.com'
 _REPO_DIR = pathlib.Path(__file__).resolve().parents[2]
 _OUT_DIR = _REPO_DIR / 'target/debug'
+_IS_NAYDUCK = bool(os.getenv('NAYDUCK'))
 
 
-def current_branch():
-    return os.environ.get('BUILDKITE_BRANCH') or subprocess.check_output([
-        "git", "rev-parse", "--symbolic-full-name", "--abbrev-ref", "HEAD"
-    ]).strip().decode()
+def current_branch() -> str:
+    """Returns checked out branch name or sha if we’re on detached head."""
+    branch = os.environ.get('BUILDKITE_BRANCH')
+    if branch:
+        return branch
+    try:
+        return subprocess.check_output(
+            ('git', 'symbolic-ref', '--short', '-q', 'HEAD')).strip().decode()
+    except subprocess.CalledProcessError as ex:
+        if ex.returncode != 1:
+            raise
+        # We’re on detached HEAD
+    return subprocess.check_output(('git', 'rev-parse', '@')).strip().decode()
 
 
 def __get_latest_deploy(chain_id: str) -> typing.Tuple[str, str]:
@@ -30,6 +41,7 @@ def __get_latest_deploy(chain_id: str) -> typing.Tuple[str, str]:
     """
 
     def download(url: str) -> str:
+        logger.info(f"download {url}")
         res = requests.get(url)
         res.raise_for_status()
         return res.text
@@ -48,12 +60,11 @@ def __get_latest_deploy(chain_id: str) -> typing.Tuple[str, str]:
 class Executables(typing.NamedTuple):
     root: pathlib.Path
     neard: pathlib.Path
-    state_viewer: pathlib.Path
 
     def node_config(self) -> typing.Dict[str, typing.Any]:
         return {
             'local': True,
-            'neard_root': self.root,
+            'near_root': self.root,
             'binary_name': self.neard.name
         }
 
@@ -66,12 +77,24 @@ def _compile_binary(branch: str) -> Executables:
     # TODO: download pre-compiled binary from github for beta/stable?
     prev_branch = current_branch()
     stash_output = subprocess.check_output(['git', 'stash'])
-    subprocess.check_output(['git', 'checkout', str(branch)])
-    subprocess.check_output(['git', 'pull', 'origin', str(branch)])
-    result = _compile_current(branch)
-    subprocess.check_output(['git', 'checkout', prev_branch])
-    if stash_output != b"No local changes to save\n":
-        subprocess.check_output(['git', 'stash', 'pop'])
+    try:
+        subprocess.check_output([
+            'git',
+            # When checking out old releases we end up in a detached head state
+            # and git prints a scary warning about that. This config silences it.
+            '-c',
+            'advice.detachedHead=false',
+            'checkout',
+            str(branch),
+        ])
+        try:
+            subprocess.check_output(['git', 'pull', 'origin', str(branch)])
+            result = _compile_current(branch)
+        finally:
+            subprocess.check_output(['git', 'checkout', prev_branch])
+    finally:
+        if stash_output != b"No local changes to save\n":
+            subprocess.check_output(['git', 'stash', 'pop'])
     return result
 
 
@@ -81,18 +104,25 @@ def escaped(branch):
 
 def _compile_current(branch: str) -> Executables:
     """Compile current branch."""
+    prebuilt_neard = os.environ.get("CURRENT_NEARD")
+    if prebuilt_neard is not None:
+        logger.info(
+            f'Using `CURRENT_NEARD={prebuilt_neard}` neard for branch {branch}')
+        try:
+            path = pathlib.Path(prebuilt_neard).resolve()
+            return Executables(path.parent, path)
+        except OSError as e:
+            logger.exception('Could not use `CURRENT_NEARD`, will build…')
+
+    logger.info(f'Building neard for branch {branch}')
     subprocess.check_call(['cargo', 'build', '-p', 'neard', '--bin', 'neard'],
                           cwd=_REPO_DIR)
     subprocess.check_call(['cargo', 'build', '-p', 'near-test-contracts'],
                           cwd=_REPO_DIR)
-    subprocess.check_call(['cargo', 'build', '-p', 'state-viewer'],
-                          cwd=_REPO_DIR)
     branch = escaped(branch)
     neard = _OUT_DIR / f'neard-{branch}'
-    state_viewer = _OUT_DIR / f'state-viewer-{branch}'
     (_OUT_DIR / 'neard').rename(neard)
-    (_OUT_DIR / 'state-viewer').rename(state_viewer)
-    return Executables(_OUT_DIR, neard, state_viewer)
+    return Executables(_OUT_DIR, neard)
 
 
 def patch_binary(binary: pathlib.Path) -> None:
@@ -102,6 +132,7 @@ def patch_binary(binary: pathlib.Path) -> None:
 
     Currently only supports NixOS.
     """
+    # cspell:words patchelf nixpkgs nixos rpath
     # Are we running on NixOS and require patching…?
     try:
         with open('/etc/os-release', 'r') as f:
@@ -116,7 +147,7 @@ def patch_binary(binary: pathlib.Path) -> None:
     with (import <nixpkgs> {});
     symlinkJoin {
       name = "nearcore-dependencies";
-      paths = [patchelf stdenv.cc.bintools];
+      paths = [patchelf stdenv.cc.bintools gcc.cc.lib];
     }
     '''
     path = subprocess.run(('nix-build', '-E', nix_expr),
@@ -124,9 +155,13 @@ def patch_binary(binary: pathlib.Path) -> None:
                           encoding='utf-8').stdout.strip()
     # Set the interpreter for the binary to NixOS'.
     patchelf = f'{path}/bin/patchelf'
-    cmd = (patchelf, '--set-interpreter', f'{path}/nix-support/dynamic-linker',
-           binary)
-    logger.debug('Patching for NixOS ' + ' '.join(cmd))
+    linker = (pathlib.Path(path) / "nix-support" /
+              "dynamic-linker").read_text().strip()
+    cmd = (patchelf, '--set-interpreter', linker, binary)
+    logger.debug('Patching NixOS interpreter {}'.format(cmd))
+    subprocess.check_call(cmd)
+    cmd = (patchelf, '--set-rpath', '$ORIGIN:{}/lib'.format(path), binary)
+    logger.debug('Patching DSO rpath {}'.format(cmd))
     subprocess.check_call(cmd)
 
 
@@ -151,6 +186,7 @@ def __download_file_if_missing(filename: pathlib.Path, url: str) -> None:
     proto = '"=https"' if _IS_DARWIN else '=https'
     cmd = ('curl', '--proto', proto, '--tlsv1.2', '-sSfL', url)
     name = None
+    filename.parent.mkdir(parents=True, exist_ok=True)
     try:
         with tempfile.NamedTemporaryFile(dir=filename.parent,
                                          delete=False) as tmp:
@@ -167,15 +203,12 @@ def __download_file_if_missing(filename: pathlib.Path, url: str) -> None:
 
 
 def __download_binary(release: str, deploy: str) -> Executables:
-    """Download binary for given release and deploye."""
-    logger.info(f'Getting neard and state-viewer for {release}@{_UNAME} '
-                f'(deploy={deploy})')
+    """Download binary for given release and deploy."""
+    logger.info(f'Getting neard for {release}@{_UNAME} (deploy={deploy})')
     neard = _OUT_DIR / f'neard-{release}-{deploy}'
-    state_viewer = _OUT_DIR / f'state-viewer-{release}-{deploy}'
     basehref = f'{_BASEHREF}/nearcore/{_UNAME}/{release}/{deploy}'
     __download_file_if_missing(neard, f'{basehref}/neard')
-    __download_file_if_missing(state_viewer, f'{basehref}/state-viewer')
-    return Executables(_OUT_DIR, neard, state_viewer)
+    return Executables(_OUT_DIR, neard)
 
 
 class ABExecutables(typing.NamedTuple):
@@ -198,28 +231,48 @@ def prepare_ab_test(chain_id: str = 'mainnet') -> ABExecutables:
         object specify, well, the latest release and deploy running in
         production at the chain.
     """
-    if chain_id not in ('mainnet', 'testnet', 'betanet'):
-        raise ValueError(f'Unexpected chain_id: {chain_id}; '
-                         'expected mainnet, testnet or betanet')
+    release, deploy, stable = __get_executables_for(chain_id)
 
-    is_nayduck = bool(os.getenv('NAYDUCK'))
-    if is_nayduck:
+    if _IS_NAYDUCK:
         # On NayDuck the file is fetched from a builder host so there’s no need
         # to build it.
-        current = Executables(_OUT_DIR, _OUT_DIR / 'neard',
-                              _OUT_DIR / 'state-viewer')
+        current = Executables(_OUT_DIR, _OUT_DIR / 'neard')
     else:
         current = _compile_current(current_branch())
-
-    release, deploy = __get_latest_deploy(chain_id)
-    try:
-        stable = __download_binary(release, deploy)
-    except Exception as e:
-        if is_nayduck:
-            logger.exception('RC binary should be downloaded for NayDuck.', e)
-        stable = _compile_binary(release)
 
     return ABExecutables(stable=stable,
                          current=current,
                          release=release,
                          deploy=deploy)
+
+
+def __get_executables_for(chain_id: str) -> typing.Tuple[str, str, Executables]:
+    """Returns latest deploy at given chain."""
+    if chain_id not in ('mainnet', 'testnet', 'betanet'):
+        raise ValueError(f'Unexpected chain_id: {chain_id}; '
+                         'expected mainnet, testnet or betanet')
+
+    release, deploy = __get_latest_deploy(chain_id)
+    try:
+        executable = __download_binary(release, deploy)
+    except Exception as e:
+        if _IS_NAYDUCK:
+            logger.exception('RC binary should be downloaded for NayDuck.', e)
+        else:
+            logger.exception(e)
+        executable = _compile_binary(release)
+    return release, deploy, executable
+
+
+def get_executables_for(chain_id: str) -> Executables:
+    """Prepares executable at HEAD and latest deploy at given chain.
+
+    Args:
+        chain_id: Chain id to get latest deployed executable for.  Can be
+            ‘master’, ‘testnet’ or ‘betanet’.
+    Returns:
+        An Executables object where pointing at executable which is deployed in
+        production at given chain.
+    """
+    _, _, executable = __get_executables_for(chain_id)
+    return executable

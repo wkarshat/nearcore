@@ -1,3 +1,16 @@
+# Small library for borsh serialization and deserialization.
+
+import logging
+import pathlib
+import sys
+
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / 'lib'))
+
+from configured_logger import new_logger
+
+logger = new_logger('serializer', level=logging.INFO)
+
+
 class BinarySerializer:
 
     def __init__(self, schema):
@@ -20,6 +33,8 @@ class BinarySerializer:
         assert value == 0
 
     def deserialize_num(self, n_bytes):
+        logger.debug(f"deserialize_num {n_bytes}")
+
         value = 0
         bytes_ = self.read_bytes(n_bytes)
         for b in bytes_[::-1]:
@@ -72,6 +87,8 @@ class BinarySerializer:
             assert False, type(fieldType)
 
     def deserialize_field(self, fieldType):
+        logger.debug(f"deserialize_field {fieldType} {type(fieldType)}")
+
         if type(fieldType) == tuple:
             if len(fieldType) == 0:
                 return None
@@ -115,14 +132,21 @@ class BinarySerializer:
         structSchema = self.schema[type(obj)]
         if structSchema['kind'] == 'struct':
             for fieldName, fieldType in structSchema['fields']:
-                self.serialize_field(getattr(obj, fieldName), fieldType)
+                try:
+                    self.serialize_field(getattr(obj, fieldName), fieldType)
+                except AssertionError as exc:
+                    raise AssertionError(f"Error in field {fieldName}") from exc
         elif structSchema['kind'] == 'enum':
             name = getattr(obj, structSchema['field'])
             for idx, (fieldName,
                       fieldType) in enumerate(structSchema['values']):
                 if fieldName == name:
                     self.serialize_num(idx, 1)
-                    self.serialize_field(getattr(obj, fieldName), fieldType)
+                    try:
+                        self.serialize_field(getattr(obj, fieldName), fieldType)
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            f"Error in field {fieldName}") from exc
                     break
             else:
                 assert False, name
@@ -131,15 +155,37 @@ class BinarySerializer:
 
     def deserialize_struct(self, type_):
         structSchema = self.schema[type_]
+        logger.debug(f"deserialize_struct {type_} {structSchema['kind']}")
+
         if structSchema['kind'] == 'struct':
             ret = type_()
             for fieldName, fieldType in structSchema['fields']:
                 setattr(ret, fieldName, self.deserialize_field(fieldType))
             return ret
         elif structSchema['kind'] == 'enum':
-            ret = type_()
             value_ord = self.deserialize_num(1)
+            if (value_ord < 0) or (len(structSchema['values']) <= value_ord):
+                raise IndexError(
+                    f"Unknown enum variant {value_ord} for {type_}, num variants: {len(structSchema['values'])}"
+                )
+
+            logger.debug(
+                f"deserialize_struct {type_} {structSchema['kind']} enum value ord {value_ord} struct schema {len(structSchema['values'])}"
+            )
             value_schema = structSchema['values'][value_ord]
+            logger.debug(
+                f"deserialize_struct {type_} {structSchema['kind']} enum value sch {value_schema}"
+            )
+
+            if value_schema is None:
+                raise IndexError(f"value schema missing for type {type_}")
+
+            if value_schema[1] is None:
+                raise IndexError(
+                    f"value schema not supported for {type_}::{value_schema[0]}"
+                )
+
+            ret = type_()
             setattr(ret, structSchema['field'], value_schema[0])
             setattr(ret, value_schema[0],
                     self.deserialize_field(value_schema[1]))

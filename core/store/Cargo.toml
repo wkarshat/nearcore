@@ -1,39 +1,69 @@
 [package]
 name = "near-store"
-version = "0.0.0"
-license = "MIT OR Apache-2.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
+
+[lints]
+workspace = true
 
 [dependencies]
-byteorder = "1.2"
-bytesize = "1.1"
-derive_more = "0.99.3"
-elastic-array = "0.11"
-lazy_static = "1.4"
-rocksdb = "0.16.0"
-serde = { version = "1", features = [ "derive" ] }
-serde_json = "1"
-cached = "0.23"
-num_cpus = "1.11"
-rand = "0.7"
-strum = { version = "0.20", features = ["derive"] }
-fs2 = "0.4"
-tracing = "0.1"
-borsh = "0.9"
-thiserror = "1"
-smart-default = "0.6"
+actix-rt.workspace = true
+actix.workspace = true
+anyhow.workspace = true
+borsh.workspace = true
+bytesize.workspace = true
+crossbeam.workspace = true
+derive_more = { workspace = true, features = ["as_ref", "into"] }
+derive-where.workspace = true
+smallvec.workspace = true
+enum-map.workspace = true
+hex.workspace = true
+itoa.workspace = true
+itertools.workspace = true
+lru.workspace = true
+num_cpus.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rayon.workspace = true
+reed-solomon-erasure.workspace = true
+rlimit.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+static_assertions.workspace = true
+stdx.workspace = true
+strum.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
-near-crypto = { path = "../crypto" }
-near-primitives = { path = "../primitives" }
+near-time.workspace = true
+near-chain-configs = { workspace = true, features = ["metrics"] }
+near-chain-primitives.workspace = true
+near-crypto.workspace = true
+near-fmt.workspace = true
+near-o11y.workspace = true
+near-parameters.workspace = true
+near-primitives.workspace = true
+near-vm-runner.workspace = true
+near-schema-checker-lib.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
-bencher = "0.1.5"
-rand = "0.7"
+assert_matches.workspace = true
+bencher.workspace = true
+insta.workspace = true
+near-chain.workspace = true
+near-chunks.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+rand_chacha.workspace = true
+testlib.workspace = true
 
 [[bench]]
 name = "trie_bench"
@@ -43,10 +73,31 @@ harness = false
 name = "store_bench"
 harness = false
 
+[[bench]]
+name = "finalize_bench"
+harness = false
+
 [features]
 default = []
-no_cache = []
-test_features = []
-protocol_feature_chunk_only_producers = []
-nightly_protocol = []
-nightly_protocol_features = ["nightly_protocol", "protocol_feature_chunk_only_producers"]
+io_trace = []
+single_thread_rocksdb = [] # Deactivate RocksDB IO background threads
+test_features = ["near-vm-runner/test_features"]
+
+# TODO(#11639): extract metrics into separate feature
+nightly = [
+    "near-chain-configs/nightly",
+    "near-chain/nightly",
+    "near-chunks/nightly",
+    "near-fmt/nightly",
+    "near-o11y/nightly",
+    "near-parameters/nightly",
+    "near-primitives/nightly",
+    "near-vm-runner/nightly",
+    "testlib/nightly",
+]
+protocol_schema = [
+    "near-crypto/protocol_schema",
+    "near-primitives/protocol_schema",
+    "near-parameters/protocol_schema",
+    "near-schema-checker-lib/protocol_schema",
+]

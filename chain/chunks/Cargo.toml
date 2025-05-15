@@ -1,34 +1,60 @@
 [package]
 name = "near-chunks"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
+
+[lints]
+workspace = true
 
 [dependencies]
-actix = "=0.11.0-beta.2"
-futures = "0.3"
-rand = "0.7"
-chrono = "0.4.6"
-log = "0.4"
-borsh = "0.9"
-cached = "0.23"
-reed-solomon-erasure = "4"
+actix.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reed-solomon-erasure.workspace = true
+strum.workspace = true
+time.workspace = true
+tracing.workspace = true
+# itertools has collect_vec which is useful in quick debugging prints
+itertools.workspace = true
 
-near-crypto = { path = "../../core/crypto" }
-near-primitives = { path = "../../core/primitives" }
-near-chunks-primitives = { path = "../chunks-primitives" }
-near-store = { path = "../../core/store" }
-near-network = { path = "../network" }
-near-chain = { path = "../chain" }
-near-pool = { path = "../pool" }
-near-network-primitives = { path = "../network-primitives" }
+near-async.workspace = true
+near-chain-configs.workspace = true
+near-crypto.workspace = true
+near-epoch-manager.workspace = true
+near-primitives.workspace = true
+near-chunks-primitives.workspace = true
+near-store.workspace = true
+near-network.workspace = true
+near-o11y.workspace = true
+near-chain.workspace = true
+near-pool.workspace = true
+near-performance-metrics.workspace = true
+near-performance-metrics-macros.workspace = true
 
 [dev-dependencies]
-near-logger-utils = { path = "../../test-utils/logger" }
+assert_matches.workspace = true
 
 [features]
+nightly = [
+    "near-async/nightly",
+    "near-chain-configs/nightly",
+    "near-chain/nightly",
+    "near-epoch-manager/nightly",
+    "near-network/nightly",
+    "near-o11y/nightly",
+    "near-pool/nightly",
+    "near-primitives/nightly",
+    "near-store/nightly",
+]
 byzantine_asserts = ["near-chain/byzantine_asserts"]
 expensive_tests = []
+test_features = []
+
+[package.metadata.cargo-machete]
+ignored = ["near-performance-metrics"]

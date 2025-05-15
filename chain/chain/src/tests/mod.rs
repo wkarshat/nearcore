@@ -1,11 +1,10 @@
-mod challenges;
-#[cfg(feature = "expensive_tests")]
 mod doomslug;
-mod gc;
+mod garbage_collection;
 mod simple_chain;
 mod sync_chain;
 
-use crate::types::Tip;
+use crate::block_processing_utils::BlockProcessingArtifact;
+use crate::test_utils::process_block_sync;
 use crate::{Block, Chain, Error, Provenance};
 use near_primitives::account::id::AccountId;
 use near_primitives::utils::MaybeValidated;
@@ -17,15 +16,15 @@ impl Chain {
         &mut self,
         me: &Option<AccountId>,
         block: Block,
-    ) -> Result<Option<Tip>, Error> {
-        self.process_block(
+    ) -> Result<(), Error> {
+        let mut block_processing_artifacts = BlockProcessingArtifact::default();
+        process_block_sync(
+            self,
             me,
             MaybeValidated::from(block),
             Provenance::PRODUCED,
-            |_| {},
-            |_| {},
-            |_| {},
-            |_| {},
+            &mut block_processing_artifacts,
         )
+        .map(|_| {})
     }
 }

@@ -21,10 +21,9 @@ implementation, and you can always access it from the running node at
 ## Supported Features
 
 Our current goal is to have a minimal yet feature-complete implementation of
-Rosetta RPC serving
-[the main use-case Rosetta was designed for](https://community.rosetta-api.org/t/what-is-rosetta-main-use-case/92/2),
-that is exposing balance-changing operations in a consistent way enabling
-reconciliation through tracking individual blocks and transactions.
+Rosetta RPC serving the main use-case Rosetta was designed for, that is exposing
+balance-changing operations in a consistent way enabling reconciliation through
+tracking individual blocks and transactions.
 
 The Rosetta APIs are organized into two distinct categories, the Data API and
 the Construction API. Simply put, the Data API is for retrieving data from a
@@ -52,20 +51,74 @@ transactions to a blockchain network.
 | - `/construction/hash`       | Done                                                                                                                                |
 | - `/construction/submit`     | Done                                                                                                                                |
 
-To verify the API compliance use:
+## API Compliance
+
+You can verify the API compliance in each network differently. You can run the commands below to check `Data` and `Construction` compliances mentioned in [Rosetta Testing](https://www.rosetta-api.org/docs/rosetta_test.html#run-the-tool). Each network has it's own `.ros` and `.cfg` files that you can configure and run.
 
 ```bash
-rosetta-cli check:data --configuration-file=./rosetta.cfg
-rosetta-cli check:construction --configuration-file=./rosetta.cfg
+rosetta-cli check:data --configuration-file=./rosetta-<mainnet|testnet|localnet>.cfg
+rosetta-cli check:construction --configuration-file=./rosetta-<mainnet|testnet|localnet>.cfg
 ```
+
+##### Localnet
+
+For `localnet` you can use the account `test.near` to run the tests. You should replace the `<privateKey>` value in `rosetta-localnet.cfg` with the `privateKey` of `test.near` which you can find in `~/.near-credentials/local` in the `test.near.json` file.
+
+```json
+  ...
+  "prefunded_accounts": [{
+        "privkey": "<privateKey>",
+        "account_identifier": {
+            "address": "test.near"
+        },
+  ...
+```
+
+After replacing the `privateKey` you will need to replace the `test-chain-I4wNe` with the name of your localnet in `rosetta-localnet.cfg`.
+
+```json
+"network": {
+  "blockchain": "nearprotocol",
+  "network": "test-chain-I4wNe"
+ },
+ ```
+
+##### Testnet
+
+To run it against testnet or mainnet would require to also have the `pre-funded accounts` as well as network set to a proper value in the `.ros` and `rosetta-<mainnet|testnet>.cfg` files.
+
+Start by [creating an account](https://docs.near.org/docs/tools/near-cli#near-create-account). Created account will be placed in `~/.near-credentials/testnet/<accountName>.testnet.json`. Change `<privateKey>` with the private key of newly created account and `<accountName>`  with the account name of the newly created account in `rosetta-testnet.cfg`.
+
+```json
+  ...
+  "prefunded_accounts": [{
+        "privkey": "<privateKey>",
+        "account_identifier": {
+            "address": "<accountName>"
+        },
+  ...
+```
+
+Next you will need to change the `faucet` with `{"address":"<accountName>"}` in `nearprotocol-testnet.ros`. Now you are ready to run the test in testnet.
+
+##### Mainnet
+
+For mainnet you can follow the same steps that you have followed in Testnet documentation. The difference is that the configuration files are named `rosetta-mainnet.cfg` and `nearprotocol-mainnet.ros`. The credentials can be found in `~/.near-credentials/mainnet/<accountName>.near.json`.
 
 ## How to Compile
 
-Follow [the standard nearcore procedures to run a node compiled from the source code](https://docs.near.org/docs/community/contribute/contribute-nearcore)
-enabling `rosetta_rpc` feature:
+To compile the `neard` executable you’ll need Rust and make installed.
+With those dependencies fulfilled, simply invoke `make neard` to build
+fully optimized executable.  Such executable is adequate for running
+in production and will be located at `./target/release/neard`.
+
+Alternatively, during development and testing it may be better to
+follow the method recommended when [contributing to
+nearcore](https://github.com/near/nearcore/blob/master/CONTRIBUTING.md)
+which creates a slightly less optimized executable but does it faster:
 
 ```bash
-cargo build --release --package neard --bin neard --features rosetta_rpc
+cargo build --profile dev-release --package neard --bin neard
 ```
 
 ## How to Configure
@@ -78,16 +131,16 @@ above), you can find it in `./target/release/neard`.
 #### mainnet
 
 ```bash
-neard --home ~/.near/mainnet init --chain-id mainnet --download-genesis
+neard --home ~/.near/mainnet init --chain-id mainnet --download-genesis --download-config
 ```
 
 #### testnet
 
 ```bash
-neard --home ~/.near/testnet init --chain-id testnet --download-genesis
+neard --home ~/.near/testnet init --chain-id testnet --download-genesis --download-config
 ```
 
-NOTE: The genesis of testnet is around 1GB, so it will take a while to download it.
+NOTE: The genesis of testnet is around 5GB, so it will take a while to download it.
 
 #### localnet (for local development)
 
@@ -168,7 +221,7 @@ Expect to see the following response:
 ```json
 { "network_identifiers": [{ "blockchain": "nearprotocol", "network": "mainnet" }] }
 ```
-
+<!-- cspell:words ztmbv -->
 The `network` value should reflect the chain id you specified during
 configuration (`mainnet`, `testnet`, `betanet`, or a random string like
 `test-chain-ztmbv` for localnet development).

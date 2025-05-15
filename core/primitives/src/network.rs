@@ -1,17 +1,14 @@
+use crate::hash::CryptoHash;
+use crate::types::{AccountId, EpochId};
+use crate::validator_signer::ValidatorSigner;
+use borsh::{BorshDeserialize, BorshSerialize};
+use near_crypto::{PublicKey, Signature};
+use near_schema_checker_lib::ProtocolSchema;
 use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use borsh::{BorshDeserialize, BorshSerialize};
-use serde::{Deserialize, Serialize};
-
-use near_crypto::{KeyType, PublicKey, SecretKey, Signature};
-
-use crate::hash::CryptoHash;
-use crate::types::{AccountId, EpochId};
-
 /// Peer id is the public key.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
 #[derive(
     BorshSerialize,
     BorshDeserialize,
@@ -21,40 +18,15 @@ use crate::types::{AccountId, EpochId};
     PartialOrd,
     Ord,
     Hash,
-    Serialize,
-    Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    ProtocolSchema,
 )]
-pub struct PeerId(Arc<PeerIdInner>);
-
-/// Peer id is the public key.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(
-    BorshSerialize,
-    BorshDeserialize,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    Hash,
-)]
-pub struct PeerIdInner(PublicKey);
+pub struct PeerId(Arc<PublicKey>);
 
 impl PeerId {
     pub fn new(key: PublicKey) -> Self {
-        Self(Arc::new(PeerIdInner(key)))
-    }
-
-    pub fn public_key(&self) -> &PublicKey {
-        &self.0 .0
-    }
-}
-
-impl PeerIdInner {
-    pub fn new(key: PublicKey) -> Self {
-        Self(key)
+        Self(Arc::new(key))
     }
 
     pub fn public_key(&self) -> &PublicKey {
@@ -63,26 +35,26 @@ impl PeerIdInner {
 }
 
 impl PeerId {
+    #[cfg(feature = "rand")]
     pub fn random() -> Self {
-        PeerId::new(SecretKey::from_random(KeyType::ED25519).public_key())
+        PeerId::new(near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519).public_key())
     }
 }
 
 impl fmt::Display for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0 .0)
+        write!(f, "{}", self.0)
     }
 }
 
 impl fmt::Debug for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0 .0)
+        write!(f, "{}", self.0)
     }
 }
 
 /// Account announcement information
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, Hash, ProtocolSchema)]
 pub struct AnnounceAccount {
     /// AccountId to be announced.
     pub account_id: AccountId,
@@ -95,17 +67,27 @@ pub struct AnnounceAccount {
 }
 
 impl AnnounceAccount {
+    pub fn new(signer: &ValidatorSigner, peer_id: PeerId, epoch_id: EpochId) -> Self {
+        let signature = Self::sign(signer, &peer_id, &epoch_id);
+        Self { account_id: signer.validator_id().clone(), peer_id: peer_id, epoch_id, signature }
+    }
+
+    pub fn hash(&self) -> CryptoHash {
+        Self::build_header_hash(&self.account_id, &self.peer_id, &self.epoch_id)
+    }
+
+    fn sign(signer: &ValidatorSigner, peer_id: &PeerId, epoch_id: &EpochId) -> Signature {
+        let hash = Self::build_header_hash(signer.validator_id(), peer_id, epoch_id);
+        signer.sign_bytes(hash.as_ref())
+    }
+
     /// We hash only (account_id, peer_id, epoch_id). There is no need hash the signature
-    /// as it's uniquely determined the the triple.
-    pub fn build_header_hash(
+    /// as it's uniquely determined the triple.
+    fn build_header_hash(
         account_id: &AccountId,
         peer_id: &PeerId,
         epoch_id: &EpochId,
     ) -> CryptoHash {
-        CryptoHash::hash_borsh(&(account_id, peer_id, epoch_id))
-    }
-
-    pub fn hash(&self) -> CryptoHash {
-        AnnounceAccount::build_header_hash(&self.account_id, &self.peer_id, &self.epoch_id)
+        CryptoHash::hash_borsh((account_id, peer_id, epoch_id))
     }
 }

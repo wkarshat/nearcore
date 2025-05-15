@@ -3,30 +3,15 @@ use bs58;
 use curve25519_dalek::constants::{
     RISTRETTO_BASEPOINT_POINT as G, RISTRETTO_BASEPOINT_TABLE as GT,
 };
-use rand_core::OsRng;
 use std::borrow::Borrow;
 use subtle::{ConditionallySelectable, ConstantTimeEq};
 
 #[derive(Clone)]
 pub struct PublicKey(pub(crate) [u8; 32], pub(crate) Point);
 #[derive(Clone)]
-pub struct SecretKey(pub(crate) Scalar, pub(crate) PublicKey);
+pub struct SecretKey(Scalar, PublicKey);
 value_type!(pub, Value, 32, "value");
 value_type!(pub, Proof, 64, "proof");
-
-#[cfg(feature = "deepsize_feature")]
-impl deepsize::DeepSizeOf for Value {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-#[cfg(feature = "deepsize_feature")]
-impl deepsize::DeepSizeOf for Proof {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        0
-    }
-}
 
 impl PublicKey {
     fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
@@ -41,6 +26,10 @@ impl PublicKey {
         self.is_valid(input.borrow(), value, proof)
     }
 
+    // FIXME: no clear fix is available here -- the underlying library runs a non-trivial amount of
+    // unchecked arithmetic inside and provides no apparent way to do it in a checked manner.
+    // cspell:words vmul
+    #[allow(clippy::arithmetic_side_effects)]
     fn is_valid(&self, input: &[u8], value: &Value, proof: &Proof) -> bool {
         let p = unwrap_or_return_false!(unpack(&value.0));
         let (r, c) = unwrap_or_return_false!(unpack(&proof.0));
@@ -53,12 +42,17 @@ impl PublicKey {
     }
 }
 
+// FIXME: no clear fix is available here -- the underlying library runs a non-trivial amount of
+// unchecked arithmetic inside and provides no apparent way to do it in a checked or wrapping
+// manner.
+// cspell:words basemul
+#[allow(clippy::arithmetic_side_effects)]
 fn basemul(s: Scalar) -> Point {
-    &s * &GT
+    &s * &*GT
 }
 
 fn safe_invert(s: Scalar) -> Scalar {
-    Scalar::conditional_select(&s, &Scalar::one(), s.ct_eq(&Scalar::zero())).invert()
+    Scalar::conditional_select(&s, &Scalar::ONE, s.ct_eq(&Scalar::ZERO)).invert()
 }
 
 impl SecretKey {
@@ -71,10 +65,6 @@ impl SecretKey {
         Some(Self::from_scalar(unpack(bytes)?))
     }
 
-    pub fn random() -> Self {
-        Self::from_scalar(Scalar::random(&mut OsRng))
-    }
-
     pub fn public_key(&self) -> &PublicKey {
         &self.1
     }
@@ -83,6 +73,10 @@ impl SecretKey {
         self.compute(input.borrow())
     }
 
+    // FIXME: no clear fix is available here -- the underlying library runs a non-trivial amount of
+    // unchecked arithmetic inside and provides no apparent way to do it in a checked or wrapping
+    // manner.
+    #[allow(clippy::arithmetic_side_effects)]
     fn compute(&self, input: &[u8]) -> Value {
         Value(basemul(safe_invert(self.0 + self.1.offset(input))).pack())
     }
@@ -91,6 +85,10 @@ impl SecretKey {
         self.compute_with_proof(input.borrow())
     }
 
+    // FIXME: no clear fix is available here -- the underlying library runs a non-trivial amount of
+    // unchecked arithmetic inside and provides no apparent way to do it in a checked or wrapping
+    // manner.
+    #[allow(clippy::arithmetic_side_effects)]
     fn compute_with_proof(&self, input: &[u8]) -> (Value, Proof) {
         let x = self.0 + self.1.offset(input);
         let inv = safe_invert(x);
@@ -122,15 +120,22 @@ macro_rules! traits {
 traits!(PublicKey, 32, |s| &s.0, "public key");
 traits!(SecretKey, 32, |s| s.0.as_bytes(), "secret key");
 
+#[cfg(feature = "rand")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use secp256k1::rand::rngs::OsRng;
     use serde::{Deserialize, Serialize};
     use serde_json::{from_str, to_string};
 
+    fn random_secret_key() -> SecretKey {
+        SecretKey::from_scalar(Scalar::random(&mut OsRng))
+    }
+
     #[test]
     fn test_conversion() {
-        let sk = SecretKey::random();
+        let sk = random_secret_key();
         let sk2 = SecretKey::from_bytes(&sk.clone().into()).unwrap();
         assert_eq!(sk, sk2);
         let pk = sk.public_key();
@@ -142,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_verify() {
-        let sk = SecretKey::random();
+        let sk = random_secret_key();
         let (val, proof) = sk.compute_vrf_with_proof(b"Test");
         let val2 = sk.compute_vrf(b"Test");
         assert_eq!(val, val2);
@@ -152,8 +157,8 @@ mod tests {
 
     #[test]
     fn test_different_keys() {
-        let sk = SecretKey::random();
-        let sk2 = SecretKey::random();
+        let sk = random_secret_key();
+        let sk2 = random_secret_key();
         assert_ne!(sk, sk2);
         assert_ne!(Into::<[u8; 32]>::into(sk.clone()), Into::<[u8; 32]>::into(sk2.clone()));
         let pk = sk.public_key();
@@ -175,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_serialize() {
-        let sk = SecretKey::random();
+        let sk = random_secret_key();
         let sk2 = round_trip(&sk);
         assert_eq!(sk, sk2);
         let (val, proof) = sk.compute_vrf_with_proof(b"Test");

@@ -1,55 +1,43 @@
-use crate::config::GasMetric;
-use crate::gas_cost::GasCost;
-use crate::vm_estimator::{create_context, least_squares_method};
-use near_primitives::config::VMConfig;
-use near_primitives::contract::ContractCode;
-use near_primitives::runtime::config_store::RuntimeConfigStore;
-use near_primitives::types::{CompiledContractCache, Gas};
+use crate::config::Config;
+use crate::gas_cost::{GasCost, LeastSquaresTolerance};
+use crate::vm_estimator::create_context;
+use near_parameters::RuntimeConfigStore;
 use near_primitives::version::PROTOCOL_VERSION;
-use near_store::{create_store, StoreCompiledContractCache};
-use near_vm_logic::mocks::mock_external::MockedExternal;
-use near_vm_runner::internal::VMKind;
-use nearcore::get_store_path;
+use near_vm_runner::internal::VMKindExt;
+use near_vm_runner::logic::mocks::mock_external::MockedExternal;
+use near_vm_runner::{ContractCode, ContractRuntimeCache, FilesystemContractRuntimeCache};
 use std::fmt::Write;
 use std::sync::Arc;
 
-pub(crate) fn gas_metering_cost(metric: GasMetric, vm_kind: VMKind) -> (Gas, Gas) {
-    const REPEATS: i32 = 1000;
+pub(crate) fn gas_metering_cost(config: &Config) -> (GasCost, GasCost) {
     let mut xs1 = vec![];
     let mut ys1 = vec![];
     let mut xs2 = vec![];
     let mut ys2 = vec![];
-    for depth in vec![1, 10, 20, 30, 50, 100, 200, 1000] {
-        if true {
+    for depth in [1, 10, 20, 30, 50, 100, 200, 1000] {
+        {
             // Here we test gas metering costs for forward branch cases.
             let nested_contract = make_deeply_nested_blocks_contact(depth);
-            let cost = compute_gas_metering_cost(metric, vm_kind, REPEATS, &nested_contract);
+            let cost = compute_gas_metering_cost(config, &nested_contract);
             xs1.push(depth as u64);
             ys1.push(cost);
         }
-        if true {
+        {
             let loop_contract = make_simple_loop_contact(depth);
-            let cost = compute_gas_metering_cost(metric, vm_kind, REPEATS, &loop_contract);
+            let cost = compute_gas_metering_cost(config, &loop_contract);
             xs2.push(depth as u64);
             ys2.push(cost);
         }
     }
 
-    // Regression analysis only makes sense for additive metrics.
-    if metric == GasMetric::Time {
-        return (0, 0);
-    }
+    let tolerance = LeastSquaresTolerance::default().factor_rel_nn_tolerance(0.001);
+    let (cost1_base, cost1_op) =
+        GasCost::least_squares_method_gas_cost(&xs1, &ys1, &tolerance, config.debug);
+    let (cost2_base, cost2_op) =
+        GasCost::least_squares_method_gas_cost(&xs2, &ys2, &tolerance, config.debug);
 
-    let (cost1_base, cost1_op, _) = least_squares_method(&xs1, &ys1);
-    let (cost2_base, cost2_op, _) = least_squares_method(&xs2, &ys2);
-
-    #[cfg(test)]
-    println!("forward branches: {} gas base {} gas per op", cost1_base, cost1_op,);
-    #[cfg(test)]
-    println!("backward branches: {} gas base {} gas per op", cost2_base, cost2_op,);
-
-    let cost_base = std::cmp::max(cost1_base, cost2_base).round().to_integer() as u64;
-    let cost_op = std::cmp::max(cost1_op, cost2_op).round().to_integer() as u64;
+    let cost_base = std::cmp::max(cost1_base, cost2_base);
+    let cost_op = std::cmp::max(cost1_op, cost2_op);
     (cost_base, cost_op)
 }
 
@@ -132,99 +120,86 @@ fn make_simple_loop_contact(depth: i32) -> ContractCode {
  * running contracts with and without gas metering and comparing the difference induced by gas
  * metering.
  */
-pub fn compute_gas_metering_cost(
-    gas_metric: GasMetric,
-    vm_kind: VMKind,
-    repeats: i32,
-    contract: &ContractCode,
-) -> u64 {
-    let runtime = vm_kind.runtime().expect("runtime has not been enabled");
-    let workdir = tempfile::Builder::new().prefix("runtime_testbed").tempdir().unwrap();
-    let store = create_store(&get_store_path(workdir.path()));
-    let cache_store = Arc::new(StoreCompiledContractCache { store });
-    let cache: Option<&dyn CompiledContractCache> = Some(cache_store.as_ref());
+pub(crate) fn compute_gas_metering_cost(config: &Config, contract: &ContractCode) -> GasCost {
+    let gas_metric = config.metric;
+    let repeats = config.iter_per_block as u64;
+    let vm_kind = config.vm_kind;
+    let warmup_repeats = config.warmup_iters_per_block;
+    let cache_store = FilesystemContractRuntimeCache::test().unwrap();
+    let cache: Option<&dyn ContractRuntimeCache> = Some(&cache_store);
     let config_store = RuntimeConfigStore::new(None);
     let runtime_config = config_store.get_config(PROTOCOL_VERSION).as_ref();
     let vm_config_gas = runtime_config.wasm_config.clone();
-    let fees = runtime_config.transaction_costs.clone();
-    let mut fake_external = MockedExternal::new();
+    let vm_config_free = Arc::new({
+        let mut cfg = near_parameters::vm::Config::clone(&vm_config_gas);
+        cfg.make_free();
+        cfg.enable_all_features();
+        cfg
+    });
+    let fees = runtime_config.fees.clone();
+    let mut fake_external = MockedExternal::with_code(contract.clone_for_tests());
     let fake_context = create_context(vec![]);
-    let promise_results = vec![];
 
-    // Warmup.
-    let result = runtime.run(
-        contract,
-        "hello",
-        &mut fake_external,
-        fake_context.clone(),
-        &vm_config_gas,
-        &fees,
-        &promise_results,
-        PROTOCOL_VERSION,
-        cache,
-    );
-    if result.1.is_some() {
-        let err = result.1.as_ref().unwrap();
-        eprintln!("error: {}", err);
+    // Warmup with gas metering
+    for _ in 0..warmup_repeats {
+        let gas_counter = fake_context.make_gas_counter(&vm_config_gas);
+        let runtime = vm_kind.runtime(vm_config_gas.clone()).expect("runtime has not been enabled");
+        let result = runtime
+            .prepare(&fake_external, cache, gas_counter, "hello")
+            .run(&mut fake_external, &fake_context, Arc::clone(&fees))
+            .expect("fatal_error");
+        if let Some(err) = &result.aborted {
+            eprintln!("error: {}", err);
+        }
+        assert!(result.aborted.is_none());
     }
-    assert!(result.1.is_none());
 
     // Run with gas metering.
     let start = GasCost::measure(gas_metric);
     for _ in 0..repeats {
-        let result = runtime.run(
-            contract,
-            "hello",
-            &mut fake_external,
-            fake_context.clone(),
-            &vm_config_gas,
-            &fees,
-            &promise_results,
-            PROTOCOL_VERSION,
-            cache,
-        );
-        assert!(result.1.is_none());
+        let gas_counter = fake_context.make_gas_counter(&vm_config_gas);
+        let runtime = vm_kind.runtime(vm_config_gas.clone()).expect("runtime has not been enabled");
+        let result = runtime
+            .prepare(&fake_external, cache, gas_counter, "hello")
+            .run(&mut fake_external, &fake_context, Arc::clone(&fees))
+            .expect("fatal_error");
+        assert!(result.aborted.is_none());
     }
-    let total_raw_with_gas = start.elapsed().to_gas();
+    let total_raw_with_gas = start.elapsed();
 
-    let vm_config_no_gas = VMConfig::free();
-    let result = runtime.run(
-        contract,
-        "hello",
-        &mut fake_external,
-        fake_context.clone(),
-        &vm_config_no_gas,
-        &fees,
-        &promise_results,
-        PROTOCOL_VERSION,
-        cache,
-    );
-    assert!(result.1.is_none());
+    // Warmup without gas metering
+    for _ in 0..warmup_repeats {
+        let gas_counter = fake_context.make_gas_counter(&vm_config_free);
+        let runtime_free_gas =
+            vm_kind.runtime(vm_config_free.clone()).expect("runtime has not been enabled");
+        let result = runtime_free_gas
+            .prepare(&fake_external, cache, gas_counter, "hello")
+            .run(&mut fake_external, &fake_context, Arc::clone(&fees))
+            .expect("fatal_error");
+        assert!(result.aborted.is_none());
+    }
+
+    // Run without gas metering.
     let start = GasCost::measure(gas_metric);
     for _ in 0..repeats {
-        let result = runtime.run(
-            contract,
-            "hello",
-            &mut fake_external,
-            fake_context.clone(),
-            &vm_config_no_gas,
-            &fees,
-            &promise_results,
-            PROTOCOL_VERSION,
-            cache,
-        );
-        assert!(result.1.is_none());
+        let gas_counter = fake_context.make_gas_counter(&vm_config_free);
+        let runtime_free_gas =
+            vm_kind.runtime(vm_config_free.clone()).expect("runtime has not been enabled");
+        let result = runtime_free_gas
+            .prepare(&fake_external, cache, gas_counter, "hello")
+            .run(&mut fake_external, &fake_context, Arc::clone(&fees))
+            .expect("fatal_error");
+        assert!(result.aborted.is_none());
     }
-    let total_raw_no_gas = start.elapsed().to_gas();
+    let total_raw_no_gas = start.elapsed();
 
-    // TODO: This seems to fail almost always but has some non-determinism to it.
-    assert!(
-        total_raw_with_gas > total_raw_no_gas,
-        "Cost with gas metering should be higher than without. Metric: {:?}. Estimated with gas metering: {}, without: {}",
-        gas_metric,
-        total_raw_with_gas,
-        total_raw_no_gas
-    );
+    if total_raw_with_gas < total_raw_no_gas {
+        // This might happen due to experimental error, especially when running
+        // without warmup or too few iterations.
+        let mut null_cost = GasCost::zero();
+        null_cost.set_uncertain("NEGATIVE-COST");
+        return null_cost;
+    }
 
-    total_raw_with_gas - total_raw_no_gas
+    (total_raw_with_gas - total_raw_no_gas) / repeats
 }

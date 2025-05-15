@@ -42,25 +42,38 @@
 //! `for_each_available_import` with its own import definition logic.
 //!
 //! The real `for_each_available_import` takes one more argument --
-//! `protocol_version`. We can add new imports, but we must make sure that they
+//! `VMConfig`. We can add new imports, but we must make sure that they
 //! are only available to contracts at a specific protocol version -- we can't
 //! make imports retroactively available to old transactions. So
 //! `for_each_available_import` takes care to invoke `M!` only for currently
 //! available imports.
+#![cfg(any(feature = "near_vm", feature = "wasmtime_vm"))]
+
+macro_rules! call_with_name {
+    ( $M:ident => @in $mod:ident : $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] > ) => {
+        $M!($mod / $func : $func < [ $( $arg_name : $arg_type ),* ] -> [ $( $returns ),* ] >)
+    };
+    ( $M:ident => @as $name:ident : $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] > ) => {
+        $M!(env / $name : $func < [ $( $arg_name : $arg_type ),* ] -> [ $( $returns ),* ] >)
+    };
+    ( $M:ident => $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] > ) => {
+        $M!(env / $func : $func < [ $( $arg_name : $arg_type ),* ] -> [ $( $returns ),* ] >)
+    };
+}
 
 macro_rules! imports {
     (
-      $($(#[$stable_feature:ident])? $(#[$feature_name:literal, $feature:ident])*
+      $($(#[$config_field:ident])? $(#[[$feature_name:literal]])?
+        $( @in $mod:ident : )?
+        $( @as $name:ident : )?
         $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] >,)*
     ) => {
         macro_rules! for_each_available_import {
-            ($protocol_version:ident, $M:ident) => {$(
-                $(#[cfg(feature = $feature_name)])*
-                if true
-                    $(&& near_primitives::checked_feature!($feature_name, $feature, $protocol_version))*
-                    $(&& near_primitives::checked_feature!("stable", $stable_feature, $protocol_version))?
-                {
-                    $M!($func < [ $( $arg_name : $arg_type ),* ] -> [ $( $returns ),* ] >);
+            ($config:expr, $M:ident) => {$(
+                let _ = &$config;
+                $(#[cfg(feature = $feature_name)])?
+                if true $(&& ($config).$config_field)? {
+                    $crate::imports::call_with_name!($M => $( @in $mod : )? $( @as $name : )? $func < [ $( $arg_name : $arg_type ),* ] -> [ $( $returns ),* ] >);
                 }
             )*}
         }
@@ -68,6 +81,12 @@ macro_rules! imports {
 }
 
 imports! {
+    // #########################
+    // # Finite-wasm internals #
+    // #########################
+    @in internal: finite_wasm_gas<[gas: u64] -> []>,
+    @in internal: finite_wasm_stack<[operand_size: u64, frame_size: u64] -> []>,
+    @in internal: finite_wasm_unstack<[operand_size: u64, frame_size: u64] -> []>,
     // #############
     // # Registers #
     // #############
@@ -82,7 +101,6 @@ imports! {
     signer_account_pk<[register_id: u64] -> []>,
     predecessor_account_id<[register_id: u64] -> []>,
     input<[register_id: u64] -> []>,
-    // TODO #1903 rename to `block_height`
     block_index<[] -> [u64]>,
     block_timestamp<[] -> [u64]>,
     epoch_height<[] -> [u64]>,
@@ -102,8 +120,15 @@ imports! {
     sha256<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
     keccak256<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
     keccak512<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
-    #[MathExtension] ripemd160<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
-    #[MathExtension] ecrecover<[hash_len: u64, hash_ptr: u64, sign_len: u64, sig_ptr: u64, v: u64, malleability_flag: u64, register_id: u64] -> [u64]>,
+    ed25519_verify<[sig_len: u64,
+        sig_ptr: u64,
+        msg_len: u64,
+        msg_ptr: u64,
+        pub_key_len: u64,
+        pub_key_ptr: u64
+    ] -> [u64]>,
+    ripemd160<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
+    ecrecover<[hash_len: u64, hash_ptr: u64, sign_len: u64, sig_ptr: u64, v: u64, malleability_flag: u64, register_id: u64] -> [u64]>,
     // #####################
     // # Miscellaneous API #
     // #####################
@@ -154,6 +179,16 @@ imports! {
         amount_ptr: u64,
         gas: u64
     ] -> []>,
+    promise_batch_action_function_call_weight<[
+        promise_index: u64,
+        method_name_len: u64,
+        method_name_ptr: u64,
+        arguments_len: u64,
+        arguments_ptr: u64,
+        amount_ptr: u64,
+        gas: u64,
+        gas_weight: u64
+    ] -> []>,
     promise_batch_action_transfer<[promise_index: u64, amount_ptr: u64] -> []>,
     promise_batch_action_stake<[
         promise_index: u64,
@@ -189,6 +224,24 @@ imports! {
         beneficiary_id_ptr: u64
     ] -> []>,
     // #######################
+    // # Promise API yield/resume #
+    // #######################
+    promise_yield_create<[
+        method_name_len: u64,
+        method_name_ptr: u64,
+        arguments_len: u64,
+        arguments_ptr: u64,
+        gas: u64,
+        gas_weight: u64,
+        register_id: u64
+    ] -> [u64]>,
+    promise_yield_resume<[
+        data_id_len: u64,
+        data_id_ptr: u64,
+        payload_len: u64,
+        payload_ptr: u64
+    ] -> [u32]>,
+    // #######################
     // # Promise API results #
     // #######################
     promise_results_count<[] -> [u64]>,
@@ -205,7 +258,7 @@ imports! {
     storage_iter_range<[start_len: u64, start_ptr: u64, end_len: u64, end_ptr: u64] -> [u64]>,
     storage_iter_next<[iterator_id: u64, key_register_id: u64, value_register_id: u64] -> [u64]>,
     // Function for the injected gas counter. Automatically called by the gas meter.
-    gas<[gas_amount: u32] -> []>,
+    @as gas: gas_seen_from_wasm<[opcodes: u32] -> []>,
     // ###############
     // # Validator API #
     // ###############
@@ -214,195 +267,46 @@ imports! {
     // #############
     // # Alt BN128 #
     // #############
-    #["protocol_feature_alt_bn128", AltBn128] alt_bn128_g1_multiexp<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
-    #["protocol_feature_alt_bn128", AltBn128] alt_bn128_g1_sum<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
-    #["protocol_feature_alt_bn128", AltBn128] alt_bn128_pairing_check<[value_len: u64, value_ptr: u64] -> [u64]>,
+    alt_bn128_g1_multiexp<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
+    alt_bn128_g1_sum<[value_len: u64, value_ptr: u64, register_id: u64] -> []>,
+    alt_bn128_pairing_check<[value_len: u64, value_ptr: u64] -> [u64]>,
+    // #############
+    // # BLS12-381 #
+    // #############
+    bls12381_p1_sum<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_p2_sum<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_g1_multiexp<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_g2_multiexp<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_map_fp_to_g1<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_map_fp2_to_g2<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_pairing_check<[value_len: u64, value_ptr: u64] -> [u64]>,
+    bls12381_p1_decompress<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+    bls12381_p2_decompress<[value_len: u64, value_ptr: u64, register_id: u64] -> [u64]>,
+
+    // #############
+    // #  Sandbox  #
+    // #############
+    #[["sandbox"]] sandbox_debug_log<[len: u64, ptr: u64] -> []>,
+
+    // Sleep for the given number of nanoseconds. This is the ultimate
+    // undercharging function as it doesn't consume much gas or computes but
+    // takes a lot of time to execute. It must always be gated behind a feature
+    // flag and it must never be released to production.
+    #[["test_features"]] sleep_nanos<[duration: u64] -> []>,
+
+    // Burn the given amount of gas. This is the ultimate overcharging function
+    // as it doesn't take almost any resources to execute but burns a lot of
+    // gas.
+    #[["test_features"]] burn_gas<[gas: u64] -> []>,
 }
 
-#[cfg(feature = "wasmer0_vm")]
-pub(crate) mod wasmer {
-    use super::str_eq;
-    use near_vm_logic::{ProtocolVersion, VMLogic, VMLogicError};
-    use std::ffi::c_void;
+pub(crate) use {call_with_name, for_each_available_import};
 
-    #[derive(Clone, Copy)]
-    struct ImportReference(pub *mut c_void);
-    unsafe impl Send for ImportReference {}
-    unsafe impl Sync for ImportReference {}
-
-    pub(crate) fn build(
-        memory: wasmer_runtime::memory::Memory,
-        logic: &mut VMLogic<'_>,
-        protocol_version: ProtocolVersion,
-    ) -> wasmer_runtime::ImportObject {
-        let raw_ptr = logic as *mut _ as *mut c_void;
-        let import_reference = ImportReference(raw_ptr);
-        let mut import_object = wasmer_runtime::ImportObject::new_with_data(move || {
-            let import_reference = import_reference;
-            let dtor = (|_: *mut c_void| {}) as fn(*mut c_void);
-            (import_reference.0, dtor)
-        });
-
-        let mut ns = wasmer_runtime_core::import::Namespace::new();
-        ns.insert("memory", memory);
-
-        macro_rules! add_import {
-            (
-              $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] >
-            ) => {
-                #[allow(unused_parens)]
-                fn $func( ctx: &mut wasmer_runtime::Ctx, $( $arg_name: $arg_type ),* ) -> Result<($( $returns ),*), VMLogicError> {
-                    const IS_GAS: bool = str_eq(stringify!($func), "gas");
-                    let _span = if IS_GAS {
-                        None
-                    } else {
-                        Some(tracing::trace_span!(target: "host-function", stringify!($func)).entered())
-                    };
-                    let logic: &mut VMLogic<'_> = unsafe { &mut *(ctx.data as *mut VMLogic<'_>) };
-                    logic.$func( $( $arg_name, )* )
-                }
-
-                ns.insert(stringify!($func), wasmer_runtime::func!($func));
-            };
-        }
-        for_each_available_import!(protocol_version, add_import);
-
-        import_object.register("env", ns);
-        import_object
-    }
-}
-
-#[cfg(feature = "wasmer2_vm")]
-pub(crate) mod wasmer2 {
-    use super::str_eq;
-    use near_vm_logic::{ProtocolVersion, VMLogic, VMLogicError};
-
-    #[derive(wasmer::WasmerEnv, Clone)]
-    struct NearWasmerEnv {
-        /// Hack to allow usage of non-'static VMLogic as an environment in host
-        /// functions. Strictly speaking, this is unsound, but this is only
-        /// accessible to `near_vm_runner` crate, where we ensure that `VMLogic`
-        /// reference does not dangle. Still, would be great to fix this properly
-        /// one day.
-        logic: *mut (),
-    }
-    unsafe impl Send for NearWasmerEnv {}
-    unsafe impl Sync for NearWasmerEnv {}
-
-    pub(crate) fn build(
-        store: &wasmer::Store,
-        memory: wasmer::Memory,
-        logic: &mut VMLogic<'_>,
-        protocol_version: ProtocolVersion,
-    ) -> wasmer::ImportObject {
-        let env = NearWasmerEnv { logic: logic as *mut _ as *mut () };
-        let mut import_object = wasmer::ImportObject::new();
-        let mut namespace = wasmer::Exports::new();
-        namespace.insert("memory", memory);
-
-        macro_rules! add_import {
-            (
-              $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] >
-            ) => {
-                #[allow(unused_parens)]
-                fn $func(env: &NearWasmerEnv, $( $arg_name: $arg_type ),* ) -> Result<($( $returns ),*), VMLogicError> {
-                    const IS_GAS: bool = str_eq(stringify!($func), "gas");
-                    let _span = if IS_GAS {
-                        None
-                    } else {
-                        Some(tracing::trace_span!(target: "host-function", stringify!($func)).entered())
-                    };
-                    let logic: &mut VMLogic = unsafe { &mut *(env.logic as *mut VMLogic<'_>) };
-                    logic.$func( $( $arg_name, )* )
-                }
-
-                namespace.insert(stringify!($func), wasmer::Function::new_native_with_env(&store, env.clone(), $func));
-            };
-        }
-        for_each_available_import!(protocol_version, add_import);
-
-        import_object.register("env", namespace);
-        import_object
-    }
-}
-
-#[cfg(feature = "wasmtime_vm")]
-pub(crate) mod wasmtime {
-    use super::str_eq;
-    use near_vm_logic::{ProtocolVersion, VMLogic, VMLogicError};
-    use std::cell::{RefCell, UnsafeCell};
-    use std::ffi::c_void;
-
-    thread_local! {
-        static CALLER_CONTEXT: UnsafeCell<*mut c_void> = UnsafeCell::new(0 as *mut c_void);
-        static EMBEDDER_ERROR: RefCell<Option<VMLogicError>> = RefCell::new(None);
-    }
-
-    // Wasm has only i32/i64 types, so Wasmtime 0.17 only accepts
-    // external functions taking i32/i64 type.
-    // Remove, once using version with https://github.com/bytecodealliance/wasmtime/issues/1829
-    // fixed. It doesn't affect correctness, as bit patterns are the same.
-    #[cfg(feature = "wasmtime_vm")]
-    macro_rules! rust2wasm {
-        (u64) => {
-            i64
-        };
-        (u32) => {
-            i32
-        };
-        ( () ) => {
-            ()
-        };
-    }
-
-    pub(crate) fn link(
-        linker: &mut wasmtime::Linker,
-        memory: wasmtime::Memory,
-        raw_logic: *mut c_void,
-        protocol_version: ProtocolVersion,
-    ) {
-        CALLER_CONTEXT.with(|caller_context| unsafe { *caller_context.get() = raw_logic });
-        linker.define("env", "memory", memory).expect("cannot define memory");
-
-        macro_rules! add_import {
-            (
-              $func:ident < [ $( $arg_name:ident : $arg_type:ident ),* ] -> [ $( $returns:ident ),* ] >
-            ) => {
-                #[allow(unused_parens)]
-                fn $func( $( $arg_name: rust2wasm!($arg_type) ),* ) -> Result<($( rust2wasm!($returns)),*), wasmtime::Trap> {
-                    const IS_GAS: bool = str_eq(stringify!($func), "gas");
-                    let _span = if IS_GAS {
-                        None
-                    } else {
-                        Some(tracing::trace_span!(target: "host-function", stringify!($func)).entered())
-                    };
-                    let data = CALLER_CONTEXT.with(|caller_context| {
-                        unsafe {
-                            *caller_context.get()
-                        }
-                    });
-                    let logic: &mut VMLogic<'_> = unsafe { &mut *(data as *mut VMLogic<'_>) };
-                    match logic.$func( $( $arg_name as $arg_type, )* ) {
-                        Ok(result) => Ok(result as ($( rust2wasm!($returns) ),* ) ),
-                        Err(err) => {
-                            // Wasmtime doesn't have proper mechanism for wrapping custom errors
-                            // into traps. So, just store error into TLS and use special exit code here.
-                            EMBEDDER_ERROR.with(|embedder_error| {
-                                *embedder_error.borrow_mut() = Some(err)
-                            });
-                            Err(wasmtime::Trap::i32_exit(239))
-                        }
-                    }
-                }
-
-                linker.func("env", stringify!($func), $func).expect("cannot link external");
-            };
-        }
-        for_each_available_import!(protocol_version, add_import);
-    }
-
-    pub(crate) fn last_error() -> Option<near_vm_logic::VMLogicError> {
-        EMBEDDER_ERROR.with(|embedder_error| embedder_error.replace(None))
+pub(crate) const fn should_trace_host_function(host_function: &str) -> bool {
+    match host_function {
+        _ if str_eq(host_function, "gas") => false,
+        _ if str_eq(host_function, "finite_wasm_gas") => false,
+        _ => true,
     }
 }
 

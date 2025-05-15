@@ -1,24 +1,24 @@
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, thread};
 
-use log::error;
 use rand::Rng;
+use tracing::error;
 
 use near_chain_configs::Genesis;
-use near_crypto::{InMemorySigner, KeyType, Signer};
+use near_crypto::{InMemorySigner, Signer};
 use near_primitives::types::AccountId;
 use nearcore::config::NearConfig;
 
 use crate::node::Node;
-use crate::user::rpc_user::RpcUser;
 use crate::user::User;
-use actix::{Actor, System};
-use futures::{FutureExt, TryFutureExt};
-use near_jsonrpc_client::new_client;
-use near_network::test_utils::WaitOrTimeoutActor;
+use crate::user::rpc_user::RpcUser;
+use actix::System;
+use near_jsonrpc_client_internal::new_client;
+use near_network::test_utils::wait_or_timeout;
 
 pub enum ProcessNodeState {
     Stopped,
@@ -29,7 +29,8 @@ pub struct ProcessNode {
     pub work_dir: PathBuf,
     pub config: NearConfig,
     pub state: ProcessNodeState,
-    pub signer: Arc<InMemorySigner>,
+    pub signer: Arc<Signer>,
+    account_id: AccountId,
 }
 
 impl Node for ProcessNode {
@@ -38,32 +39,31 @@ impl Node for ProcessNode {
     }
 
     fn account_id(&self) -> Option<AccountId> {
-        self.config.validator_signer.as_ref().map(|vs| vs.validator_id().clone())
+        self.config.validator_signer.get().map(|vs| vs.validator_id().clone())
     }
 
     fn start(&mut self) {
         match self.state {
             ProcessNodeState::Stopped => {
-                std::env::set_var("ADVERSARY_CONSENT", "1");
+                unsafe {
+                    std::env::set_var("ADVERSARY_CONSENT", "1");
+                }
                 let child =
                     self.get_start_node_command().spawn().expect("start node command failed");
                 self.state = ProcessNodeState::Running(child);
                 let client_addr = format!("http://{}", self.config.rpc_addr().unwrap());
                 thread::sleep(Duration::from_secs(3));
                 near_actix_test_utils::run_actix(async move {
-                    WaitOrTimeoutActor::new(
-                        Box::new(move |_| {
-                            actix::spawn(
-                                new_client(&client_addr)
-                                    .status()
-                                    .map_ok(|_| System::current().stop())
-                                    .then(|_| futures::future::ready(())),
-                            );
-                        }),
-                        1000,
-                        30000,
-                    )
-                    .start();
+                    wait_or_timeout(1000, 30000, || async {
+                        let res = new_client(&client_addr).status().await;
+                        if res.is_err() {
+                            return ControlFlow::Continue(());
+                        }
+                        ControlFlow::Break(())
+                    })
+                    .await
+                    .unwrap();
+                    System::current().stop()
                 });
             }
             ProcessNodeState::Running(_) => panic!("Node is already running"),
@@ -81,7 +81,7 @@ impl Node for ProcessNode {
         }
     }
 
-    fn signer(&self) -> Arc<dyn Signer> {
+    fn signer(&self) -> Arc<Signer> {
         self.signer.clone()
     }
 
@@ -93,8 +93,11 @@ impl Node for ProcessNode {
     }
 
     fn user(&self) -> Box<dyn User> {
-        let account_id = self.signer.account_id.clone();
-        Box::new(RpcUser::new(self.config.rpc_addr().unwrap(), account_id, self.signer.clone()))
+        Box::new(RpcUser::new(
+            &self.config.rpc_addr().unwrap(),
+            self.account_id.clone(),
+            self.signer.clone(),
+        ))
     }
 
     fn as_process_ref(&self) -> &ProcessNode {
@@ -110,18 +113,16 @@ impl ProcessNode {
     /// Side effect: reset_storage
     pub fn new(config: NearConfig) -> ProcessNode {
         let mut rng = rand::thread_rng();
-        let work_dir = env::temp_dir().join(format!("process_node_{}", rng.gen::<u64>()));
-        let signer = Arc::new(InMemorySigner::from_seed(
-            config.validator_signer.as_ref().unwrap().validator_id().clone(),
-            KeyType::ED25519,
-            config.validator_signer.as_ref().unwrap().validator_id().as_ref(),
-        ));
-        let result = ProcessNode { config, work_dir, state: ProcessNodeState::Stopped, signer };
+        let work_dir = env::temp_dir().join(format!("process_node_{}", rng.r#gen::<u64>()));
+        let account_id = config.validator_signer.get().unwrap().validator_id().clone();
+        let signer = Arc::new(InMemorySigner::test_signer(&account_id));
+        let result =
+            ProcessNode { config, work_dir, state: ProcessNodeState::Stopped, signer, account_id };
         result.reset_storage();
         result
     }
 
-    /// Clear storage directory and run keygen
+    /// Clear storage directory and run key gen
     pub fn reset_storage(&self) {
         Command::new("rm").arg("-r").arg(&self.work_dir).spawn().unwrap().wait().unwrap();
         self.config.save_to_dir(&self.work_dir);
@@ -132,10 +133,8 @@ impl ProcessNode {
         if std::env::var("NIGHTLY_RUNNER").is_err() {
             let mut command = Command::new("cargo");
             command.args(&["run", "-p", "neard"]);
-            #[cfg(feature = "nightly_protocol")]
-            command.args(&["--features", "nightly_protocol"]);
-            #[cfg(feature = "nightly_protocol_features")]
-            command.args(&["--features", "nightly_protocol_features"]);
+            #[cfg(feature = "nightly")]
+            command.args(&["--features", "nightly"]);
             command.args(&["--bin", "neard", "--", "--home"]);
             command.arg(&self.work_dir);
             command.arg("run");

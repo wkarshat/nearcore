@@ -1,90 +1,149 @@
 [package]
 name = "nearcore"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
+
+[lints]
+workspace = true
 
 [dependencies]
-awc = "3.0.0-beta.5"
-actix = "=0.11.0-beta.2" # Pinned the version to avoid compilation errors
-actix_derive = "=0.6.0-beta.1" # Pinned dependency in addition to actix dependecy (remove this line once the pinning is not needed)
-actix-web = "=4.0.0-beta.6"
-actix-rt = "2"
-byteorder = "1.2"
-easy-ext = "0.2"
-chrono = { version = "0.4.4", features = ["serde"] }
-futures = "0.3"
-hyper = { version = "0.14", features = ["full"] }
-hyper-tls = "0.5.0"
-rand = "0.7"
-rayon = "1.5"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-dirs = "3"
-borsh = "0.9"
-thiserror = "1.0"
-tokio = { version = "1.1", features = ["fs"] }
-tracing = "0.1.13"
-smart-default = "0.6"
-num-rational = { version = "0.3", features = ["serde"] }
-near-rust-allocator-proxy = "0.3.0"
-lazy-static-include = "3"
-tempfile = "3"
-anyhow = "1.0.51"
+actix-rt.workspace = true
+actix-web.workspace = true
+actix.workspace = true
+anyhow.workspace = true
+borsh.workspace = true
+bytesize.workspace = true
+dirs.workspace = true
+easy-ext.workspace = true
+futures.workspace = true
+hex.workspace = true
+hyper-tls.workspace = true
+hyper.workspace = true
+indicatif.workspace = true
+itertools.workspace = true
+num-rational.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_ignored.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+xz2.workspace = true
 
-near-crypto = { path = "../core/crypto" }
-near-primitives = { path = "../core/primitives" }
-near-chain-configs = { path = "../core/chain-configs" }
-near-store = { path = "../core/store" }
-node-runtime = { path = "../runtime/runtime" }
-near-chain = { path = "../chain/chain" }
-near-chunks = { path = "../chain/chunks" }
-near-client = { path = "../chain/client" }
-near-pool = { path = "../chain/pool" }
-near-network = { path = "../chain/network" }
-near-jsonrpc = { path = "../chain/jsonrpc", optional = true }
-near-rosetta-rpc = { path = "../chain/rosetta-rpc", optional = true }
-near-telemetry = { path = "../chain/telemetry" }
-near-epoch-manager = { path = "../chain/epoch_manager" }
-near-performance-metrics = { path = "../utils/near-performance-metrics" }
-near-vm-runner = { path = "../runtime/near-vm-runner"}
-near-network-primitives = { path = "../chain/network-primitives" }
-
-delay-detector = { path = "../tools/delay_detector", optional = true }
+near-async.workspace = true
+near-chain.workspace = true
+near-chain-configs = { workspace = true, features = ["metrics"] }
+near-chunks.workspace = true
+near-client.workspace = true
+near-client-primitives.workspace = true
+near-crypto.workspace = true
+near-dyn-configs.workspace = true
+near-epoch-manager.workspace = true
+near-jsonrpc = { workspace = true, optional = true }
+near-jsonrpc-primitives = { workspace = true, optional = true }
+near-mainnet-res.workspace = true
+near-network.workspace = true
+near-o11y.workspace = true
+near-performance-metrics.workspace = true
+near-pool.workspace = true
+near-parameters.workspace = true
+near-primitives.workspace = true
+near-rosetta-rpc = { workspace = true, optional = true }
+near-store.workspace = true
+near-telemetry.workspace = true
+near-transactions-generator = { workspace = true, optional = true }
+near-vm-runner.workspace = true
+node-runtime.workspace = true
+near-config-utils.workspace = true
 
 [dev-dependencies]
-near-logger-utils = { path = "../test-utils/logger" }
-near-actix-test-utils = { path = "../test-utils/actix-test-utils" }
-tempfile = "3"
-testlib = { path = "../test-utils/testlib" }
-near-jsonrpc-primitives = { path = "../chain/jsonrpc-primitives" }
-primitive-types = "0.10"
+bencher.workspace = true
+primitive-types.workspace = true
+
+near-actix-test-utils.workspace = true
+near-jsonrpc-primitives.workspace = true
+testlib.workspace = true
+
+[[bench]]
+name = "store"
+harness = false
 
 [features]
-default = ["json_rpc"]
+default = ["json_rpc", "rosetta_rpc"]
 
-performance_stats = ["near-performance-metrics/performance_stats"]
-memory_stats = ["near-performance-metrics/memory_stats"]
+performance_stats = [
+    "near-performance-metrics/performance_stats",
+]
 c_memory_stats = ["near-performance-metrics/c_memory_stats"]
-test_features = ["near-client/test_features", "near-network/test_features", "near-store/test_features", "near-jsonrpc/test_features"]
-expensive_tests = ["near-client/expensive_tests", "near-epoch-manager/expensive_tests", "near-chain/expensive_tests"]
-no_cache = ["node-runtime/no_cache", "near-store/no_cache", "near-chain/no_cache", "near-epoch-manager/no_cache"]
-delay_detector = ["near-client/delay_detector"]
+test_features = [
+    "near-client/test_features",
+    "near-network/test_features",
+    "near-store/test_features",
+    "near-jsonrpc/test_features",
+    "near-primitives/test_features",
+    "near-vm-runner/test_features",
+]
+expensive_tests = [
+    "near-client/expensive_tests",
+    "near-epoch-manager/expensive_tests",
+    "near-chain/expensive_tests",
+]
 rosetta_rpc = ["near-rosetta-rpc"]
-json_rpc = ["near-jsonrpc"]
-protocol_feature_alt_bn128 = ["near-primitives/protocol_feature_alt_bn128", "node-runtime/protocol_feature_alt_bn128"]
-protocol_feature_chunk_only_producers = ["near-chain-configs/protocol_feature_chunk_only_producers", "near-epoch-manager/protocol_feature_chunk_only_producers", "near-chain/protocol_feature_chunk_only_producers", "near-client/protocol_feature_chunk_only_producers", "node-runtime/protocol_feature_chunk_only_producers", "near-rosetta-rpc/protocol_feature_chunk_only_producers", "near-primitives/protocol_feature_chunk_only_producers"]
-protocol_feature_routing_exchange_algorithm = ["near-primitives/protocol_feature_routing_exchange_algorithm", "near-chain/protocol_feature_routing_exchange_algorithm", "near-network/protocol_feature_routing_exchange_algorithm", "near-client/protocol_feature_routing_exchange_algorithm", "near-jsonrpc/protocol_feature_routing_exchange_algorithm"]
-protocol_feature_access_key_nonce_for_implicit_accounts = ["near-primitives/protocol_feature_access_key_nonce_for_implicit_accounts", "node-runtime/protocol_feature_access_key_nonce_for_implicit_accounts"]
-nightly_protocol_features = ["nightly_protocol", "near-primitives/nightly_protocol_features", "near-client/nightly_protocol_features", "near-epoch-manager/nightly_protocol_features", "near-store/nightly_protocol_features", "protocol_feature_alt_bn128", "protocol_feature_chunk_only_producers", "protocol_feature_routing_exchange_algorithm", "protocol_feature_access_key_nonce_for_implicit_accounts"]
-nightly_protocol = ["near-primitives/nightly_protocol", "near-jsonrpc/nightly_protocol"]
+json_rpc = ["near-jsonrpc", "near-jsonrpc-primitives"]
 
-# Force usage of a specific wasm vm irrespective of protocol version.
-force_wasmer2 = ["near-vm-runner/force_wasmer2"]
-force_wasmer0 = ["near-vm-runner/force_wasmer0"]
-force_wasmtime = ["near-vm-runner/force_wasmtime"]
+nightly = [
+    "near-actix-test-utils/nightly",
+    "near-async/nightly",
+    "near-chain-configs/nightly",
+    "near-chain/nightly",
+    "near-chunks/nightly",
+    "near-client-primitives/nightly",
+    "near-client/nightly",
+    "near-dyn-configs/nightly",
+    "near-epoch-manager/nightly",
+    "near-jsonrpc-primitives/nightly",
+    "near-jsonrpc/nightly",
+    "near-mainnet-res/nightly",
+    "near-network/nightly",
+    "near-o11y/nightly",
+    "near-parameters/nightly",
+    "near-pool/nightly",
+    "near-primitives/nightly",
+    "near-rosetta-rpc/nightly",
+    "near-store/nightly",
+    "near-telemetry/nightly",
+    "near-transactions-generator/nightly",
+    "near-vm-runner/nightly",
+    "node-runtime/nightly",
+    "testlib/nightly",
+]
+sandbox = [
+    "near-client/sandbox",
+    "near-jsonrpc/sandbox",
+    "near-o11y/sandbox",
+    "node-runtime/sandbox",
+]
+io_trace = ["node-runtime/io_trace"]
 
-sandbox = ["near-client/sandbox", "node-runtime/sandbox", "near-jsonrpc/sandbox"]
+calimero_zero_storage = ["near-primitives/calimero_zero_storage"]
+tx_generator = ["near-transactions-generator"]
+
+[package.metadata.cargo-machete]
+ignored = [
+    "near-client-primitives",
+    "near-parameters",
+    "near-performance-metrics",
+    "near-pool",
+    "node-runtime",
+]

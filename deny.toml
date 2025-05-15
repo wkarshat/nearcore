@@ -1,8 +1,22 @@
+[graph]
 targets = [
     { triple = "x86_64-unknown-linux-musl" },
     { triple = "x86_64-pc-windows-msvc" },
     { triple = "x86_64-apple-darwin" },
 ]
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception"]
+confidence-threshold = 0.8
+exceptions = []
+private = { ignore = false, registries = [] }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
 
 [bans]
 multiple-versions = "deny"
@@ -14,96 +28,95 @@ deny = [
     { name = "keccak-hash", version = "<0.4.1" },
     { name = "primitive-types", version = "<0.10.1" },
     { name = "uint", version = "<0.8.2" },
+
+    # https://github.com/near/nearcore/pull/8562
+    { name = "borsh", version = "0.10, <0.10.2" },
 ]
 
 skip = [
-    { name = "clap", version = "=2.33.3" },
-    { name = "humantime", version = "=2.1.0" },
-    { name = "textwrap", version = "=0.12.1" },
-
-    # many crates (borsh, indexmap, cached, ...) use this older version
-    { name = "hashbrown", version = "=0.9.1" },
-
-    # insta uses older version of console
-    { name = "console", version = "=0.14.1" },
-    # near-epoch-manager fixed the rand version to ensure protocol stability
-    { name = "rand", version = "=0.6.5" },
-    # rand 0.6.5 uses two versions of rand_core due to weird dependencies mismatch with rand_chacha
-    { name = "rand_core", version = "=0.3.1" },
-    { name = "rand_chacha", version = "=0.1.1" },
-    { name = "autocfg", version = "=0.1.7" },
-    # wasmer 0.17 and wasmtime 0.17 use conflicting versions of those
-    { name = "base64", version = "=0.11.0" },
-    { name = "wasmparser", version = "=0.51.4" },
-    { name = "rand_core", version = "=0.4.2" },
-    # wasmer 0.17 and wasmtime 0.17 uses older versions of some crates
-    { name = "generic-array", version = "=0.12.4" },
-
-    # `sha2` uses it
-    { name = "cfg-if", version = "=1.0.0" },
-
-    # Wasmer 2.0 indirectly uses this outdated version.
-    { name = "memmap2", version = "=0.2.3" },
-    # Wasmer 2.0 uses newer object
-    { name = "object", version = "=0.27.1" },
-    # Wasmer 2.0 uses both region 2.2.0 and 3.0.0 via dependencies
-    { name = "region", version = "=2.2.0" },
-    # Wasmtime 0.17 use rely older wasmparser.
-    { name = "wasmparser", version = "=0.76.0" },
-    # Wasmtime 0.17 use older target-lexicon.
-    { name = "target-lexicon", version = "=0.11.2" },
-
-    # param estimator uses newer imports, but it's not part of neard
-    { name = "indicatif", version = "=0.15.0" },
-    { name = "rand_xorshift", version = "=0.2.0" },
-    { name = "wasmparser", version = "=0.59.0" },
-
-    # wasmtime and actix-http
-    { name = "gimli", version = "=0.23.0" },
-
     # wasmer and wasmtime
-    { name = "target-lexicon", version = "=0.10.0" },
+    { name = "memoffset", version = "=0.6.5" },
+    { name = "memoffset", version = "=0.8.0" },
+    { name = "rustix", version = "^0.38" },
+    { name = "linux-raw-sys", version = "^0.4" },
 
-    # chain and param estimator
-    { name = "num-rational", version = "=0.3.2" },
-
-    # tracing-subscriber via near-logger-utils and clap via bindgen
-    { name = "ansi_term", version = "=0.12.1" },
+    # wasm-tools
+    { name = "wasmparser", version = "=0.78.2" },
+    { name = "wasmparser", version = "=0.99.0" },
+    { name = "wasmparser", version = "=0.105.0" },
+    { name = "wasm-encoder", version = "=0.27.0" },
+    { name = "wasmprinter", version = "=0.2.57" },
 
     # wasmer 0.17.x
-    { name = "parking_lot", version = "=0.10.2" },
-    { name = "parking_lot_core", version = "=0.7.2" },
-    { name = "lock_api", version = "=0.3.4" },
-    { name = "digest", version = "=0.8.1" },
+    { name = "target-lexicon", version = "^0.12.0" },
 
-    # chrono uses old time crate
-    { name = "time", version = "=0.1.43" },
+    # many crates haven't updated to syn 2.0 yet.
+    { name = "syn", version = "=1.0.103" },
+    { name = "heck", version = "=0.4.0" }, # paperclip
 
-    # clap v2 uses old versions
-    { name = "strsim", version = "0.8.0" },
+    # ubiquituous dependencies that are prone to duplication due to frequent "breaking" releases.
+    { name = "windows-sys", version = "<0.59" },
+    { name = "windows_x86_64_msvc", version = "<0.59" },
+    { name = "windows-targets", version = "<0.52" },
 
-    # ed25519-dalek uses older versions of rand and rand_core
-    { name = "rand", version = "=0.7.3" },
-    { name = "rand_core", version = "=0.5.1" },
-    { name = "rand_chacha", version = "=0.2.2" },
+    # ed25519-dalek, bolero uses older versions of rand and rand_core
+    { name = "rand", version = "<0.9" },
+    { name = "rand_core", version = "<0.9" },
+    { name = "rand_chacha", version = "<0.9" },
     { name = "getrandom", version = "=0.1.16" },
+    { name = "getrandom", version = "^0.2" },
 
-    # criterion and criterion-plot use conflicting versions
-    { name = "semver-parser", version = "=0.7.0" },
-    { name = "semver", version = "=0.9.0" },
+    # criterion, rocksdb depend on this older version of the crate.
+    { name = "rustc-hash", version = "<2" },
 
-    # hashbrown uses an older version
-    { name = "ahash", version = "=0.4.7" },
+    # Hashbrowns
+    { name = "hashbrown", version = "0.12.0" },
+    { name = "hashbrown", version = "0.13.2" },
+    { name = "hashbrown", version = "0.14.5" },
+    { name = "zerocopy", version = "^0.7" },
 
-    # zeropool-bn optionally uses the older borsh 0.8.2
-    { name = "borsh", version = "=0.8.2" },
-    { name = "borsh-derive", version = "=0.8.2" },
-    { name = "borsh-derive-internal", version = "=0.8.2" },
-    { name = "borsh-schema-derive-internal", version = "=0.8.2" },
+    # Bolero requires a newer version and the rest of the ecosystem hasn't caught up yet.
+    { name = "bitflags", version = "=1.3.2" },
+    { name = "indexmap", version = "=1.9.2" },
 
-    # wasmer-runtime-core-near and parity-secp256k1 use an older version
-    { name = "arrayvec", version = "=0.5.2" },
+    # Various packages haven’t upgraded to 0.base64 21 yet.
+    { name = "base64", version = "=0.13.0" },
+    { name = "ahash", version = "=0.7.8" },
 
-    # borsh uses a very old version of proc-macro-crate
-    { name = "proc-macro-crate", version = "=0.1.5" }
+    # ark-ec, criterion,
+    { name = "itertools", version = "0.10" },
+    { name = "itertools", version = "0.12" },
+
+    # actix-http hasn't upgraded iminz_oxide/flate2 yet.
+    { name = "miniz_oxide", version = "=0.5.1" },
+
+    # Everything depends on this...
+    { name = "lru", version = "=0.7.8" },
+
+    # reed-solomon-erasure latest version
+    { name = "parking_lot", version = "=0.11.2" },
+    { name = "parking_lot_core", version = "=0.8.6" },
+    { name = "spin", version = "=0.9.8" },
+
+    # ecosystem migration to 2.0 is in early phases at the time of writing.
+    { name = "thiserror", version = "<2.0" },
+    { name = "thiserror-impl", version = "<2.0" },
+    { name = "derive_more", version = "<1" },
+
+    # indicatif brings in a newer version
+    { name = "unicode-width", version = "<0.2" },
+
+    # http ecosystem split.
+    { name = "reqwest", version = "^0.11" },
+    { name = "winreg", version = "^0.50" },
+    { name = "socket2", version = "^0.4" },
+    { name = "rustls-pemfile", version = "^1" },
+    { name = "nix", version = "^0.24" },
+    { name = "mio", version = "^0.8" },
+    { name = "hyper-tls", version = "^0.5" },
+    { name = "hyper", version = "^0.14" },
+    { name = "http-body", version = "^0.4" },
+    { name = "http", version = "^0.2" },
+    { name = "h2", version = "^0.3" },
+    { name = "base64", version = "^0.21" },
 ]

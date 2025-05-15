@@ -1,16 +1,26 @@
 use crate::types::Balance;
 use aliases::Aliases;
 use borsh::{BorshDeserialize, BorshSerialize};
-use serde::Serialize;
+use near_schema_checker_lib::ProtocolSchema;
 
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(Default, BorshSerialize, BorshDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(
+    Default,
+    BorshSerialize,
+    BorshDeserialize,
+    serde::Serialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    ProtocolSchema,
+)]
 pub struct WeightedIndex {
     weight_sum: Balance,
     aliases: Vec<u64>,
     no_alias_odds: Vec<Balance>,
 }
 
+// cspell:words bigs
 impl WeightedIndex {
     pub fn new(weights: Vec<Balance>) -> Self {
         let n = Balance::from(weights.len() as u64);
@@ -18,7 +28,7 @@ impl WeightedIndex {
 
         let mut no_alias_odds = weights;
         let mut weight_sum: Balance = 0;
-        for w in no_alias_odds.iter_mut() {
+        for w in &mut no_alias_odds {
             weight_sum += *w;
             *w *= n;
         }
@@ -172,6 +182,7 @@ mod test {
     }
 
     /// Assert y is within 0.5% of x.
+    #[track_caller]
     fn assert_relative_closeness(x: i32, y: i32) {
         let diff = (y - x).abs();
         let relative_diff = f64::from(diff) / f64::from(x);

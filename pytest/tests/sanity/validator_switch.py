@@ -15,18 +15,18 @@ from transaction import sign_staking_tx
 import utils
 
 EPOCH_LENGTH = 20
-tracked_shards = {"tracked_shards": [0, 1, 2, 3]}
+tracked_shards = {
+    "tracked_shards_config": "AllShards",
+    "state_sync_enabled": True,
+    "store.state_snapshot_config.state_snapshot_type": "Enabled"
+}
 
 nodes = start_cluster(
     3, 1, 4, None,
     [["epoch_length", EPOCH_LENGTH], ["block_producer_kickout_threshold", 10],
-     ["chunk_producer_kickout_threshold", 10]], {
-         0: tracked_shards,
-         1: tracked_shards
-     })
+     ["chunk_producer_kickout_threshold", 10]], {3: tracked_shards})
 
-time.sleep(3)
-
+utils.wait_for_blocks(nodes[0], target=5)
 hash_ = nodes[0].get_latest_block().hash_bytes
 
 for i in range(4):

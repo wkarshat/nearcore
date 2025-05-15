@@ -1,28 +1,38 @@
-use serde::{Deserialize, Serialize};
+use near_primitives::hash::CryptoHash;
+use near_primitives::types::AccountId;
 use serde_json::Value;
 
-use near_primitives::types::AccountId;
-
-#[derive(Debug, Clone)]
-pub struct RpcBroadcastTransactionRequest {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RpcSendTransactionRequest {
+    #[serde(rename = "signed_tx_base64")]
     pub signed_transaction: near_primitives::transaction::SignedTransaction,
+    #[serde(default)]
+    pub wait_until: near_primitives::views::TxExecutionStatus,
 }
 
-#[derive(Debug)]
-pub struct RpcTransactionStatusCommonRequest {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct RpcTransactionStatusRequest {
+    #[serde(flatten)]
     pub transaction_info: TransactionInfo,
+    #[serde(default)]
+    pub wait_until: near_primitives::views::TxExecutionStatus,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum TransactionInfo {
-    Transaction(near_primitives::transaction::SignedTransaction),
-    TransactionId {
-        hash: near_primitives::hash::CryptoHash,
-        account_id: near_primitives::types::AccountId,
-    },
+    Transaction(SignedTransaction),
+    TransactionId { tx_hash: CryptoHash, sender_account_id: AccountId },
 }
 
-#[derive(thiserror::Error, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SignedTransaction {
+    #[serde(rename = "signed_tx_base64")]
+    SignedTransaction(near_primitives::transaction::SignedTransaction),
+}
+
+#[derive(thiserror::Error, Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "name", content = "info", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RpcTransactionError {
     #[error("An error happened during transaction execution: {context:?}")]
@@ -42,66 +52,58 @@ pub enum RpcTransactionError {
     TimeoutError,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct RpcTransactionResponse {
     #[serde(flatten)]
-    pub final_execution_outcome: near_primitives::views::FinalExecutionOutcomeViewEnum,
+    pub final_execution_outcome: Option<near_primitives::views::FinalExecutionOutcomeViewEnum>,
+    pub final_execution_status: near_primitives::views::TxExecutionStatus,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct RpcBroadcastTxSyncResponse {
     pub transaction_hash: near_primitives::hash::CryptoHash,
 }
 
-impl RpcBroadcastTransactionRequest {
-    pub fn parse(value: Option<Value>) -> Result<Self, crate::errors::RpcParseError> {
-        let signed_transaction = crate::utils::parse_signed_transaction(value)?;
-        Ok(Self { signed_transaction })
+impl TransactionInfo {
+    pub fn from_signed_tx(tx: near_primitives::transaction::SignedTransaction) -> Self {
+        Self::Transaction(SignedTransaction::SignedTransaction(tx))
     }
-}
 
-impl RpcTransactionStatusCommonRequest {
-    pub fn parse(value: Option<Value>) -> Result<Self, crate::errors::RpcParseError> {
-        if let Ok((hash, account_id)) = crate::utils::parse_params::<(
-            near_primitives::hash::CryptoHash,
-            AccountId,
-        )>(value.clone())
-        {
-            let transaction_info = TransactionInfo::TransactionId { hash, account_id };
-            Ok(Self { transaction_info })
-        } else {
-            let signed_transaction = crate::utils::parse_signed_transaction(value)?;
-            let transaction_info = TransactionInfo::Transaction(signed_transaction);
-            Ok(Self { transaction_info })
+    pub fn to_signed_tx(&self) -> Option<&near_primitives::transaction::SignedTransaction> {
+        match self {
+            TransactionInfo::Transaction(tx) => match tx {
+                SignedTransaction::SignedTransaction(tx) => Some(tx),
+            },
+            TransactionInfo::TransactionId { .. } => None,
+        }
+    }
+
+    pub fn to_tx_hash_and_account(&self) -> (CryptoHash, &AccountId) {
+        match self {
+            TransactionInfo::Transaction(tx) => match tx {
+                SignedTransaction::SignedTransaction(tx) => {
+                    (tx.get_hash(), tx.transaction.signer_id())
+                }
+            },
+            TransactionInfo::TransactionId { tx_hash, sender_account_id } => {
+                (*tx_hash, sender_account_id)
+            }
         }
     }
 }
 
-impl From<near_client_primitives::types::TxStatusError> for RpcTransactionError {
-    fn from(error: near_client_primitives::types::TxStatusError) -> Self {
-        match error {
-            near_client_primitives::types::TxStatusError::ChainError(err) => {
-                Self::InternalError { debug_info: format!("{:?}", err) }
-            }
-            near_client_primitives::types::TxStatusError::MissingTransaction(
-                requested_transaction_hash,
-            ) => Self::UnknownTransaction { requested_transaction_hash },
-            near_client_primitives::types::TxStatusError::InvalidTx(context) => {
-                Self::InvalidTransaction { context }
-            }
-            near_client_primitives::types::TxStatusError::InternalError(debug_info) => {
-                Self::InternalError { debug_info }
-            }
-            near_client_primitives::types::TxStatusError::TimeoutError => Self::TimeoutError,
-        }
+impl From<near_primitives::transaction::SignedTransaction> for TransactionInfo {
+    fn from(transaction_info: near_primitives::transaction::SignedTransaction) -> Self {
+        Self::Transaction(SignedTransaction::SignedTransaction(transaction_info))
     }
 }
 
-impl From<near_primitives::views::FinalExecutionOutcomeViewEnum> for RpcTransactionResponse {
-    fn from(
-        final_execution_outcome: near_primitives::views::FinalExecutionOutcomeViewEnum,
-    ) -> Self {
-        Self { final_execution_outcome }
+impl From<near_primitives::views::TxStatusView> for RpcTransactionResponse {
+    fn from(view: near_primitives::views::TxStatusView) -> Self {
+        Self {
+            final_execution_outcome: view.execution_outcome,
+            final_execution_status: view.status,
+        }
     }
 }
 
@@ -128,16 +130,10 @@ impl From<RpcTransactionError> for crate::errors::RpcError {
                 return Self::new_internal_error(
                     None,
                     format!("Failed to serialize RpcTransactionError: {:?}", err),
-                )
+                );
             }
         };
 
         Self::new_internal_or_handler_error(Some(error_data), error_data_value)
-    }
-}
-
-impl From<actix::MailboxError> for RpcTransactionError {
-    fn from(error: actix::MailboxError) -> Self {
-        Self::InternalError { debug_info: error.to_string() }
     }
 }

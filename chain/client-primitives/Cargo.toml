@@ -1,27 +1,34 @@
 [package]
 name = "near-client-primitives"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
-publish = true
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/near/nearcore"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
 description = "This crate hosts NEAR client-related error types"
+repository.workspace = true
+license.workspace = true
+publish = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lints]
+workspace = true
 
 [dependencies]
-actix = "=0.11.0-beta.2"
-chrono = { version = "0.4.4", features = ["serde"] }
-strum = { version = "0.20", features = ["derive"] }
-thiserror = "1.0"
+actix.workspace = true
+serde.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
-near-chain-primitives = { path = "../chain-primitives" }
-near-chain-configs = { path = "../../core/chain-configs" }
+near-time.workspace = true
+near-chain-primitives.workspace = true
+near-chain-configs.workspace = true
+near-chunks-primitives.workspace = true
+near-crypto.workspace = true
+near-primitives.workspace = true
 
-near-chunks-primitives = { path = "../chunks-primitives" }
-near-crypto = { path = "../../core/crypto" }
-near-network-primitives = { path = "../network-primitives" }
-near-primitives = { path = "../../core/primitives" }
+[features]
+nightly = [
+  "near-chain-configs/nightly",
+  "near-primitives/nightly",
+]
+sandbox = []
+test_features = ["near-primitives/test_features"]

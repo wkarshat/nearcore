@@ -1,6 +1,6 @@
 from messages.crypto import Signature, PublicKey, MerklePath, ShardProof
 from messages.tx import SignedTransaction, Receipt
-from messages.block import Block, Approval, PartialEncodedChunk, PartialEncodedChunkV1, PartialEncodedChunkRequestMsg, PartialEncodedChunkResponseMsg, PartialEncodedChunkForwardMsg, BlockHeader, ShardChunk, ShardChunkHeader, ShardChunkHeaderV1
+from messages.block import Block, Approval, PartialEncodedChunk, PartialEncodedChunkRequestMsg, PartialEncodedChunkResponseMsg, PartialEncodedChunkForwardMsg, BlockHeader, ShardChunk, ShardChunkHeader, ShardChunkHeaderV1, ChunkEndorsement, ChunkEndorsementV1, ChunkStateWitnessAck, PartialEncodedStateWitness, ChunkContractAccesses, PartialEncodedContractDeploys, ContractCodeRequest, ContractCodeResponse
 from messages.shard import StateRootNode
 
 
@@ -40,7 +40,7 @@ class PeerChainInfoV2:
     pass
 
 
-class EdgeInfo:
+class PartialEdgeInfo:
     pass
 
 
@@ -52,11 +52,7 @@ class Edge:
     pass
 
 
-class SyncData:
-    pass
-
-
-class RoutingTableSyncV2:
+class RoutingTableUpdate:
     pass
 
 
@@ -136,6 +132,22 @@ class PartialSync:
     pass
 
 
+class SyncSnapshotHosts:
+    pass
+
+
+class SnapshotHostInfo:
+    pass
+
+
+class DistanceVector:
+    pass
+
+
+class AdvertisedPeerDistance:
+    pass
+
+
 network_schema = [
     [
         SocketAddr, {
@@ -155,9 +167,9 @@ network_schema = [
                 ['Handshake', Handshake],
                 ['HandshakeFailure', (PeerInfo, HandshakeFailureReason)],
                 ['LastEdge', Edge],
-                ['Sync', SyncData],
-                ['RequestUpdateNonce', EdgeInfo],
-                ['ResponseUpdateNonce', Edge],
+                ['SyncRoutingTable', RoutingTableUpdate],
+                ['RequestUpdateNonce', PartialEdgeInfo],
+                ['_UnusedResponseUpdateNonce', None],
                 ['PeersRequest', ()],
                 ['PeersResponse', [PeerInfo]],
                 ['BlockHeadersRequest', [[32]]],
@@ -168,12 +180,17 @@ network_schema = [
                 ['Routed', RoutedMessage],
                 ['Disconnect', ()],
                 ['Challenge', None],  # TODO
-                ['HandshakeV2', HandshakeV2],
-                ['EpochSyncRequest', None],  # TODO
-                ['EpochSyncResponse', None],  # TODO
-                ['EpochSyncFinalizationRequest', None],  # TODO
-                ['EpochSyncFinalizationResponse', None],  # TODO
-                ['RoutingTableSyncV2', RoutingTableSyncV2],
+                ['_UnusedHandshakeV2', None],
+                ['_UnusedEpochSyncRequest', None],
+                ['_UnusedEpochSyncResponse', None],
+                ['_UnusedEpochSyncFinalizationRequest', None],
+                ['_UnusedEpochSyncFinalizationResponse', None],
+                ['_UnusedRoutingTableSyncV2', RoutingTableSyncV2],
+                ['DistanceVector', DistanceVector],
+                ['StateRequestHeader', ('u64', [32])],
+                ['StateRequestPart', ('u64', [32], 'u64')],
+                ['VersionedStateResponse', None],  # TODO
+                ['SyncSnapshotHosts', SyncSnapshotHosts],
             ]
         }
     ],
@@ -191,7 +208,7 @@ network_schema = [
                     'type': 'u16'
                 }],
                 ['chain_info', PeerChainInfoV2],
-                ['edge_info', EdgeInfo],
+                ['edge_info', PartialEdgeInfo],
             ]
         }
     ],
@@ -209,7 +226,7 @@ network_schema = [
                     'type': 'u16'
                 }],
                 ['chain_info', PeerChainInfo],
-                ['edge_info', EdgeInfo],
+                ['edge_info', PartialEdgeInfo],
             ]
         }
     ],
@@ -283,7 +300,7 @@ network_schema = [
         }
     ],
     [
-        SyncData, {
+        RoutingTableUpdate, {
             'kind': 'struct',
             'fields': [
                 ['edges', [Edge]],
@@ -292,7 +309,7 @@ network_schema = [
         }
     ],
     [
-        EdgeInfo, {
+        PartialEdgeInfo, {
             'kind': 'struct',
             'fields': [
                 ['nonce', 'u64'],
@@ -355,22 +372,38 @@ network_schema = [
                 ['BlockApproval', Approval],
                 ['ForwardTx', SignedTransaction],
                 ['TxStatusRequest', ('string', [32])],
-                ['TxStatusResponse', None],  # TODO
-                ['QueryRequest', None],  # TODO
-                ['QueryResponse', None],  # TODO
-                ['ReceiptOutcomeRequest', [32]],
-                ['ReceiptOutcomeResponse', None],  # TODO
-                ['StateRequestHeader', ('u64', [32])],
-                ['StateRequestPart', ('u64', [32], 'u64')],
-                ['StateResponseInfo', StateResponseInfoV1],
+                ['TxStatusResponse', None],  # TODO: Implement this.
+                ['_UnusedQueryRequest', None],
+                ['_UnusedQueryResponse', None],
+                ['_UnusedReceiptOutcomeRequest', None],
+                ['_UnusedReceiptOutcomeResponse', None],
+                ['_UnusedStateRequestHeader', None],
+                ['_UnusedStateRequestPart', None],
+                ['StateResponse', StateResponseInfoV1],
                 ['PartialEncodedChunkRequest', PartialEncodedChunkRequestMsg],
                 ['PartialEncodedChunkResponse', PartialEncodedChunkResponseMsg],
-                ['PartialEncodedChunk', PartialEncodedChunkV1],
+                ['_UnusedPartialEncodedChunk', None],
                 ['Ping', PingPong],
                 ['Pong', PingPong],
                 ['VersionedPartialEncodedChunk', PartialEncodedChunk],
-                ['VersionedStateResponse', StateResponseInfo],
-                ['PartialEncodedChunkForward', PartialEncodedChunkForwardMsg]
+                ['_UnusedVersionedStateResponse', None],
+                ['PartialEncodedChunkForward', PartialEncodedChunkForwardMsg],
+                ['_UnusedChunkStateWitness', None],
+                ['ChunkEndorsement', ChunkEndorsementV1],
+                ['ChunkStateWitnessAck', ChunkStateWitnessAck],
+                ['PartialEncodedStateWitness', PartialEncodedStateWitness],
+                [
+                    'PartialEncodedStateWitnessForward',
+                    PartialEncodedStateWitness
+                ],
+                ['VersionedChunkEndorsement', ChunkEndorsement],
+                ['ChunkContractAccesses', ChunkContractAccesses],
+                ['ContractCodeRequest', ContractCodeRequest],
+                ['ContractCodeResponse', ContractCodeResponse],
+                [
+                    'PartialEncodedContractDeploys',
+                    PartialEncodedContractDeploys
+                ],
             ]
         }
     ],
@@ -550,6 +583,45 @@ network_schema = [
             'fields': [
                 ['ibf_level', 'u64'],
                 ['ibf', [IbfElem]],
+            ]
+        }
+    ],
+    [
+        SyncSnapshotHosts, {
+            'kind': 'struct',
+            'fields': [['hosts', [SnapshotHostInfo]],]
+        }
+    ],
+    [
+        SnapshotHostInfo, {
+            'kind':
+                'struct',
+            'fields': [
+                ['peer_id', PublicKey],
+                ['sync_hash', [32]],
+                ['epoch_height', 'u64'],
+                ['shards', ['u64']],
+                ['signature', Signature],
+            ]
+        }
+    ],
+    [
+        AdvertisedPeerDistance, {
+            'kind': 'struct',
+            'fields': [
+                ['destination', PublicKey],
+                ['distance', 'u32'],
+            ]
+        }
+    ],
+    [
+        DistanceVector, {
+            'kind':
+                'struct',
+            'fields': [
+                ['root', PublicKey],
+                ['distances', [AdvertisedPeerDistance]],
+                ['edges', [Edge]],
             ]
         }
     ]

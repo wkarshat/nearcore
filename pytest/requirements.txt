@@ -1,17 +1,24 @@
 PyGithub
 base58
+cachetools
 cython
 deepdiff
-ed25519
+json-rpc
+locust>=2.28
+geventhttpclient>=2.3.1
+nearup
 numpy
 prometheus-client
+psutil
 pynacl
 python-rc==0.3.9
 requests
 retrying
 scikit-learn
-# TODO(mina86): scipy 1.7.2 breaks buildkite so for the time being pin
-# to an older version.  Remove the pin once issue is fixed properly.
-scipy==1.7.1
+scipy
 semver
+toml
 tqdm
+urllib3<2
+datetime
+jmespath

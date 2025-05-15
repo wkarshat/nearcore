@@ -1,11 +1,6 @@
-#[macro_use]
-extern crate bencher;
-
-use bencher::{black_box, Bencher};
-use near_primitives::borsh::maybestd::sync::Arc;
+use bencher::{Bencher, benchmark_group, benchmark_main, black_box};
 use near_primitives::errors::StorageError;
-use near_store::db::DBCol::ColBlockMerkleTree;
-use near_store::{create_store, DBCol, Store};
+use near_store::{DBCol, NodeStorage, Store};
 use std::time::{Duration, Instant};
 
 /// Run a benchmark to generate `num_keys` keys, each of size `key_size`, then write then
@@ -18,7 +13,13 @@ fn benchmark_write_then_read_successful(
     max_value_size: usize,
     col: DBCol,
 ) {
-    let store = create_store_in_random_folder();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    // Use default StoreConfig rather than NodeStorage::test_opener so we’re using the
+    // same configuration as in production.
+    let store = NodeStorage::opener(tmp_dir.path(), &Default::default(), None)
+        .open()
+        .unwrap()
+        .get_hot_store();
     let keys = generate_keys(num_keys, key_size);
     write_to_db(&store, &keys, max_value_size, col);
 
@@ -37,13 +38,6 @@ fn benchmark_write_then_read_successful(
     });
 }
 
-/// Create `Store` in a random folder.
-fn create_store_in_random_folder() -> Arc<Store> {
-    let tmp_dir = tempfile::Builder::new().prefix("_test_clear_column").tempdir().unwrap();
-    let store = create_store(tmp_dir.path());
-    store
-}
-
 /// Generate `count` keys of `key_size` length.
 fn generate_keys(count: usize, key_size: usize) -> Vec<Vec<u8>> {
     let mut res: Vec<Vec<u8>> = Vec::new();
@@ -55,9 +49,9 @@ fn generate_keys(count: usize, key_size: usize) -> Vec<Vec<u8>> {
     res
 }
 
-/// Read from DB value for given `kyes` in random order for `col`.
+/// Read from DB value for given `keys` in random order for `col`.
 /// Works only for column configured without reference counting, that is `.is_rc() == false`.
-fn read_from_db(store: &Arc<Store>, keys: &Vec<Vec<u8>>, col: DBCol) -> usize {
+fn read_from_db(store: &Store, keys: &[Vec<u8>], col: DBCol) -> usize {
     let mut read = 0;
     for _k in 0..keys.len() {
         let r = rand::random::<u32>() % (keys.len() as u32);
@@ -76,13 +70,13 @@ fn read_from_db(store: &Arc<Store>, keys: &Vec<Vec<u8>>, col: DBCol) -> usize {
 /// Write random value of size between `0` and `max_value_size` to given `keys` at specific column
 /// `col.`
 /// Works only for column configured without reference counting, that is `.is_rc() == false`.
-fn write_to_db(store: &Arc<Store>, keys: &[Vec<u8>], max_value_size: usize, col: DBCol) {
+fn write_to_db(store: &Store, keys: &[Vec<u8>], max_value_size: usize, col: DBCol) {
     let mut store_update = store.store_update();
-    for key in keys.iter() {
+    for key in keys {
         let x: usize = rand::random::<usize>() % max_value_size;
         let val: Vec<u8> = (0..x).map(|_| rand::random::<u8>()).collect();
         // NOTE:  this
-        store_update.set(col, key.as_slice().clone(), &val);
+        store_update.set(col, &key, &val);
     }
     store_update.commit().unwrap();
 }
@@ -90,8 +84,8 @@ fn write_to_db(store: &Arc<Store>, keys: &[Vec<u8>], max_value_size: usize, col:
 fn benchmark_write_then_read_successful_10m(bench: &mut Bencher) {
     // By adding logs, I've seen a lot of write to keys with size 40, an values with sizes
     // between 10 .. 333.
-    // NOTE: ColBlockMerkleTree was chosen to be a column, where `.is_rc() == false`.
-    benchmark_write_then_read_successful(bench, 10_000_000, 40, 333, ColBlockMerkleTree);
+    // NOTE: DBCol::BlockMerkleTree was chosen to be a column, where `.is_rc() == false`.
+    benchmark_write_then_read_successful(bench, 10_000_000, 40, 333, DBCol::BlockMerkleTree);
 }
 
 benchmark_group!(benches, benchmark_write_then_read_successful_10m);

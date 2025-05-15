@@ -1,5 +1,9 @@
-pub(crate) mod codec;
 pub(crate) mod peer_actor;
-mod rate_counter;
+mod stream;
 mod tracker;
-pub(crate) mod utils;
+mod transfer_stats;
+
+#[cfg(test)]
+pub(crate) mod testonly;
+#[cfg(test)]
+mod tests;

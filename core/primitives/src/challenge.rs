@@ -1,66 +1,52 @@
-use borsh::{BorshDeserialize, BorshSerialize};
-use serde::{Deserialize, Serialize};
-
-use near_crypto::Signature;
-
-use crate::hash::{hash, CryptoHash};
+use crate::hash::CryptoHash;
 use crate::merkle::MerklePath;
 use crate::sharding::{EncodedShardChunk, ShardChunk, ShardChunkHeader};
+use crate::state::PartialState;
 use crate::types::AccountId;
-use crate::validator_signer::ValidatorSigner;
-
-/// Serialized TrieNodeWithSize
-pub type StateItem = Vec<u8>;
-
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Debug, Clone, Eq, PartialEq)]
-pub struct PartialState(pub Vec<StateItem>);
+use borsh::{BorshDeserialize, BorshSerialize};
+use near_crypto::Signature;
+use near_primitives_core::types::BlockHeight;
+use near_schema_checker_lib::ProtocolSchema;
+use std::fmt::Debug;
 
 /// Double signed block.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 pub struct BlockDoubleSign {
     pub left_block_header: Vec<u8>,
     pub right_block_header: Vec<u8>,
 }
 
-impl std::fmt::Display for BlockDoubleSign {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{:?}", self)
-    }
-}
-
 /// Invalid chunk (body of the chunk doesn't match proofs or invalid encoding).
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 pub struct ChunkProofs {
     /// Encoded block header that contains invalid chunk.
     pub block_header: Vec<u8>,
     /// Merkle proof of inclusion of this chunk.
     pub merkle_proof: MerklePath,
     /// Invalid chunk in an encoded form or in a decoded form.
-    pub chunk: MaybeEncodedShardChunk,
+    pub chunk: Box<MaybeEncodedShardChunk>,
 }
 
 /// Either `EncodedShardChunk` or `ShardChunk`. Used for `ChunkProofs`.
 /// `Decoded` is used to avoid re-encoding an already decoded chunk to construct a challenge.
 /// `Encoded` is still needed in case a challenge challenges an invalid encoded chunk that can't be
 /// decoded.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // both variants are large
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 pub enum MaybeEncodedShardChunk {
     Encoded(EncodedShardChunk),
     Decoded(ShardChunk),
 }
 
 /// Doesn't match post-{state root, outgoing receipts, gas used, etc} results after applying previous chunk.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 pub struct ChunkState {
     /// Encoded prev block header.
     pub prev_block_header: Vec<u8>,
-    /// Encoded block header that contains invalid chunnk.
-    pub block_header: Vec<u8>,
+    /// Block height.
+    /// TODO: block header is likely to be needed if we ever want to support
+    /// challenges fully.
+    pub block_height: BlockHeight,
     /// Merkle proof in inclusion of prev chunk.
     pub prev_merkle_proof: MerklePath,
     /// Previous chunk that contains transactions.
@@ -73,8 +59,7 @@ pub struct ChunkState {
     pub partial_state: PartialState,
 }
 
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 // TODO(#1313): Use Box
 #[allow(clippy::large_enum_variant)]
 pub enum ChallengeBody {
@@ -83,44 +68,35 @@ pub enum ChallengeBody {
     ChunkState(ChunkState),
 }
 
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug)]
-#[borsh_init(init)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
+#[borsh(init=init)]
 pub struct Challenge {
     pub body: ChallengeBody,
     pub account_id: AccountId,
     pub signature: Signature,
 
-    #[borsh_skip]
+    #[borsh(skip)]
     pub hash: CryptoHash,
 }
 
 impl Challenge {
     pub fn init(&mut self) {
-        self.hash = hash(&self.body.try_to_vec().expect("Failed to serialize"));
-    }
-
-    pub fn produce(body: ChallengeBody, signer: &dyn ValidatorSigner) -> Self {
-        let (hash, signature) = signer.sign_challenge(&body);
-        Self { body, account_id: signer.validator_id().clone(), signature, hash }
+        self.hash = CryptoHash::hash_borsh(&self.body);
     }
 }
 
-pub type Challenges = Vec<Challenge>;
-
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    PartialEq,
+    Eq,
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    ProtocolSchema,
+)]
 pub struct SlashedValidator {
     pub account_id: AccountId,
     pub is_double_sign: bool,
 }
-
-impl SlashedValidator {
-    pub fn new(account_id: AccountId, is_double_sign: bool) -> Self {
-        SlashedValidator { account_id, is_double_sign }
-    }
-}
-
-/// Result of checking challenge, contains which accounts to slash.
-/// If challenge is invalid this is sender, otherwise author of chunk (and possibly other participants that signed invalid blocks).
-pub type ChallengesResult = Vec<SlashedValidator>;

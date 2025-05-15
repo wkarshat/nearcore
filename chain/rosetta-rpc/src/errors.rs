@@ -1,10 +1,20 @@
-#[derive(Debug, strum::EnumIter)]
+use std::num::ParseIntError;
+
+use near_account_id::ParseAccountError;
+
+#[derive(Debug, strum::EnumIter, thiserror::Error)]
 pub(crate) enum ErrorKind {
+    #[error("Invalid input: {0}")]
     InvalidInput(String),
+    #[error("Not found: {0}")]
     NotFound(String),
+    #[error("Wrong network: {0}")]
     WrongNetwork(String),
+    #[error("Timeout: {0}")]
     Timeout(String),
+    #[error("Internal invariant violation: {0}")]
     InternalInvariantError(String),
+    #[error("Internal error: {0}")]
     InternalError(String),
 }
 
@@ -35,10 +45,6 @@ impl From<near_client::TxStatusError> for ErrorKind {
             near_client::TxStatusError::MissingTransaction(err) => {
                 Self::NotFound(format!("Transaction is missing: {:?}", err))
             }
-            near_client::TxStatusError::InvalidTx(err) => Self::NotFound(format!(
-                "Transaction is invalid, so it will never be included to the chain: {:?}",
-                err
-            )),
             near_client::TxStatusError::InternalError(_)
             | near_client::TxStatusError::TimeoutError => {
                 // TODO: remove the statuses from TxStatusError since they are
@@ -53,6 +59,23 @@ impl From<near_client::TxStatusError> for ErrorKind {
     }
 }
 
+impl From<ParseAccountError> for ErrorKind {
+    fn from(value: ParseAccountError) -> Self {
+        Self::InvalidInput(format!("Parse Account Error: kind {:?}", value.kind()))
+    }
+}
+
+impl From<ParseIntError> for ErrorKind {
+    fn from(value: ParseIntError) -> Self {
+        Self::InvalidInput(format!("Parse Int Error: kind {:?}", value.kind()))
+    }
+}
+
+impl From<serde_json::Error> for ErrorKind {
+    fn from(value: serde_json::Error) -> Self {
+        Self::InternalInvariantError(format!("JSON Serialization Error, {:?}", value))
+    }
+}
 impl From<near_client_primitives::types::GetStateChangesError> for ErrorKind {
     fn from(err: near_client_primitives::types::GetStateChangesError) -> Self {
         match err {

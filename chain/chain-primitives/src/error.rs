@@ -1,19 +1,11 @@
-use std::fmt::{self, Display};
-use std::io;
-
-use chrono::DateTime;
-use near_primitives::time::Utc;
-
-use failure::{Backtrace, Context, Fail};
-use log::error;
-
 use near_primitives::block::BlockValidityError;
-use near_primitives::challenge::{ChunkProofs, ChunkState};
-use near_primitives::errors::{EpochError, StorageError};
-use near_primitives::serialize::to_base;
+use near_primitives::challenge::{ChunkProofs, MaybeEncodedShardChunk};
+use near_primitives::errors::{ChunkAccessError, EpochError, StorageError};
 use near_primitives::shard_layout::ShardLayoutError;
-use near_primitives::sharding::{ChunkHash, ShardChunkHeader};
-use near_primitives::types::{BlockHeight, EpochId, ShardId};
+use near_primitives::sharding::{BadHeaderForProtocolVersionError, ChunkHash, ShardChunkHeader};
+use near_primitives::types::{BlockHeight, EpochId, ShardId, ShardIndex};
+use near_time::Utc;
+use std::io;
 
 #[derive(thiserror::Error, Debug)]
 pub enum QueryError {
@@ -63,162 +55,195 @@ pub enum QueryError {
     },
 }
 
-#[derive(Debug)]
-pub struct Error {
-    inner: Context<ErrorKind>,
-}
-
-#[derive(Clone, Eq, PartialEq, Debug, Fail)]
-pub enum ErrorKind {
-    /// The block doesn't fit anywhere in our chain.
-    #[fail(display = "Block is unfit: {}", _0)]
-    Unfit(String),
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The block is already known
+    #[error("Block is known: {0}")]
+    BlockKnown(#[from] BlockKnownError),
+    #[error("Too many blocks being processed")]
+    TooManyProcessingBlocks,
     /// Orphan block.
-    #[fail(display = "Orphan")]
+    #[error("Orphan")]
     Orphan,
     /// Chunk is missing.
-    #[fail(display = "Chunk Missing (unavailable on the node): {:?}", _0)]
+    #[error("Chunk Missing (unavailable on the node): {0:?}")]
     ChunkMissing(ChunkHash),
     /// Chunks missing with header info.
-    #[fail(display = "Chunks Missing: {:?}", _0)]
+    #[error("Chunks Missing: {0:?}")]
     ChunksMissing(Vec<ShardChunkHeader>),
+    /// Block is pending optimistic block execution.
+    #[error("Block Pending Optimistic Execution")]
+    BlockPendingOptimisticExecution,
     /// Block time is before parent block time.
-    #[fail(display = "Invalid Block Time: block time {} before previous {}", _1, _0)]
-    InvalidBlockPastTime(DateTime<Utc>, DateTime<Utc>),
+    #[error("Invalid Block Time: block time {1} before previous {0}")]
+    InvalidBlockPastTime(Utc, Utc),
     /// Block time is from too much in the future.
-    #[fail(display = "Invalid Block Time: Too far in the future: {}", _0)]
-    InvalidBlockFutureTime(DateTime<Utc>),
+    #[error("Invalid Block Time: Too far in the future: {0}")]
+    InvalidBlockFutureTime(Utc),
     /// Block height is invalid (not previous + 1).
-    #[fail(display = "Invalid Block Height {}", _0)]
+    #[error("Invalid Block Height {0}")]
     InvalidBlockHeight(BlockHeight),
     /// Invalid block proposed signature.
-    #[fail(display = "Invalid Block Proposer Signature")]
+    #[error("Invalid Block Proposer Signature")]
     InvalidBlockProposer,
     /// Invalid state root hash.
-    #[fail(display = "Invalid State Root Hash")]
+    #[error("Invalid State Root Hash")]
     InvalidStateRoot,
     /// Invalid block tx root hash.
-    #[fail(display = "Invalid Block Tx Root Hash")]
+    #[error("Invalid Block Tx Root Hash")]
     InvalidTxRoot,
     /// Invalid chunk receipts root hash.
-    #[fail(display = "Invalid Chunk Receipts Root Hash")]
+    #[error("Invalid Chunk Receipts Root Hash")]
     InvalidChunkReceiptsRoot,
     /// Invalid chunk headers root hash.
-    #[fail(display = "Invalid Chunk Headers Root Hash")]
+    #[error("Invalid Chunk Headers Root Hash")]
     InvalidChunkHeadersRoot,
     /// Invalid chunk tx root hash.
-    #[fail(display = "Invalid Chunk Tx Root Hash")]
+    #[error("Invalid Chunk Tx Root Hash")]
     InvalidChunkTxRoot,
     /// Invalid receipts proof.
-    #[fail(display = "Invalid Receipts Proof")]
+    #[error("Invalid Receipts Proof")]
     InvalidReceiptsProof,
     /// Invalid outcomes proof.
-    #[fail(display = "Invalid Outcomes Proof")]
+    #[error("Invalid Outcomes Proof")]
     InvalidOutcomesProof,
     /// Invalid state payload on state sync.
-    #[fail(display = "Invalid State Payload")]
+    #[error("Invalid State Payload")]
     InvalidStatePayload,
     /// Invalid transactions in the block.
-    #[fail(display = "Invalid Transactions")]
+    #[error("Invalid Transactions")]
     InvalidTransactions,
-    /// Invalid Challenge Root (doesn't match actual challenge)
-    #[fail(display = "Invalid Challenge Root")]
-    InvalidChallengeRoot,
     /// Invalid challenge (wrong signature or format).
-    #[fail(display = "Invalid Challenge")]
+    #[error("Invalid Challenge")]
     InvalidChallenge,
-    /// Incorrect (malicious) challenge (slash the sender).
-    #[fail(display = "Malicious Challenge")]
-    MaliciousChallenge,
     /// Incorrect number of chunk headers
-    #[fail(display = "Incorrect Number of Chunk Headers")]
+    #[error("Incorrect Number of Chunk Headers")]
     IncorrectNumberOfChunkHeaders,
     /// Invalid chunk.
-    #[fail(display = "Invalid Chunk")]
-    InvalidChunk,
+    #[error("Invalid Chunk")]
+    InvalidChunk(String),
+    /// One of the chunks has invalid transactions order
+    #[error("Invalid Chunk Transactions Order")]
+    InvalidChunkTransactionsOrder(Box<MaybeEncodedShardChunk>),
     /// One of the chunks has invalid proofs
-    #[fail(display = "Invalid Chunk Proofs")]
+    #[error("Invalid Chunk Proofs")]
     InvalidChunkProofs(Box<ChunkProofs>),
-    /// Invalid chunk state.
-    #[fail(display = "Invalid Chunk State")]
-    InvalidChunkState(Box<ChunkState>),
+    #[error("Invalid Chunk State Witness: {0}")]
+    InvalidChunkStateWitness(String),
+    #[error("Invalid Partial Chunk State Witness: {0}")]
+    InvalidPartialChunkStateWitness(String),
+    #[error("Invalid Chunk Endorsement")]
+    InvalidChunkEndorsement,
     /// Invalid chunk mask
-    #[fail(display = "Invalid Chunk Mask")]
+    #[error("Invalid Chunk Endorsement Bitmap")]
+    InvalidChunkEndorsementBitmap(String),
+    /// Invalid chunk mask
+    #[error("Invalid Chunk Mask")]
     InvalidChunkMask,
     /// The chunk height is outside of the horizon
-    #[fail(display = "Invalid Chunk Height")]
+    #[error("Invalid Chunk Height")]
     InvalidChunkHeight,
     /// Invalid epoch hash
-    #[fail(display = "Invalid Epoch Hash")]
+    #[error("Invalid Epoch Hash")]
     InvalidEpochHash,
-    /// `next_bps_hash` doens't correspond to the actual next block producers set
-    #[fail(display = "Invalid Next BP Hash")]
+    /// `next_bps_hash` doesn't correspond to the actual next block producers set
+    #[error("Invalid Next BP Hash")]
     InvalidNextBPHash,
+    /// The block has a protocol version that's outdated
+    #[error("Invalid protocol version")]
+    InvalidProtocolVersion,
     /// The block doesn't have approvals from 50% of the block producers
-    #[fail(display = "Not enough approvals")]
+    #[error("Not enough approvals")]
     NotEnoughApprovals,
     /// The information about the last final block is incorrect
-    #[fail(display = "Invalid finality info")]
+    #[error("Invalid finality info")]
     InvalidFinalityInfo,
     /// Invalid validator proposals in the block.
-    #[fail(display = "Invalid Validator Proposals")]
+    #[error("Invalid Validator Proposals")]
     InvalidValidatorProposals,
     /// Invalid Signature
-    #[fail(display = "Invalid Signature")]
+    #[error("Invalid Signature")]
     InvalidSignature,
     /// Invalid Approvals
-    #[fail(display = "Invalid Approvals")]
+    #[error("Invalid Approvals")]
     InvalidApprovals,
     /// Invalid Gas Limit
-    #[fail(display = "Invalid Gas Limit")]
+    #[error("Invalid Gas Limit")]
     InvalidGasLimit,
-    /// Invalid Gas Limit
-    #[fail(display = "Invalid Gas Price")]
+    /// Invalid Gas Price
+    #[error("Invalid Gas Price")]
     InvalidGasPrice,
     /// Invalid Gas Used
-    #[fail(display = "Invalid Gas Used")]
+    #[error("Invalid Gas Used")]
     InvalidGasUsed,
     /// Invalid Balance Burnt
-    #[fail(display = "Invalid Balance Burnt")]
+    #[error("Invalid Balance Burnt")]
     InvalidBalanceBurnt,
+    /// Invalid Congestion Info
+    #[error("Invalid Congestion Info: {0}")]
+    InvalidCongestionInfo(String),
+    /// Invalid bandwidth requests
+    #[error("Invalid bandwidth requests - chunk extra doesn't match chunk header: {0}")]
+    InvalidBandwidthRequests(String),
     /// Invalid shard id
-    #[fail(display = "Shard id {} does not exist", _0)]
+    #[error("Shard id {0} does not exist")]
     InvalidShardId(ShardId),
+    #[error("Shard index {0} does not exist")]
+    InvalidShardIndex(ShardIndex),
+    #[error("Shard id {0} does not have a parent")]
+    NoParentShardId(ShardId),
     /// Invalid shard id
-    #[fail(display = "Invalid state request: {}", _0)]
+    #[error("Invalid state request: {0}")]
     InvalidStateRequest(String),
     /// Invalid VRF proof, or incorrect random_output in the header
-    #[fail(display = "Invalid Randomness Beacon Output")]
+    #[error("Invalid Randomness Beacon Output")]
     InvalidRandomnessBeaconOutput,
     /// Invalid block merkle root.
-    #[fail(display = "Invalid Block Merkle Root")]
+    #[error("Invalid Block Merkle Root")]
     InvalidBlockMerkleRoot,
+    /// Invalid split shard ids.
+    #[error("Invalid Split Shard Ids when resharding. shard_id: {0}, parent_shard_id: {1}")]
+    InvalidSplitShardsIds(ShardId, ShardId),
     /// Someone is not a validator. Usually happens in signature verification
-    #[fail(display = "Not A Validator")]
-    NotAValidator,
+    #[error("Not A Validator: {0}")]
+    NotAValidator(String),
+    /// Someone is not a chunk validator. Happens if we're asked to validate a chunk we're not
+    /// supposed to validate, or to verify a chunk approval signed by a validator that isn't
+    /// supposed to validate the chunk.
+    #[error("Not A Chunk Validator")]
+    NotAChunkValidator,
     /// Validator error.
-    #[fail(display = "Validator Error: {}", _0)]
+    #[error("Validator Error: {0}")]
     ValidatorError(String),
     /// Epoch out of bounds. Usually if received block is too far in the future or alternative fork.
-    #[fail(display = "Epoch Out Of Bounds")]
+    #[error("Epoch Out Of Bounds: {:?}", _0)]
     EpochOutOfBounds(EpochId),
-    /// A challenged block is on the chain that was attempted to become the head
-    #[fail(display = "Challenged block on chain")]
-    ChallengedBlockOnChain,
+    /// Block cannot be finalized.
+    #[error("Block cannot be finalized")]
+    CannotBeFinalized,
     /// IO Error.
-    #[fail(display = "IO Error: {}", _0)]
-    IOErr(String),
+    #[error("IO Error: {0}")]
+    IOErr(#[from] io::Error),
     /// Not found record in the DB.
-    #[fail(display = "DB Not Found Error: {}", _0)]
+    #[error("DB Not Found Error: {0}")]
     DBNotFoundErr(String),
     /// Storage error. Used for internal passing the error.
-    #[fail(display = "Storage Error: {}", _0)]
-    StorageError(StorageError),
+    #[error("Storage Error: {0}")]
+    StorageError(#[from] StorageError),
     /// GC error.
-    #[fail(display = "GC Error: {}", _0)]
+    #[error("GC Error: {0}")]
     GCError(String),
+    /// Resharding error.
+    #[error("Resharding Error: {0}")]
+    ReshardingError(String),
+    /// EpochSyncProof validation error.
+    #[error("EpochSyncProof Validation Error: {0}")]
+    InvalidEpochSyncProof(String),
+    /// Invalid chunk header version for protocol version
+    #[error(transparent)]
+    BadHeaderForProtocolVersion(#[from] BadHeaderForProtocolVersionError),
     /// Anything else
-    #[fail(display = "Other Error: {}", _0)]
+    #[error("Other Error: {0}")]
     Other(String),
 }
 
@@ -230,161 +255,234 @@ pub trait LogTransientStorageError {
 
 impl<T> LogTransientStorageError for Result<T, Error> {
     fn log_storage_error(self, message: &str) -> Self {
-        if let Err(ref e) = self {
-            error!(target: "client",
-                   "Transient storage error: {}, {}",
-                   message, e
-            );
+        if let Err(err) = &self {
+            tracing::error!(target: "chain", "Transient storage error: {message}, {err}");
         }
         self
     }
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let cause = match self.cause() {
-            Some(c) => format!("{}", c),
-            None => String::from("Unknown"),
-        };
-        let output = format!("{} \n Cause: {}", self.inner, cause);
-        Display::fmt(&output, f)
-    }
-}
-
 impl Error {
-    pub fn kind(&self) -> ErrorKind {
-        self.inner.get_context().clone()
-    }
-
-    pub fn cause(&self) -> Option<&dyn Fail> {
-        self.inner.cause()
-    }
-
-    pub fn backtrace(&self) -> Option<&Backtrace> {
-        self.inner.backtrace()
-    }
-
     pub fn is_bad_data(&self) -> bool {
-        match self.kind() {
-            ErrorKind::Unfit(_)
-            | ErrorKind::Orphan
-            | ErrorKind::ChunkMissing(_)
-            | ErrorKind::ChunksMissing(_)
-            | ErrorKind::InvalidChunkHeight
-            | ErrorKind::IOErr(_)
-            | ErrorKind::Other(_)
-            | ErrorKind::ValidatorError(_)
-            | ErrorKind::EpochOutOfBounds(_)
-            | ErrorKind::ChallengedBlockOnChain
-            | ErrorKind::StorageError(_)
-            | ErrorKind::GCError(_)
-            | ErrorKind::DBNotFoundErr(_) => false,
-            ErrorKind::InvalidBlockPastTime(_, _)
-            | ErrorKind::InvalidBlockFutureTime(_)
-            | ErrorKind::InvalidBlockHeight(_)
-            | ErrorKind::InvalidBlockProposer
-            | ErrorKind::InvalidChunk
-            | ErrorKind::InvalidChunkProofs(_)
-            | ErrorKind::InvalidChunkState(_)
-            | ErrorKind::InvalidChunkMask
-            | ErrorKind::InvalidStateRoot
-            | ErrorKind::InvalidTxRoot
-            | ErrorKind::InvalidChunkReceiptsRoot
-            | ErrorKind::InvalidOutcomesProof
-            | ErrorKind::InvalidChunkHeadersRoot
-            | ErrorKind::InvalidChunkTxRoot
-            | ErrorKind::InvalidReceiptsProof
-            | ErrorKind::InvalidStatePayload
-            | ErrorKind::InvalidTransactions
-            | ErrorKind::InvalidChallenge
-            | ErrorKind::MaliciousChallenge
-            | ErrorKind::IncorrectNumberOfChunkHeaders
-            | ErrorKind::InvalidEpochHash
-            | ErrorKind::InvalidNextBPHash
-            | ErrorKind::NotEnoughApprovals
-            | ErrorKind::InvalidFinalityInfo
-            | ErrorKind::InvalidValidatorProposals
-            | ErrorKind::InvalidSignature
-            | ErrorKind::InvalidApprovals
-            | ErrorKind::InvalidGasLimit
-            | ErrorKind::InvalidGasPrice
-            | ErrorKind::InvalidGasUsed
-            | ErrorKind::InvalidBalanceBurnt
-            | ErrorKind::InvalidShardId(_)
-            | ErrorKind::InvalidStateRequest(_)
-            | ErrorKind::InvalidRandomnessBeaconOutput
-            | ErrorKind::InvalidBlockMerkleRoot
-            | ErrorKind::NotAValidator
-            | ErrorKind::InvalidChallengeRoot => true,
+        match self {
+            Error::BlockKnown(_)
+            | Error::TooManyProcessingBlocks
+            | Error::Orphan
+            | Error::ChunkMissing(_)
+            | Error::ChunksMissing(_)
+            | Error::BlockPendingOptimisticExecution
+            | Error::InvalidChunkHeight
+            | Error::IOErr(_)
+            | Error::Other(_)
+            | Error::ValidatorError(_)
+            | Error::EpochOutOfBounds(_)
+            | Error::CannotBeFinalized
+            | Error::StorageError(_)
+            | Error::GCError(_)
+            | Error::ReshardingError(_)
+            | Error::DBNotFoundErr(_) => false,
+            Error::InvalidBlockPastTime(_, _)
+            | Error::InvalidBlockFutureTime(_)
+            | Error::InvalidBlockHeight(_)
+            | Error::InvalidBlockProposer
+            | Error::InvalidChunk(_)
+            | Error::InvalidChunkTransactionsOrder(_)
+            | Error::InvalidChunkProofs(_)
+            | Error::InvalidChunkStateWitness(_)
+            | Error::InvalidPartialChunkStateWitness(_)
+            | Error::InvalidChunkEndorsement
+            | Error::InvalidChunkEndorsementBitmap(_)
+            | Error::InvalidChunkMask
+            | Error::InvalidStateRoot
+            | Error::InvalidTxRoot
+            | Error::InvalidChunkReceiptsRoot
+            | Error::InvalidOutcomesProof
+            | Error::InvalidChunkHeadersRoot
+            | Error::InvalidChunkTxRoot
+            | Error::InvalidReceiptsProof
+            | Error::InvalidStatePayload
+            | Error::InvalidTransactions
+            | Error::InvalidChallenge
+            | Error::InvalidSplitShardsIds(_, _)
+            | Error::IncorrectNumberOfChunkHeaders
+            | Error::InvalidEpochHash
+            | Error::InvalidEpochSyncProof(_)
+            | Error::InvalidNextBPHash
+            | Error::NotEnoughApprovals
+            | Error::InvalidFinalityInfo
+            | Error::InvalidValidatorProposals
+            | Error::InvalidSignature
+            | Error::InvalidApprovals
+            | Error::InvalidGasLimit
+            | Error::InvalidGasPrice
+            | Error::InvalidGasUsed
+            | Error::InvalidBalanceBurnt
+            | Error::InvalidCongestionInfo(_)
+            | Error::InvalidBandwidthRequests(_)
+            | Error::InvalidShardId(_)
+            | Error::InvalidShardIndex(_)
+            | Error::NoParentShardId(_)
+            | Error::InvalidStateRequest(_)
+            | Error::InvalidRandomnessBeaconOutput
+            | Error::InvalidBlockMerkleRoot
+            | Error::InvalidProtocolVersion
+            | Error::NotAValidator(_)
+            | Error::NotAChunkValidator
+            | Error::BadHeaderForProtocolVersion(_) => true,
         }
     }
 
     pub fn is_error(&self) -> bool {
-        match self.kind() {
-            ErrorKind::IOErr(_) | ErrorKind::Other(_) | ErrorKind::DBNotFoundErr(_) => true,
+        match self {
+            Error::IOErr(_) | Error::Other(_) | Error::DBNotFoundErr(_) => true,
             _ => false,
         }
     }
-}
 
-impl From<ErrorKind> for Error {
-    fn from(kind: ErrorKind) -> Error {
-        Error { inner: Context::new(kind) }
+    /// Some blockchain errors are reported in the prometheus metrics. In such cases a report might
+    /// contain a label that specifies the type of error that has occurred. For example when the node
+    /// receives a block with an invalid signature this would be reported as:
+    ///  `near_num_invalid_blocks{error="invalid_signature"}`.
+    /// This function returns the value of the error label for a specific instance of Error.
+    pub fn prometheus_label_value(&self) -> &'static str {
+        match self {
+            Error::BlockKnown(_) => "block_known",
+            Error::TooManyProcessingBlocks => "too_many_processing_blocks",
+            Error::Orphan => "orphan",
+            Error::ChunkMissing(_) => "chunk_missing",
+            Error::ChunksMissing(_) => "chunks_missing",
+            Error::BlockPendingOptimisticExecution => "block_pending_optimistic_execution",
+            Error::InvalidChunkHeight => "invalid_chunk_height",
+            Error::IOErr(_) => "io_err",
+            Error::Other(_) => "other",
+            Error::ValidatorError(_) => "validator_error",
+            Error::EpochOutOfBounds(_) => "epoch_out_of_bounds",
+            Error::CannotBeFinalized => "cannot_be_finalized",
+            Error::StorageError(_) => "storage_error",
+            Error::GCError(_) => "gc_error",
+            Error::DBNotFoundErr(_) => "db_not_found_err",
+            Error::InvalidBlockPastTime(_, _) => "invalid_block_past_time",
+            Error::InvalidBlockFutureTime(_) => "invalid_block_future_time",
+            Error::InvalidBlockHeight(_) => "invalid_block_height",
+            Error::InvalidBlockProposer => "invalid_block_proposer",
+            Error::InvalidChunk(_) => "invalid_chunk",
+            Error::InvalidChunkTransactionsOrder(_) => "invalid_chunk_transactions_order",
+            Error::InvalidChunkProofs(_) => "invalid_chunk_proofs",
+            Error::InvalidChunkStateWitness(_) => "invalid_chunk_state_witness",
+            Error::InvalidPartialChunkStateWitness(_) => "invalid_partial_chunk_state_witness",
+            Error::InvalidChunkEndorsement => "invalid_chunk_endorsement",
+            Error::InvalidChunkEndorsementBitmap(_) => "invalid_chunk_endorsement_bitmap",
+            Error::InvalidChunkMask => "invalid_chunk_mask",
+            Error::InvalidStateRoot => "invalid_state_root",
+            Error::InvalidTxRoot => "invalid_tx_root",
+            Error::InvalidChunkReceiptsRoot => "invalid_chunk_receipts_root",
+            Error::InvalidOutcomesProof => "invalid_outcomes_proof",
+            Error::InvalidChunkHeadersRoot => "invalid_chunk_headers_root",
+            Error::InvalidChunkTxRoot => "invalid_chunk_tx_root",
+            Error::InvalidReceiptsProof => "invalid_receipts_proof",
+            Error::InvalidStatePayload => "invalid_state_payload",
+            Error::InvalidTransactions => "invalid_transactions",
+            Error::InvalidChallenge => "invalid_challenge",
+            Error::InvalidSplitShardsIds(_, _) => "invalid_split_shard_ids",
+            Error::IncorrectNumberOfChunkHeaders => "incorrect_number_of_chunk_headers",
+            Error::InvalidEpochHash => "invalid_epoch_hash",
+            Error::InvalidEpochSyncProof(_) => "invalid_epoch_sync_proof",
+            Error::InvalidNextBPHash => "invalid_next_bp_hash",
+            Error::NotEnoughApprovals => "not_enough_approvals",
+            Error::InvalidFinalityInfo => "invalid_finality_info",
+            Error::InvalidValidatorProposals => "invalid_validator_proposals",
+            Error::InvalidSignature => "invalid_signature",
+            Error::InvalidApprovals => "invalid_approvals",
+            Error::InvalidGasLimit => "invalid_gas_limit",
+            Error::InvalidGasPrice => "invalid_gas_price",
+            Error::InvalidGasUsed => "invalid_gas_used",
+            Error::InvalidBalanceBurnt => "invalid_balance_burnt",
+            Error::InvalidCongestionInfo(_) => "invalid_congestion_info",
+            Error::InvalidBandwidthRequests(_) => "invalid_bandwidth_requests",
+            Error::InvalidShardId(_) => "invalid_shard_id",
+            Error::InvalidShardIndex(_) => "invalid_shard_index",
+            Error::NoParentShardId(_) => "no_parent_shard_id",
+            Error::InvalidStateRequest(_) => "invalid_state_request",
+            Error::InvalidRandomnessBeaconOutput => "invalid_randomness_beacon_output",
+            Error::InvalidBlockMerkleRoot => "invalid_block_merkle_root",
+            Error::InvalidProtocolVersion => "invalid_protocol_version",
+            Error::NotAValidator(_) => "not_a_validator",
+            Error::NotAChunkValidator => "not_a_chunk_validator",
+            Error::ReshardingError(_) => "resharding_error",
+            Error::BadHeaderForProtocolVersion(_) => "bad_header_for_protocol_version",
+        }
     }
 }
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Error {
-        Error { inner: Context::new(ErrorKind::IOErr(error.to_string())) }
-    }
-}
-
-impl From<String> for Error {
-    fn from(error: String) -> Error {
-        Error { inner: Context::new(ErrorKind::Other(error)) }
-    }
-}
-
-impl std::error::Error for Error {}
 
 impl From<EpochError> for Error {
     fn from(error: EpochError) -> Self {
         match error {
-            EpochError::EpochOutOfBounds(epoch_id) => ErrorKind::EpochOutOfBounds(epoch_id),
-            EpochError::MissingBlock(h) => ErrorKind::DBNotFoundErr(to_base(&h)),
-            err => ErrorKind::ValidatorError(err.to_string()),
+            EpochError::EpochOutOfBounds(epoch_id) => Error::EpochOutOfBounds(epoch_id),
+            EpochError::MissingBlock(h) => Error::DBNotFoundErr(format!("epoch block: {h}")),
+            EpochError::NotAValidator(account_id, epoch_id) => {
+                Error::NotAValidator(format!("account_id: {account_id}, epoch_id: {epoch_id:?}"))
+            }
+            err => Error::ValidatorError(err.to_string()),
         }
-        .into()
+    }
+}
+
+pub trait EpochErrorResultToChainError<T> {
+    fn into_chain_error(self) -> Result<T, Error>;
+}
+
+impl<T> EpochErrorResultToChainError<T> for Result<T, EpochError> {
+    fn into_chain_error(self: Result<T, EpochError>) -> Result<T, Error> {
+        self.map_err(|err| err.into())
     }
 }
 
 impl From<ShardLayoutError> for Error {
     fn from(error: ShardLayoutError) -> Self {
         match error {
-            ShardLayoutError::InvalidShardIdError { shard_id } => {
-                ErrorKind::InvalidShardId(shard_id)
+            ShardLayoutError::InvalidShardIdError { shard_id } => Error::InvalidShardId(shard_id),
+            ShardLayoutError::InvalidShardIndexError { shard_index } => {
+                Error::InvalidShardIndex(shard_index)
             }
+            ShardLayoutError::NoParentError { shard_id } => Error::NoParentShardId(shard_id),
         }
-        .into()
     }
 }
 
 impl From<BlockValidityError> for Error {
     fn from(error: BlockValidityError) -> Self {
         match error {
-            BlockValidityError::InvalidStateRoot => ErrorKind::InvalidStateRoot,
-            BlockValidityError::InvalidReceiptRoot => ErrorKind::InvalidChunkReceiptsRoot,
-            BlockValidityError::InvalidTransactionRoot => ErrorKind::InvalidTxRoot,
-            BlockValidityError::InvalidChunkHeaderRoot => ErrorKind::InvalidChunkHeadersRoot,
-            BlockValidityError::InvalidChunkMask => ErrorKind::InvalidChunkMask,
-            BlockValidityError::InvalidChallengeRoot => ErrorKind::InvalidChallengeRoot,
+            BlockValidityError::InvalidStateRoot => Error::InvalidStateRoot,
+            BlockValidityError::InvalidReceiptRoot => Error::InvalidChunkReceiptsRoot,
+            BlockValidityError::InvalidTransactionRoot => Error::InvalidTxRoot,
+            BlockValidityError::InvalidChunkHeaderRoot => Error::InvalidChunkHeadersRoot,
+            BlockValidityError::InvalidChunkMask => Error::InvalidChunkMask,
         }
-        .into()
     }
 }
 
-impl From<StorageError> for Error {
-    fn from(error: StorageError) -> Self {
-        ErrorKind::StorageError(error).into()
+impl From<ChunkAccessError> for Error {
+    fn from(error: ChunkAccessError) -> Self {
+        match error {
+            ChunkAccessError::ChunkMissing(chunk_hash) => Error::ChunkMissing(chunk_hash),
+        }
     }
+}
+
+#[derive(Clone, Eq, PartialEq, Debug, thiserror::Error)]
+pub enum BlockKnownError {
+    #[error("already known in header")]
+    KnownInHeader,
+    #[error("already known in head")]
+    KnownInHead,
+    #[error("already known in orphan")]
+    KnownInOrphan,
+    #[error("already known in missing chunks")]
+    KnownInMissingChunks,
+    #[error("already known in store")]
+    KnownInStore,
+    #[error("already known in blocks in processing")]
+    KnownInProcessing,
+    #[error("already known in invalid blocks")]
+    KnownAsInvalid,
 }

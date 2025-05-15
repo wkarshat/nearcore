@@ -1,66 +1,68 @@
-use std::fs;
+pub use crate::config::NightshadeRuntimeExt;
+pub use crate::config::{NearConfig, init_configs, load_config, load_test_config};
+#[cfg(feature = "json_rpc")]
+use crate::entity_debug::EntityDebugHandlerImpl;
+use crate::metrics::spawn_trie_metrics_loop;
+
+use crate::cold_storage::spawn_cold_store_loop;
+use crate::state_sync::StateSyncDumper;
+use actix::{Actor, Addr};
+use actix_rt::ArbiterHandle;
+use anyhow::Context;
+use cold_storage::ColdStoreLoopHandle;
+use near_async::actix::AddrWithAutoSpanContextExt;
+use near_async::actix_wrapper::{ActixWrapper, spawn_actix_actor};
+use near_async::futures::TokioRuntimeFutureSpawner;
+use near_async::messaging::{IntoMultiSender, IntoSender, LateBoundSender};
+use near_async::time::{self, Clock};
+use near_chain::rayon_spawner::RayonAsyncComputationSpawner;
+use near_chain::resharding::resharding_actor::ReshardingActor;
+pub use near_chain::runtime::NightshadeRuntime;
+use near_chain::state_snapshot_actor::{
+    SnapshotCallbacks, StateSnapshotActor, get_delete_snapshot_callback, get_make_snapshot_callback,
+};
+use near_chain::types::RuntimeAdapter;
+use near_chain::{Chain, ChainGenesis};
+use near_chain_configs::ReshardingHandle;
+use near_chunks::shards_manager_actor::start_shards_manager;
+use near_client::adapter::client_sender_for_network;
+use near_client::gc_actor::GCActor;
+use near_client::{
+    ClientActor, ConfigUpdater, PartialWitnessActor, RpcHandlerActor, RpcHandlerConfig,
+    StartClientResult, ViewClientActor, ViewClientActorInner, spawn_rpc_handler_actor,
+    start_client,
+};
+use near_epoch_manager::EpochManager;
+use near_epoch_manager::EpochManagerAdapter;
+use near_epoch_manager::shard_tracker::ShardTracker;
+use near_network::PeerManagerActor;
+use near_primitives::genesis::GenesisId;
+use near_primitives::types::EpochId;
+use near_store::db::metadata::DbKind;
+use near_store::genesis::initialize_sharded_genesis_state;
+use near_store::metrics::spawn_db_metrics_loop;
+use near_store::{NodeStorage, Store, StoreOpenerError};
+use near_telemetry::TelemetryActor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use actix::{Actor, Addr, Arbiter};
-use actix_rt::ArbiterHandle;
-use actix_web;
-#[cfg(feature = "performance_stats")]
-use near_rust_allocator_proxy::allocator::reset_memory_usage_max;
-use tracing::{error, info, trace};
-
-use near_chain::ChainGenesis;
-#[cfg(feature = "test_features")]
-use near_client::AdversarialControls;
-use near_client::{start_client, start_view_client, ClientActor, ViewClientActor};
-
-use near_network::routing::start_routing_table_actor;
-use near_network::types::NetworkRecipient;
-use near_network::PeerManagerActor;
-use near_primitives::network::PeerId;
-#[cfg(feature = "rosetta_rpc")]
-use near_rosetta_rpc::start_rosetta_rpc;
-use near_store::migrations::migrate_29_to_30;
-use near_store::migrations::{
-    fill_col_outcomes_by_hash, fill_col_transaction_refcount, get_store_version, migrate_10_to_11,
-    migrate_11_to_12, migrate_13_to_14, migrate_14_to_15, migrate_17_to_18, migrate_21_to_22,
-    migrate_25_to_26, migrate_28_to_29, migrate_6_to_7, migrate_7_to_8, migrate_8_to_9,
-    migrate_9_to_10, set_store_version,
-};
-use near_store::migrations::{migrate_20_to_21, migrate_26_to_27};
-use near_store::{create_store, Store};
-use near_telemetry::TelemetryActor;
-
-pub use crate::config::{init_configs, load_config, load_test_config, NearConfig, NEAR_BASE};
-use crate::migrations::{
-    migrate_12_to_13, migrate_18_to_19, migrate_19_to_20, migrate_22_to_23, migrate_23_to_24,
-    migrate_24_to_25,
-};
-pub use crate::runtime::NightshadeRuntime;
-pub use crate::shard_tracker::TrackedConfig;
+use tokio::sync::broadcast;
 
 pub mod append_only_map;
+pub mod cold_storage;
 pub mod config;
+#[cfg(test)]
+mod config_duration_test;
+mod config_validate;
+mod download_file;
+pub mod dyn_config;
+#[cfg(feature = "json_rpc")]
+pub mod entity_debug;
+mod entity_debug_serializer;
+mod metrics;
 pub mod migrations;
-mod runtime;
-mod shard_tracker;
-
-const STORE_PATH: &str = "data";
-
-pub fn store_path_exists<P: AsRef<Path>>(path: P) -> bool {
-    fs::canonicalize(path).is_ok()
-}
-
-pub fn get_store_path(base_path: &Path) -> PathBuf {
-    let mut store_path = base_path.to_owned();
-    store_path.push(STORE_PATH);
-    if store_path_exists(&store_path) {
-        info!(target: "near", "Opening store database at {:?}", store_path);
-    } else {
-        info!(target: "near", "Did not find {:?} path, will be creating new store database", store_path);
-    }
-    store_path
-}
+pub mod state_sync;
+#[cfg(feature = "tx_generator")]
+use near_transactions_generator::actix_actor::TxGeneratorActor;
 
 pub fn get_default_home() -> PathBuf {
     if let Ok(near_home) = std::env::var("NEAR_HOME") {
@@ -75,296 +77,444 @@ pub fn get_default_home() -> PathBuf {
     PathBuf::default()
 }
 
-/// Function checks current version of the database and applies migrations to the database.
-pub fn apply_store_migrations(path: &Path, near_config: &NearConfig) {
-    let db_version = get_store_version(path);
-    if db_version > near_primitives::version::DB_VERSION {
-        error!(target: "near", "DB version {} is created by a newer version of neard, please update neard or delete data", db_version);
-        std::process::exit(1);
-    }
-    if db_version == near_primitives::version::DB_VERSION {
-        return;
-    }
+/// Opens node’s storage performing migrations and checks when necessary.
+///
+/// If opened storage is an RPC store and `near_config.config.archive` is true,
+/// converts the storage to archival node.  Otherwise, if opening archival node
+/// with that field being false, prints a warning and sets the field to `true`.
+/// In other words, once store is archival, the node will act as archival nod
+/// regardless of settings in `config.json`.
+///
+/// The end goal is to get rid of `archive` option in `config.json` file and
+/// have the type of the node be determined purely based on kind of database
+/// being opened.
+pub fn open_storage(home_dir: &Path, near_config: &mut NearConfig) -> anyhow::Result<NodeStorage> {
+    let migrator = migrations::Migrator::new(near_config);
+    let opener = NodeStorage::opener(
+        home_dir,
+        &near_config.config.store,
+        near_config.config.archival_config(),
+    )
+    .with_migrator(&migrator);
+    let storage = match opener.open() {
+        Ok(storage) => Ok(storage),
+        Err(StoreOpenerError::IO(err)) => {
+            Err(anyhow::anyhow!("{err}"))
+        }
+        // Cannot happen with Mode::ReadWrite
+        Err(StoreOpenerError::DbDoesNotExist) => unreachable!(),
+        // Cannot happen with Mode::ReadWrite
+        Err(StoreOpenerError::DbAlreadyExists) => unreachable!(),
+        Err(StoreOpenerError::HotColdExistenceMismatch) => {
+            Err(anyhow::anyhow!(
+                "Hot and cold databases must either both exist or both not exist.\n\
+                 Note that at this moment it’s not possible to convert and RPC or legacy archive database into split hot+cold database.\n\
+                 To set up node in that configuration, start with neither of the databases existing.",
+            ))
+        },
+        Err(err @ StoreOpenerError::HotColdVersionMismatch { .. }) => {
+            Err(anyhow::anyhow!("{err}"))
+        },
+        Err(StoreOpenerError::DbKindMismatch { which, got, want }) => {
+            Err(if let Some(got) = got {
+                anyhow::anyhow!("{which} database kind should be {want} but got {got}")
+            } else {
+                anyhow::anyhow!("{which} database kind should be {want} but none was set")
+            })
+        }
+        Err(StoreOpenerError::SnapshotAlreadyExists(snap_path)) => {
+            Err(anyhow::anyhow!(
+                "Detected an existing database migration snapshot at ‘{}’.\n\
+                 Probably a database migration got interrupted and your database is corrupted.\n\
+                 Please replace files in ‘{}’ with contents of the snapshot, delete the snapshot and try again.",
+                snap_path.display(),
+                opener.path().display(),
+            ))
+        },
+        Err(StoreOpenerError::SnapshotError(err)) => {
+            use near_store::config::MigrationSnapshot;
+            let path = std::path::PathBuf::from("/path/to/snapshot/dir");
+            let on = MigrationSnapshot::Path(path).format_example();
+            let off = MigrationSnapshot::Enabled(false).format_example();
+            Err(anyhow::anyhow!(
+                "Failed to create a database migration snapshot: {err}.\n\
+                 To change the location of snapshot adjust \
+                 ‘store.migration_snapshot’ property in ‘config.json’:\n{on}\n\
+                 Alternatively, you can disable database migration snapshots \
+                 in `config.json`:\n{off}"
+            ))
+        },
+        Err(StoreOpenerError::SnapshotRemoveError { path, error }) => {
+            let path = path.display();
+            Err(anyhow::anyhow!(
+                "The DB migration has succeeded but deleting of the snapshot \
+                 at {path} has failed: {error}\n
+                 Try renaming the snapshot directory to temporary name (e.g. \
+                 by adding tilde to its name) and starting the node.  If that \
+                 works, the snapshot can be deleted."))
+        }
+        // Cannot happen with Mode::ReadWrite
+        Err(StoreOpenerError::DbVersionMismatchOnRead { .. }) => unreachable!(),
+        // Cannot happen when migrator is specified.
+        Err(StoreOpenerError::DbVersionMismatch { .. }) => unreachable!(),
+        Err(StoreOpenerError::DbVersionMissing { .. }) => {
+            Err(anyhow::anyhow!("Database version is missing!"))
+        },
+        Err(StoreOpenerError::DbVersionTooOld { got, latest_release, .. }) => {
+            Err(anyhow::anyhow!(
+                "Database version {got} is created by an old version \
+                 of neard and is no longer supported, please migrate using \
+                 {latest_release} release"
+            ))
+        },
+        Err(StoreOpenerError::DbVersionTooNew { got, want }) => {
+            Err(anyhow::anyhow!(
+                "Database version {got} is higher than the expected version {want}. \
+                It was likely created by newer version of neard. Please upgrade your neard."
+            ))
+        },
+        Err(StoreOpenerError::MigrationError(err)) => {
+            Err(err)
+        },
+        Err(StoreOpenerError::CheckpointError(err)) => {
+            Err(err)
+        },
+    }.with_context(|| format!("unable to open database at {}", opener.path().display()))?;
 
-    // Add migrations here based on `db_version`.
-    if db_version <= 1 {
-        // version 1 => 2: add gc column
-        // Does not need to do anything since open db with option `create_missing_column_families`
-        // Nevertheless need to bump db version, because db_version 1 binary can't open db_version 2 db
-        info!(target: "near", "Migrate DB from version 1 to 2");
-        let store = create_store(path);
-        set_store_version(&store, 2);
-    }
-    if db_version <= 2 {
-        // version 2 => 3: add ColOutcomesByBlockHash + rename LastComponentNonce -> ColLastComponentNonce
-        // The column number is the same, so we don't need additional updates
-        info!(target: "near", "Migrate DB from version 2 to 3");
-        let store = create_store(path);
-        fill_col_outcomes_by_hash(&store);
-        set_store_version(&store, 3);
-    }
-    if db_version <= 3 {
-        // version 3 => 4: add ColTransactionRefCount
-        info!(target: "near", "Migrate DB from version 3 to 4");
-        let store = create_store(path);
-        fill_col_transaction_refcount(&store);
-        set_store_version(&store, 4);
-    }
-    if db_version <= 4 {
-        info!(target: "near", "Migrate DB from version 4 to 5");
-        // version 4 => 5: add ColProcessedBlockHeights
-        // we don't need to backfill the old heights since at worst we will just process some heights
-        // again.
-        let store = create_store(path);
-        set_store_version(&store, 5);
-    }
-    if db_version <= 5 {
-        info!(target: "near", "Migrate DB from version 5 to 6");
-        // version 5 => 6: add merge operator to ColState
-        // we don't have merge records before so old storage works
-        let store = create_store(path);
-        set_store_version(&store, 6);
-    }
-    if db_version <= 6 {
-        info!(target: "near", "Migrate DB from version 6 to 7");
-        // version 6 => 7:
-        // - make ColState use 8 bytes for refcount (change to merge operator)
-        // - move ColTransactionRefCount into ColTransactions
-        // - make ColReceiptIdToShardId refcounted
-        migrate_6_to_7(path);
-    }
-    if db_version <= 7 {
-        info!(target: "near", "Migrate DB from version 7 to 8");
-        // version 7 => 8:
-        // delete values in column `StateColParts`
-        migrate_7_to_8(path);
-    }
-    if db_version <= 8 {
-        info!(target: "near", "Migrate DB from version 8 to 9");
-        // version 8 => 9:
-        // Repair `ColTransactions`, `ColReceiptIdToShardId`
-        migrate_8_to_9(path);
-    }
-    if db_version <= 9 {
-        info!(target: "near", "Migrate DB from version 9 to 10");
-        // version 9 => 10;
-        // populate partial encoded chunks for chunks that exist in storage
-        migrate_9_to_10(path, near_config.client_config.archive);
-    }
-    if db_version <= 10 {
-        info!(target: "near", "Migrate DB from version 10 to 11");
-        // version 10 => 11
-        // Add final head
-        migrate_10_to_11(path);
-    }
-    if db_version <= 11 {
-        info!(target: "near", "Migrate DB from version 11 to 12");
-        // version 11 => 12;
-        // populate ColReceipts with existing receipts
-        migrate_11_to_12(path);
-    }
-    if db_version <= 12 {
-        info!(target: "near", "Migrate DB from version 12 to 13");
-        // version 12 => 13;
-        // migrate ColTransactionResult to fix the inconsistencies there
-        migrate_12_to_13(path, near_config);
-    }
-    if db_version <= 13 {
-        info!(target: "near", "Migrate DB from version 13 to 14");
-        // version 13 => 14;
-        // store versioned enums for shard chunks
-        migrate_13_to_14(path);
-    }
-    if db_version <= 14 {
-        info!(target: "near", "Migrate DB from version 14 to 15");
-        // version 14 => 15;
-        // Change ColOutcomesByBlockHash to be ordered within each shard
-        migrate_14_to_15(path);
-    }
-    if db_version <= 15 {
-        info!(target: "near", "Migrate DB from version 15 to 16");
-        // version 15 => 16: add column for compiled contracts
-        let store = create_store(path);
-        set_store_version(&store, 16);
-    }
-    if db_version <= 16 {
-        info!(target: "near", "Migrate DB from version 16 to 17");
-        // version 16 => 17: add column for storing epoch validator info
-        let store = create_store(path);
-        set_store_version(&store, 17);
-    }
-    if db_version <= 17 {
-        info!(target: "near", "Migrate DB from version 17 to 18");
-        // version 17 => 18: add `hash` to `BlockInfo` and ColHeaderHashesByHeight
-        migrate_17_to_18(path);
-    }
-    if db_version <= 18 {
-        info!(target: "near", "Migrate DB from version 18 to 19");
-        // version 18 => 19: populate ColEpochValidatorInfo for archival nodes
-        migrate_18_to_19(path, near_config);
-    }
-    if db_version <= 19 {
-        info!(target: "near", "Migrate DB from version 19 to 20");
-        // version 19 => 20: fix execution outcome
-        migrate_19_to_20(path, near_config);
-    }
-    if db_version <= 20 {
-        info!(target: "near", "Migrate DB from version 20 to 21");
-        // version 20 => 21: delete genesis json hash due to change in Genesis::json_hash function
-        migrate_20_to_21(path);
-    }
-    if db_version <= 21 {
-        info!(target: "near", "Migrate DB from version 21 to 22");
-        // version 21 => 22: rectify inflation: add `timestamp` to `BlockInfo`
-        migrate_21_to_22(path);
-    }
-    if db_version <= 22 {
-        info!(target: "near", "Migrate DB from version 22 to 23");
-        migrate_22_to_23(path, near_config);
-    }
-    if db_version <= 23 {
-        info!(target: "near", "Migrate DB from version 23 to 24");
-        migrate_23_to_24(path, near_config);
-    }
-    if db_version <= 24 {
-        info!(target: "near", "Migrate DB from version 24 to 25");
-        migrate_24_to_25(path);
-    }
-    if db_version <= 25 {
-        info!(target: "near", "Migrate DB from version 25 to 26");
-        migrate_25_to_26(path);
-    }
-    if db_version <= 26 {
-        info!(target: "near", "Migrate DB from version 26 to 27");
-        migrate_26_to_27(path, near_config.client_config.archive);
-    }
-    if db_version <= 27 {
-        // version 27 => 28: add ColStateChangesForSplitStates
-        // Does not need to do anything since open db with option `create_missing_column_families`
-        // Nevertheless need to bump db version, because db_version 1 binary can't open db_version 2 db
-        info!(target: "near", "Migrate DB from version 27 to 28");
-        let store = create_store(path);
-        set_store_version(&store, 28);
-    }
-    if db_version <= 28 {
-        // version 28 => 29: delete ColNextBlockWithNewChunk, ColLastBlockWithNewChunk
-        info!(target: "near", "Migrate DB from version 28 to 29");
-        migrate_28_to_29(path);
-    }
-    if db_version <= 29 {
-        // version 29 => 30: migrate all structures that use ValidatorStake to versionized version
-        info!(target: "near", "Migrate DB from version 29 to 30");
-        migrate_29_to_30(path);
-    }
-
-    #[cfg(feature = "nightly_protocol")]
-    {
-        let store = create_store(&path);
-
-        // set some dummy value to avoid conflict with other migrations from nightly features
-        set_store_version(&store, 10000);
-    }
-
-    #[cfg(not(feature = "nightly_protocol"))]
-    {
-        let db_version = get_store_version(path);
-        debug_assert_eq!(db_version, near_primitives::version::DB_VERSION);
-    }
+    near_config.config.archive = storage.is_archive()?;
+    Ok(storage)
 }
 
-pub fn init_and_migrate_store(home_dir: &Path, near_config: &NearConfig) -> Arc<Store> {
-    let path = get_store_path(home_dir);
-    let store_exists = store_path_exists(&path);
-    if store_exists {
-        apply_store_migrations(&path, near_config);
+// Safely get the split store while checking that all conditions to use it are met.
+fn get_split_store(config: &NearConfig, storage: &NodeStorage) -> anyhow::Result<Option<Store>> {
+    // SplitStore should only be used on archival nodes.
+    if !config.config.archive {
+        return Ok(None);
     }
-    let store = create_store(&path);
-    if !store_exists {
-        set_store_version(&store, near_primitives::version::DB_VERSION);
+
+    // SplitStore should only be used if cold store is configured.
+    if config.config.cold_store.is_none() {
+        return Ok(None);
     }
-    store
+
+    // SplitStore should only be used in the view client if it is enabled.
+    if !config.config.split_storage.as_ref().is_some_and(|c| c.enable_split_storage_view_client) {
+        return Ok(None);
+    }
+
+    // SplitStore should only be used if the migration is finished. The
+    // migration to cold store is finished when the db kind of the hot store is
+    // changed from Archive to Hot.
+    if storage.get_hot_store().get_db_kind()? != Some(DbKind::Hot) {
+        return Ok(None);
+    }
+
+    Ok(storage.get_split_store())
 }
 
 pub struct NearNode {
     pub client: Addr<ClientActor>,
     pub view_client: Addr<ViewClientActor>,
+    pub rpc_handler: Addr<RpcHandlerActor>,
+    #[cfg(feature = "tx_generator")]
+    pub tx_generator: Addr<TxGeneratorActor>,
     pub arbiters: Vec<ArbiterHandle>,
-    pub rpc_servers: Vec<(&'static str, actix_web::dev::Server)>,
+    pub rpc_servers: Vec<(&'static str, actix_web::dev::ServerHandle)>,
+    /// The cold_store_loop_handle will only be set if the cold store is configured.
+    /// It's a handle to a background thread that copies data from the hot store to the cold store.
+    pub cold_store_loop_handle: Option<ColdStoreLoopHandle>,
+    /// Contains handles to background threads that may be dumping state to S3.
+    pub state_sync_dumper: StateSyncDumper,
+    // A handle that allows the main process to interrupt resharding if needed.
+    // This typically happens when the main process is interrupted.
+    pub resharding_handle: ReshardingHandle,
+    // The threads that state sync runs in.
+    pub state_sync_runtime: Arc<tokio::runtime::Runtime>,
+    /// Shard tracker, allows querying of which shards are tracked by this node.
+    pub shard_tracker: ShardTracker,
 }
 
-pub fn start_with_config(home_dir: &Path, config: NearConfig) -> NearNode {
-    let store = init_and_migrate_store(home_dir, &config);
+pub fn start_with_config(home_dir: &Path, config: NearConfig) -> anyhow::Result<NearNode> {
+    start_with_config_and_synchronization(home_dir, config, None, None)
+}
 
-    let runtime = Arc::new(NightshadeRuntime::with_config(
+pub fn start_with_config_and_synchronization(
+    home_dir: &Path,
+    mut config: NearConfig,
+    // 'shutdown_signal' will notify the corresponding `oneshot::Receiver` when an instance of
+    // `ClientActor` gets dropped.
+    shutdown_signal: Option<broadcast::Sender<()>>,
+    config_updater: Option<ConfigUpdater>,
+) -> anyhow::Result<NearNode> {
+    let storage = open_storage(home_dir, &mut config)?;
+    let db_metrics_arbiter = if config.client_config.enable_statistics_export {
+        let period = config.client_config.log_summary_period;
+        let db_metrics_arbiter_handle = spawn_db_metrics_loop(&storage, period)?;
+        Some(db_metrics_arbiter_handle)
+    } else {
+        None
+    };
+
+    let epoch_manager = EpochManager::new_arc_handle(
+        storage.get_hot_store(),
+        &config.genesis.config,
+        Some(home_dir),
+    );
+
+    let trie_metrics_arbiter = spawn_trie_metrics_loop(
+        config.clone(),
+        storage.get_hot_store(),
+        config.client_config.log_summary_period,
+        epoch_manager.clone(),
+    )?;
+
+    let genesis_epoch_config = epoch_manager.get_epoch_config(&EpochId::default())?;
+    // Initialize genesis_state in store either from genesis config or dump before other components.
+    // We only initialize if the genesis state is not already initialized in store.
+    // This sets up genesis_state_roots and genesis_hash in store.
+    initialize_sharded_genesis_state(
+        storage.get_hot_store(),
+        &config.genesis,
+        &genesis_epoch_config,
+        Some(home_dir),
+    );
+
+    let shard_tracker = ShardTracker::new(
+        config.client_config.tracked_shards_config.clone(),
+        epoch_manager.clone(),
+    );
+    let runtime = NightshadeRuntime::from_config(
         home_dir,
-        Arc::clone(&store),
+        storage.get_hot_store(),
         &config,
-        config.client_config.trie_viewer_state_size_limit,
-        config.client_config.max_gas_burnt_view,
+        epoch_manager.clone(),
+    )
+    .context("could not create the transaction runtime")?;
+
+    // Get the split store. If split store is some then create a new set of structures for
+    // the view client. Otherwise just re-use the existing ones.
+    let split_store = get_split_store(&config, &storage)?;
+    let (view_epoch_manager, view_shard_tracker, view_runtime) =
+        if let Some(split_store) = &split_store {
+            let view_epoch_manager = EpochManager::new_arc_handle(
+                split_store.clone(),
+                &config.genesis.config,
+                Some(home_dir),
+            );
+            let view_shard_tracker = ShardTracker::new(
+                config.client_config.tracked_shards_config.clone(),
+                epoch_manager.clone(),
+            );
+            let view_runtime = NightshadeRuntime::from_config(
+                home_dir,
+                split_store.clone(),
+                &config,
+                view_epoch_manager.clone(),
+            )
+            .context("could not create the transaction runtime")?;
+            (view_epoch_manager, view_shard_tracker, view_runtime)
+        } else {
+            (epoch_manager.clone(), shard_tracker.clone(), runtime.clone())
+        };
+
+    let cold_store_loop_handle = spawn_cold_store_loop(&config, &storage, epoch_manager.clone())?;
+
+    let telemetry = ActixWrapper::new(TelemetryActor::new(config.telemetry_config.clone())).start();
+    let chain_genesis = ChainGenesis::new(&config.genesis.config);
+    let state_roots = near_store::get_genesis_state_roots(runtime.store())?
+        .expect("genesis should be initialized.");
+    let (genesis_block, _genesis_chunks) = Chain::make_genesis_block(
+        epoch_manager.as_ref(),
+        runtime.as_ref(),
+        &chain_genesis,
+        state_roots,
+    )?;
+    let genesis_id = GenesisId {
+        chain_id: config.client_config.chain_id.clone(),
+        hash: *genesis_block.header().hash(),
+    };
+
+    let node_id = config.network_config.node_id();
+    let network_adapter = LateBoundSender::new();
+    let shards_manager_adapter = LateBoundSender::new();
+    let client_adapter_for_shards_manager = LateBoundSender::new();
+    let client_adapter_for_partial_witness_actor = LateBoundSender::new();
+    let adv = near_client::adversarial::Controls::new(config.client_config.archive);
+
+    let view_client_addr = ViewClientActorInner::spawn_actix_actor(
+        Clock::real(),
+        config.validator_signer.clone(),
+        chain_genesis.clone(),
+        view_epoch_manager.clone(),
+        view_shard_tracker.clone(),
+        view_runtime.clone(),
+        network_adapter.as_multi_sender(),
+        config.client_config.clone(),
+        adv.clone(),
+    );
+
+    let state_snapshot_sender = LateBoundSender::new();
+    let state_snapshot_actor = StateSnapshotActor::new(
+        runtime.get_flat_storage_manager(),
+        network_adapter.as_multi_sender(),
+        runtime.get_tries(),
+    );
+    let (state_snapshot_addr, state_snapshot_arbiter) = spawn_actix_actor(state_snapshot_actor);
+    state_snapshot_sender.bind(state_snapshot_addr.clone().with_auto_span_context());
+
+    let delete_snapshot_callback: Arc<dyn Fn() + Sync + Send> = get_delete_snapshot_callback(
+        state_snapshot_addr.clone().with_auto_span_context().into_multi_sender(),
+    );
+    let make_snapshot_callback = get_make_snapshot_callback(
+        state_snapshot_addr.with_auto_span_context().into_multi_sender(),
+        runtime.get_flat_storage_manager(),
+    );
+    let snapshot_callbacks = SnapshotCallbacks { make_snapshot_callback, delete_snapshot_callback };
+
+    let (partial_witness_actor, partial_witness_arbiter) =
+        spawn_actix_actor(PartialWitnessActor::new(
+            Clock::real(),
+            network_adapter.as_multi_sender(),
+            client_adapter_for_partial_witness_actor.as_multi_sender(),
+            config.validator_signer.clone(),
+            epoch_manager.clone(),
+            runtime.clone(),
+            Arc::new(RayonAsyncComputationSpawner),
+            Arc::new(RayonAsyncComputationSpawner),
+        ));
+
+    let (_gc_actor, gc_arbiter) = spawn_actix_actor(GCActor::new(
+        runtime.store().clone(),
+        &chain_genesis,
+        runtime.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
+        config.validator_signer.clone(),
+        config.client_config.gc.clone(),
+        config.client_config.archive,
     ));
 
-    let telemetry = TelemetryActor::new(config.telemetry_config.clone()).start();
-    let chain_genesis = ChainGenesis::from(&config.genesis);
-
-    let node_id = PeerId::new(config.network_config.public_key.clone().into());
-    let network_adapter = Arc::new(NetworkRecipient::default());
-    #[cfg(feature = "test_features")]
-    let adv = Arc::new(std::sync::RwLock::new(AdversarialControls::default()));
-
-    let view_client = start_view_client(
-        config.validator_signer.as_ref().map(|signer| signer.validator_id().clone()),
-        chain_genesis.clone(),
+    let resharding_handle = ReshardingHandle::new();
+    let (resharding_sender_addr, _) = spawn_actix_actor(ReshardingActor::new(
+        epoch_manager.clone(),
         runtime.clone(),
-        network_adapter.clone(),
+        resharding_handle.clone(),
+        config.client_config.resharding_config.clone(),
+    ));
+    let resharding_sender = resharding_sender_addr.with_auto_span_context();
+    let state_sync_runtime =
+        Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
+
+    let state_sync_spawner = Arc::new(TokioRuntimeFutureSpawner(state_sync_runtime.clone()));
+    let StartClientResult {
+        client_actor,
+        client_arbiter_handle,
+        tx_pool,
+        chunk_endorsement_tracker,
+    } = start_client(
+        Clock::real(),
         config.client_config.clone(),
-        #[cfg(feature = "test_features")]
-        adv.clone(),
-    );
-    let (client_actor, client_arbiter_handle) = start_client(
-        config.client_config,
-        chain_genesis,
-        runtime,
+        chain_genesis.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
+        runtime.clone(),
         node_id,
-        network_adapter.clone(),
-        config.validator_signer,
-        telemetry,
-        #[cfg(feature = "test_features")]
-        adv.clone(),
+        state_sync_spawner.clone(),
+        network_adapter.as_multi_sender(),
+        shards_manager_adapter.as_sender(),
+        config.validator_signer.clone(),
+        telemetry.with_auto_span_context().into_sender(),
+        Some(snapshot_callbacks),
+        shutdown_signal,
+        adv,
+        config_updater,
+        partial_witness_actor.clone().with_auto_span_context().into_multi_sender(),
+        true,
+        None,
+        resharding_sender.into_multi_sender(),
+    );
+    client_adapter_for_shards_manager.bind(client_actor.clone().with_auto_span_context());
+    client_adapter_for_partial_witness_actor.bind(client_actor.clone().with_auto_span_context());
+    let (shards_manager_actor, shards_manager_arbiter_handle) = start_shards_manager(
+        epoch_manager.clone(),
+        view_epoch_manager.clone(),
+        shard_tracker.clone(),
+        network_adapter.as_sender(),
+        client_adapter_for_shards_manager.as_sender(),
+        config.validator_signer.clone(),
+        split_store.unwrap_or_else(|| storage.get_hot_store()),
+        config.client_config.chunk_request_retry_period,
+    );
+    shards_manager_adapter.bind(shards_manager_actor.with_auto_span_context());
+
+    let rpc_handler_config = RpcHandlerConfig {
+        handler_threads: config.client_config.transaction_request_handler_threads,
+        tx_routing_height_horizon: config.client_config.tx_routing_height_horizon,
+        epoch_length: config.client_config.epoch_length,
+        transaction_validity_period: config.genesis.config.transaction_validity_period,
+    };
+    let rpc_handler = spawn_rpc_handler_actor(
+        rpc_handler_config,
+        tx_pool,
+        chunk_endorsement_tracker,
+        view_epoch_manager.clone(),
+        view_shard_tracker,
+        config.validator_signer.clone(),
+        view_runtime.clone(),
+        network_adapter.as_multi_sender(),
     );
 
-    #[allow(unused_mut)]
-    let mut rpc_servers = Vec::new();
-    let arbiter = Arbiter::new();
-    let client_actor1 = client_actor.clone().recipient();
-    let view_client1 = view_client.clone().recipient();
-    config.network_config.verify();
-    let network_config = config.network_config;
-    let routing_table_addr =
-        start_routing_table_actor(PeerId::new(network_config.public_key.clone()), store.clone());
-    #[cfg(all(feature = "json_rpc", feature = "test_features"))]
-    let routing_table_addr2 = routing_table_addr.clone();
-    let network_actor = PeerManagerActor::start_in_arbiter(&arbiter.handle(), move |_ctx| {
-        PeerManagerActor::new(
-            store,
-            network_config,
-            client_actor1,
-            view_client1,
-            routing_table_addr,
-        )
-        .unwrap()
-    });
+    let mut state_sync_dumper = StateSyncDumper {
+        clock: Clock::real(),
+        client_config: config.client_config.clone(),
+        chain_genesis,
+        epoch_manager,
+        shard_tracker: shard_tracker.clone(),
+        runtime,
+        validator: config.validator_signer.clone(),
+        future_spawner: state_sync_spawner,
+        handle: None,
+    };
+    state_sync_dumper.start()?;
 
+    let hot_store = storage.get_hot_store();
+    let cold_store = storage.get_cold_store();
+
+    let mut rpc_servers = Vec::new();
+    let network_actor = PeerManagerActor::spawn(
+        time::Clock::real(),
+        storage.into_inner(near_store::Temperature::Hot),
+        config.network_config,
+        client_sender_for_network(
+            client_actor.clone(),
+            view_client_addr.clone(),
+            rpc_handler.clone(),
+        ),
+        network_adapter.as_multi_sender(),
+        shards_manager_adapter.as_sender(),
+        partial_witness_actor.with_auto_span_context().into_multi_sender(),
+        genesis_id,
+    )
+    .context("PeerManager::spawn()")?;
+    network_adapter.bind(network_actor.clone().with_auto_span_context());
     #[cfg(feature = "json_rpc")]
     if let Some(rpc_config) = config.rpc_config {
-        rpc_servers.extend_from_slice(&near_jsonrpc::start_http(
+        let entity_debug_handler = EntityDebugHandlerImpl {
+            epoch_manager: view_epoch_manager,
+            runtime: view_runtime,
+            hot_store,
+            cold_store,
+        };
+        rpc_servers.extend(near_jsonrpc::start_http(
             rpc_config,
             config.genesis.config.clone(),
-            client_actor.clone(),
-            view_client.clone(),
+            client_actor.clone().with_auto_span_context().into_multi_sender(),
+            view_client_addr.clone().with_auto_span_context().into_multi_sender(),
+            rpc_handler.clone().with_auto_span_context().into_multi_sender(),
+            network_actor.into_multi_sender(),
             #[cfg(feature = "test_features")]
-            network_actor.clone(),
-            #[cfg(feature = "test_features")]
-            routing_table_addr2,
+            _gc_actor.with_auto_span_context().into_multi_sender(),
+            Arc::new(entity_debug_handler),
         ));
     }
 
@@ -372,29 +522,52 @@ pub fn start_with_config(home_dir: &Path, config: NearConfig) -> NearNode {
     if let Some(rosetta_rpc_config) = config.rosetta_rpc_config {
         rpc_servers.push((
             "Rosetta RPC",
-            start_rosetta_rpc(
+            near_rosetta_rpc::start_rosetta_rpc(
                 rosetta_rpc_config,
-                Arc::new(config.genesis.clone()),
+                config.genesis,
+                genesis_block.header().hash(),
                 client_actor.clone(),
-                view_client.clone(),
+                view_client_addr.clone(),
+                rpc_handler.clone(),
             ),
         ));
     }
 
-    network_adapter.set_recipient(network_actor.recipient());
-
     rpc_servers.shrink_to_fit();
 
-    trace!(target: "diagnostic", key="log", "Starting NEAR node with diagnostic activated");
+    tracing::trace!(target: "diagnostic", key = "log", "Starting NEAR node with diagnostic activated");
 
-    // We probably reached peak memory once on this thread, we want to see when it happens again.
-    #[cfg(feature = "performance_stats")]
-    reset_memory_usage_max();
-
-    NearNode {
-        client: client_actor,
-        view_client,
-        rpc_servers,
-        arbiters: vec![client_arbiter_handle, arbiter.handle()],
+    let mut arbiters = vec![
+        client_arbiter_handle,
+        shards_manager_arbiter_handle,
+        trie_metrics_arbiter,
+        state_snapshot_arbiter,
+        gc_arbiter,
+        partial_witness_arbiter,
+    ];
+    if let Some(db_metrics_arbiter) = db_metrics_arbiter {
+        arbiters.push(db_metrics_arbiter);
     }
+
+    #[cfg(feature = "tx_generator")]
+    let tx_generator = near_transactions_generator::actix_actor::start_tx_generator(
+        config.tx_generator.unwrap_or_default(),
+        rpc_handler.clone().with_auto_span_context().into_multi_sender(),
+        view_client_addr.clone().with_auto_span_context().into_multi_sender(),
+    );
+
+    Ok(NearNode {
+        client: client_actor,
+        view_client: view_client_addr,
+        rpc_handler,
+        #[cfg(feature = "tx_generator")]
+        tx_generator,
+        rpc_servers,
+        arbiters,
+        cold_store_loop_handle,
+        state_sync_dumper,
+        resharding_handle,
+        state_sync_runtime,
+        shard_tracker,
+    })
 }

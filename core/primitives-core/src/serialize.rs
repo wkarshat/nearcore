@@ -1,214 +1,208 @@
-pub fn to_base<T: AsRef<[u8]>>(input: T) -> String {
-    bs58::encode(input).into_string()
+use base64::Engine;
+use base64::display::Base64Display;
+use base64::engine::general_purpose::GeneralPurpose;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+pub fn to_base64(input: &[u8]) -> String {
+    BASE64_STANDARD.encode(input)
 }
 
-pub fn from_base(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    bs58::decode(s).into_vec().map_err(|err| err.into())
+pub fn base64_display(input: &[u8]) -> Base64Display<'_, 'static, GeneralPurpose> {
+    Base64Display::new(input, &BASE64_STANDARD)
 }
 
-pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
-    base64::encode(&input)
+pub fn from_base64(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    BASE64_STANDARD.decode(encoded)
 }
 
-pub fn from_base64(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    base64::decode(s).map_err(|err| err.into())
-}
-
-pub fn from_base_buf(s: &str, buffer: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
-    match bs58::decode(s).into(buffer) {
-        Ok(_) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-pub trait BaseEncode {
-    fn to_base(&self) -> String;
-}
-
-impl<T> BaseEncode for T
-where
-    for<'a> &'a T: Into<Vec<u8>>,
-{
-    fn to_base(&self) -> String {
-        to_base(&self.into())
-    }
-}
-
-pub trait BaseDecode: for<'a> TryFrom<&'a [u8], Error = Box<dyn std::error::Error>> {
-    fn from_base(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = from_base(s)?;
-        Self::try_from(&bytes)
-    }
-}
-
-pub mod base64_format {
+/// Serializes number as a string; deserializes either as a string or number.
+///
+/// This format works for `u64`, `u128`, `Option<u64>` and `Option<u128>` types.
+/// When serializing, numbers are serialized as decimal strings.  When
+/// deserializing, strings are parsed as decimal numbers while numbers are
+/// interpreted as is.
+pub mod dec_format {
     use serde::de;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
 
-    use super::{from_base64, to_base64};
+    #[derive(thiserror::Error, Debug)]
+    #[error("cannot parse from unit")]
+    pub struct ParseUnitError;
 
-    pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: AsRef<[u8]>,
-    {
-        serializer.serialize_str(&to_base64(data))
+    /// Abstraction between integers that we serialize.
+    pub trait DecType: Sized {
+        /// Formats number as a decimal string; passes `None` as is.
+        fn serialize(&self) -> Option<String>;
+
+        /// Constructs Self from a `null` value.  Returns error if this type
+        /// does not accept `null` values.
+        fn try_from_unit() -> Result<Self, ParseUnitError> {
+            Err(ParseUnitError)
+        }
+
+        /// Tries to parse decimal string as an integer.
+        fn try_from_str(value: &str) -> Result<Self, std::num::ParseIntError>;
+
+        /// Constructs Self from a 64-bit unsigned integer.
+        fn from_u64(value: u64) -> Self;
+    }
+
+    impl DecType for u64 {
+        fn serialize(&self) -> Option<String> {
+            Some(self.to_string())
+        }
+        fn try_from_str(value: &str) -> Result<Self, std::num::ParseIntError> {
+            Self::from_str_radix(value, 10)
+        }
+        fn from_u64(value: u64) -> Self {
+            value
+        }
+    }
+
+    impl DecType for u128 {
+        fn serialize(&self) -> Option<String> {
+            Some(self.to_string())
+        }
+        fn try_from_str(value: &str) -> Result<Self, std::num::ParseIntError> {
+            Self::from_str_radix(value, 10)
+        }
+        fn from_u64(value: u64) -> Self {
+            value.into()
+        }
+    }
+
+    impl<T: DecType> DecType for Option<T> {
+        fn serialize(&self) -> Option<String> {
+            self.as_ref().and_then(DecType::serialize)
+        }
+        fn try_from_unit() -> Result<Self, ParseUnitError> {
+            Ok(None)
+        }
+        fn try_from_str(value: &str) -> Result<Self, std::num::ParseIntError> {
+            Some(T::try_from_str(value)).transpose()
+        }
+        fn from_u64(value: u64) -> Self {
+            Some(T::from_u64(value))
+        }
+    }
+
+    struct Visitor<T>(core::marker::PhantomData<T>);
+
+    impl<'de, T: DecType> de::Visitor<'de> for Visitor<T> {
+        type Value = T;
+
+        fn expecting(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fmt.write_str("a non-negative integer as a string")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<T, E> {
+            T::try_from_unit().map_err(|_| de::Error::invalid_type(de::Unexpected::Option, &self))
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<T, E> {
+            Ok(T::from_u64(value))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
+            T::try_from_str(value).map_err(de::Error::custom)
+        }
     }
 
     pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
-        T: From<Vec<u8>>,
+        T: DecType,
     {
-        let s = String::deserialize(deserializer)?;
-        from_base64(&s).map_err(|err| de::Error::custom(err.to_string())).map(Into::into)
+        deserializer.deserialize_any(Visitor(Default::default()))
     }
-}
 
-pub mod option_base64_format {
-    use serde::de;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use super::{from_base64, to_base64};
-
-    pub fn serialize<S>(data: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S, T>(num: &T, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
+        T: DecType,
     {
-        if let Some(ref bytes) = data {
-            serializer.serialize_str(&to_base64(bytes))
-        } else {
-            serializer.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: Option<String> = Option::deserialize(deserializer)?;
-        if let Some(s) = s {
-            Ok(Some(from_base64(&s).map_err(|err| de::Error::custom(err.to_string()))?))
-        } else {
-            Ok(None)
+        match num.serialize() {
+            Some(value) => serializer.serialize_str(&value),
+            None => serializer.serialize_none(),
         }
     }
 }
 
-pub mod base_bytes_format {
-    use serde::de;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use super::{from_base, to_base};
-
-    pub fn serialize<S>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&to_base(data))
+#[test]
+fn test_u64_dec_format() {
+    #[derive(PartialEq, Debug, serde::Deserialize, serde::Serialize)]
+    struct Test {
+        #[serde(with = "dec_format")]
+        field: u64,
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        from_base(&s).map_err(|err| de::Error::custom(err.to_string()))
-    }
+    assert_round_trip("{\"field\":\"42\"}", Test { field: 42 });
+    assert_round_trip("{\"field\":\"18446744073709551615\"}", Test { field: u64::MAX });
+    assert_deserialize("{\"field\":42}", Test { field: 42 });
+    assert_de_error::<Test>("{\"field\":18446744073709551616}");
+    assert_de_error::<Test>("{\"field\":\"18446744073709551616\"}");
+    assert_de_error::<Test>("{\"field\":42.0}");
 }
 
-pub mod u64_dec_format {
-    use serde::de;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(num: &u64, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format!("{}", num))
+#[test]
+fn test_u128_dec_format() {
+    #[derive(PartialEq, Debug, serde::Deserialize, serde::Serialize)]
+    struct Test {
+        #[serde(with = "dec_format")]
+        field: u128,
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        u64::from_str_radix(&s, 10).map_err(de::Error::custom)
-    }
+    assert_round_trip("{\"field\":\"42\"}", Test { field: 42 });
+    assert_round_trip("{\"field\":\"18446744073709551615\"}", Test { field: u64::MAX as u128 });
+    assert_round_trip("{\"field\":\"18446744073709551616\"}", Test { field: 18446744073709551616 });
+    assert_deserialize("{\"field\":42}", Test { field: 42 });
+    assert_de_error::<Test>("{\"field\":null}");
+    assert_de_error::<Test>("{\"field\":42.0}");
 }
 
-pub mod u128_dec_format {
-    use serde::de;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(num: &u128, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format!("{}", num))
+#[test]
+fn test_option_u128_dec_format() {
+    #[derive(PartialEq, Debug, serde::Deserialize, serde::Serialize)]
+    struct Test {
+        #[serde(with = "dec_format")]
+        field: Option<u128>,
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        u128::from_str_radix(&s, 10).map_err(de::Error::custom)
-    }
+    assert_round_trip("{\"field\":null}", Test { field: None });
+    assert_round_trip("{\"field\":\"42\"}", Test { field: Some(42) });
+    assert_round_trip(
+        "{\"field\":\"18446744073709551615\"}",
+        Test { field: Some(u64::MAX as u128) },
+    );
+    assert_round_trip(
+        "{\"field\":\"18446744073709551616\"}",
+        Test { field: Some(18446744073709551616) },
+    );
+    assert_deserialize("{\"field\":42}", Test { field: Some(42) });
+    assert_de_error::<Test>("{\"field\":42.0}");
 }
 
-pub mod u128_dec_format_compatible {
-    //! This in an extension to `u128_dec_format` that serves a compatibility layer role to
-    //! deserialize u128 from a "small" JSON number (u64).
-    //!
-    //! It is unfortunate that we cannot enable "arbitrary_precision" feature in
-    //! serde_json due to a bug: <https://github.com/serde-rs/json/issues/505>.
-    use serde::{de, Deserialize, Deserializer};
-
-    pub use super::u128_dec_format::serialize;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum U128 {
-        Number(u64),
-        String(String),
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match U128::deserialize(deserializer)? {
-            U128::Number(value) => Ok(u128::from(value)),
-            U128::String(value) => u128::from_str_radix(&value, 10).map_err(de::Error::custom),
-        }
-    }
+#[cfg(test)]
+#[track_caller]
+fn assert_round_trip<'a, T>(serialized: &'a str, obj: T)
+where
+    T: serde::Deserialize<'a> + serde::Serialize + std::fmt::Debug + std::cmp::PartialEq,
+{
+    assert_eq!(serialized, serde_json::to_string(&obj).unwrap());
+    assert_eq!(obj, serde_json::from_str(serialized).unwrap());
 }
 
-pub mod option_u128_dec_format {
-    use serde::de;
-    use serde::{Deserialize, Deserializer, Serializer};
+#[cfg(test)]
+#[track_caller]
+fn assert_deserialize<'a, T>(serialized: &'a str, obj: T)
+where
+    T: serde::Deserialize<'a> + std::fmt::Debug + std::cmp::PartialEq,
+{
+    assert_eq!(obj, serde_json::from_str(serialized).unwrap());
+}
 
-    pub fn serialize<S>(data: &Option<u128>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if let Some(ref num) = data {
-            serializer.serialize_str(&format!("{}", num))
-        } else {
-            serializer.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u128>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: Option<String> = Option::deserialize(deserializer)?;
-        if let Some(s) = s {
-            Ok(Some(u128::from_str_radix(&s, 10).map_err(de::Error::custom)?))
-        } else {
-            Ok(None)
-        }
-    }
+#[cfg(test)]
+#[track_caller]
+fn assert_de_error<'a, T: serde::Deserialize<'a> + std::fmt::Debug>(serialized: &'a str) {
+    serde_json::from_str::<T>(serialized).unwrap_err();
 }

@@ -16,10 +16,11 @@
 
 //! Nibble-orientated view onto byte-slice, allowing nibble-precision offsets.
 
-use elastic_array::ElasticArray36;
+use smallvec::SmallVec;
 use std::cmp::*;
 use std::fmt;
 
+/// cspell:words nibbleslice
 /// Nibble-orientated view onto byte-slice, allowing nibble-precision offsets.
 ///
 /// This is an immutable struct. No operations actually change it.
@@ -42,7 +43,7 @@ use std::fmt;
 ///   assert_eq!(n2.mid(3).common_prefix(&n1), 3);
 /// }
 /// ```
-#[derive(Copy, Clone, Eq, Ord)]
+#[derive(Copy, Clone, Eq)]
 pub struct NibbleSlice<'a> {
     data: &'a [u8],
     offset: usize,
@@ -59,11 +60,7 @@ impl Iterator for NibbleSliceIterator<'_> {
 
     fn next(&mut self) -> Option<u8> {
         self.i += 1;
-        if self.i <= self.p.len() {
-            Some(self.p.at(self.i - 1))
-        } else {
-            None
-        }
+        if self.i <= self.p.len() { Some(self.p.at(self.i - 1)) } else { None }
     }
 }
 
@@ -102,11 +99,8 @@ impl<'a> NibbleSlice<'a> {
     /// Get the nibble at position `i`.
     #[inline(always)]
     pub fn at(&self, i: usize) -> u8 {
-        if (self.offset + i) & 1 == 1 {
-            self.data[(self.offset + i) / 2] & 15u8
-        } else {
-            self.data[(self.offset + i) / 2] >> 4
-        }
+        let shift = if (self.offset + i) & 1 == 1 { 0 } else { 4 };
+        (self.data[(self.offset + i) / 2] >> shift) & 0xf
     }
 
     /// Return object which represents a view on to this slice (further) offset by `i` nibbles.
@@ -132,9 +126,9 @@ impl<'a> NibbleSlice<'a> {
 
     /// Encode while nibble slice in prefixed hex notation, noting whether it `is_leaf`.
     #[inline]
-    pub fn encode_nibbles(nibbles: &[u8], is_leaf: bool) -> ElasticArray36<u8> {
+    pub fn encode_nibbles(nibbles: &[u8], is_leaf: bool) -> SmallVec<[u8; 36]> {
         let l = nibbles.len();
-        let mut r = ElasticArray36::new();
+        let mut r: SmallVec<[u8; 36]> = SmallVec::new();
         let mut i = l % 2;
         r.push(if i == 1 { 0x10 + nibbles[0] } else { 0 } + if is_leaf { 0x20 } else { 0 });
         while i < l {
@@ -146,31 +140,50 @@ impl<'a> NibbleSlice<'a> {
 
     /// Encode while nibble slice in prefixed hex notation, noting whether it `is_leaf`.
     #[inline]
-    pub fn encoded(&self, is_leaf: bool) -> ElasticArray36<u8> {
+    pub fn encoded(&self, is_leaf: bool) -> SmallVec<[u8; 36]> {
+        let mut to: SmallVec<[u8; 36]> = SmallVec::new();
         let l = self.len();
-        let mut r = ElasticArray36::new();
-        let mut i = l % 2;
-        r.push(if i == 1 { 0x10 + self.at(0) } else { 0 } + if is_leaf { 0x20 } else { 0 });
-        while i < l {
-            r.push(self.at(i) * 16 + self.at(i + 1));
-            i += 2;
+        let parity = l % 2;
+        let mut first_byte: u8 = 0;
+        if parity == 1 {
+            first_byte = 0x10 + self.at(0);
         }
-        r
+        if is_leaf {
+            first_byte |= 0x20;
+        }
+        to.push(first_byte);
+        let from_byte = (self.offset + parity) / 2;
+        to.extend_from_slice(&self.data[from_byte..]);
+        to
     }
 
-    pub fn merge_encoded(&self, other: &Self, is_leaf: bool) -> ElasticArray36<u8> {
+    /// Same as `encoded`, but writes the result to the given vector.
+    #[inline]
+    pub fn encode_to(&self, is_leaf: bool, to: &mut Vec<u8>) {
+        let l = self.len();
+        let parity = l % 2;
+        let mut first_byte: u8 = 0;
+        if parity == 1 {
+            first_byte = 0x10 + self.at(0);
+        }
+        if is_leaf {
+            first_byte |= 0x20;
+        }
+        to.clear();
+        to.push(first_byte);
+        let from_byte = (self.offset + parity) / 2;
+        to.extend_from_slice(&self.data[from_byte..]);
+    }
+
+    pub fn merge_encoded(&self, other: &Self, is_leaf: bool) -> SmallVec<[u8; 36]> {
         let l = self.len() + other.len();
-        let mut r = ElasticArray36::new();
+        let mut r: SmallVec<[u8; 36]> = SmallVec::new();
         let mut i = l % 2;
         r.push(if i == 1 { 0x10 + self.at(0) } else { 0 } + if is_leaf { 0x20 } else { 0 });
         while i < l {
             let bit1 = if i < self.len() { self.at(i) } else { other.at(i - self.len()) };
             let bit2 = if i + 1 < l {
-                if i + 1 < self.len() {
-                    self.at(i + 1)
-                } else {
-                    other.at(i + 1 - self.len())
-                }
+                if i + 1 < self.len() { self.at(i + 1) } else { other.at(i + 1 - self.len()) }
             } else {
                 0
             };
@@ -183,9 +196,9 @@ impl<'a> NibbleSlice<'a> {
 
     /// Encode only the leftmost `n` bytes of the nibble slice in prefixed hex notation,
     /// noting whether it `is_leaf`.
-    pub fn encoded_leftmost(&self, n: usize, is_leaf: bool) -> ElasticArray36<u8> {
+    pub fn encoded_leftmost(&self, n: usize, is_leaf: bool) -> SmallVec<[u8; 36]> {
         let l = min(self.len(), n);
-        let mut r = ElasticArray36::new();
+        let mut r: SmallVec<[u8; 36]> = SmallVec::new();
         let mut i = l % 2;
         r.push(if i == 1 { 0x10 + self.at(0) } else { 0 } + if is_leaf { 0x20 } else { 0 });
         while i < l {
@@ -193,6 +206,27 @@ impl<'a> NibbleSlice<'a> {
             i += 2;
         }
         r
+    }
+
+    /// Same as `encoded_leftmost`, but writes the result to the given vector.
+    pub fn encode_leftmost_to(&self, n: usize, is_leaf: bool, to: &mut Vec<u8>) {
+        let l = min(self.len(), n);
+        to.resize(1 + l / 2, 0);
+        let mut i = l % 2;
+        to[0] = if i == 1 { 0x10 + self.at(0) } else { 0 } + if is_leaf { 0x20 } else { 0 };
+        while i < l {
+            to[i / 2 + 1] = self.at(i) * 16 + self.at(i + 1);
+            i += 2;
+        }
+    }
+
+    // Helper to convert nibbles to bytes.
+    pub fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
+        assert_eq!(nibbles.len() % 2, 0);
+        let encoded: SmallVec<[u8; 36]> = NibbleSlice::encode_nibbles(&nibbles, false);
+        // Ignore first element returned by `encode_nibbles` because it contains only
+        // `is_leaf` info for even length.
+        encoded[1..].to_vec()
     }
 }
 
@@ -202,17 +236,23 @@ impl PartialEq for NibbleSlice<'_> {
     }
 }
 
-impl PartialOrd for NibbleSlice<'_> {
-    fn partial_cmp(&self, them: &Self) -> Option<Ordering> {
+impl Ord for NibbleSlice<'_> {
+    fn cmp(&self, them: &Self) -> Ordering {
         let s = min(self.len(), them.len());
         for i in 0..s {
-            match self.at(i).partial_cmp(&them.at(i)).unwrap() {
-                Ordering::Less => return Some(Ordering::Less),
-                Ordering::Greater => return Some(Ordering::Greater),
+            match self.at(i).cmp(&them.at(i)) {
+                Ordering::Less => return Ordering::Less,
+                Ordering::Greater => return Ordering::Greater,
                 _ => {}
             }
         }
-        self.len().partial_cmp(&them.len())
+        self.len().cmp(&them.len())
+    }
+}
+
+impl PartialOrd for NibbleSlice<'_> {
+    fn partial_cmp(&self, them: &Self) -> Option<Ordering> {
+        Some(self.cmp(them))
     }
 }
 
@@ -232,8 +272,8 @@ impl fmt::Debug for NibbleSlice<'_> {
 #[cfg(test)]
 mod tests {
     use super::NibbleSlice;
-    use elastic_array::ElasticArray36;
-    use rand::{thread_rng, Rng};
+    use rand::{Rng, thread_rng};
+    use smallvec::SmallVec;
 
     static D: &[u8; 3] = &[0x01u8, 0x23, 0x45];
 
@@ -277,10 +317,15 @@ mod tests {
     #[test]
     fn encoded() {
         let n = NibbleSlice::new(D);
-        assert_eq!(n.encoded(false), ElasticArray36::from_slice(&[0x00, 0x01, 0x23, 0x45]));
-        assert_eq!(n.encoded(true), ElasticArray36::from_slice(&[0x20, 0x01, 0x23, 0x45]));
-        assert_eq!(n.mid(1).encoded(false), ElasticArray36::from_slice(&[0x11, 0x23, 0x45]));
-        assert_eq!(n.mid(1).encoded(true), ElasticArray36::from_slice(&[0x31, 0x23, 0x45]));
+        assert_eq!(n.encoded(false), SmallVec::<[u8; 36]>::from_slice(&[0x00, 0x01, 0x23, 0x45]));
+        assert_eq!(n.encoded(true), SmallVec::<[u8; 36]>::from_slice(&[0x20, 0x01, 0x23, 0x45]));
+        let mut v = vec![];
+        n.encode_to(false, &mut v);
+        assert_eq!(v, vec![0x00, 0x01, 0x23, 0x45]);
+        n.encode_to(true, &mut v);
+        assert_eq!(v, vec![0x20, 0x01, 0x23, 0x45]);
+        assert_eq!(n.mid(1).encoded(false), SmallVec::<[u8; 36]>::from_slice(&[0x11, 0x23, 0x45]));
+        assert_eq!(n.mid(1).encoded(true), SmallVec::<[u8; 36]>::from_slice(&[0x31, 0x23, 0x45]));
     }
 
     #[test]
@@ -293,10 +338,24 @@ mod tests {
     }
 
     fn encode_decode(nibbles: &[u8], is_leaf: bool) {
-        let n = NibbleSlice::encode_nibbles(nibbles, is_leaf);
-        let (n, is_leaf_decoded) = NibbleSlice::from_encoded(&n);
+        let encoded = NibbleSlice::encode_nibbles(nibbles, is_leaf);
+        let (n, is_leaf_decoded) = NibbleSlice::from_encoded(&encoded);
         assert_eq!(&n.iter().collect::<Vec<_>>(), nibbles);
-        assert_eq!(is_leaf_decoded, is_leaf)
+        assert_eq!(is_leaf_decoded, is_leaf);
+        let re_encoded = n.encoded(is_leaf);
+        assert_eq!(&re_encoded, &encoded);
+        let mut re_encoded2 = vec![];
+        n.encode_to(is_leaf, &mut re_encoded2);
+        assert_eq!(&re_encoded2, &encoded.to_vec());
+
+        for i in 0..nibbles.len() {
+            let encoded = NibbleSlice::encode_nibbles(&nibbles[..i], is_leaf);
+            let leftmost_encoded = n.encoded_leftmost(i, is_leaf);
+            assert_eq!(&leftmost_encoded, &encoded);
+            let mut leftmost_encoded2 = vec![];
+            n.encode_leftmost_to(i, is_leaf, &mut leftmost_encoded2);
+            assert_eq!(&leftmost_encoded2, &encoded.to_vec());
+        }
     }
 
     #[test]
@@ -307,8 +366,8 @@ mod tests {
         encode_decode(&[0u8], true);
         let mut rng = thread_rng();
         for _ in 0..100 {
-            let l = rng.gen_range(0, 10);
-            let nibbles: Vec<_> = (0..l).map(|_| rng.gen_range(0, 16) as u8).collect();
+            let l = rng.gen_range(0..10);
+            let nibbles: Vec<_> = (0..l).map(|_| rng.gen_range(0..16) as u8).collect();
             encode_decode(&nibbles, true);
             encode_decode(&nibbles, false);
         }

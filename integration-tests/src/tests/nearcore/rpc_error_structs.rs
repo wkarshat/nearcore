@@ -1,17 +1,18 @@
 use std::str::FromStr;
 
 use actix::{Actor, System};
-use borsh::BorshSerialize;
-use futures::{future, FutureExt, TryFutureExt};
 
-use crate::genesis_helpers::genesis_block;
+use futures::{FutureExt, TryFutureExt, future};
+
 use crate::tests::nearcore::node_cluster::NodeCluster;
+use crate::utils::genesis_helpers::genesis_block;
 use near_actix_test_utils::spawn_interruptible;
 use near_client::GetBlock;
-use near_crypto::{InMemorySigner, KeyType};
+use near_crypto::InMemorySigner;
 use near_jsonrpc::client::new_client;
-use near_logger_utils::init_integration_logger;
 use near_network::test_utils::WaitOrTimeoutActor;
+use near_o11y::WithSpanContextExt;
+use near_o11y::testonly::init_integration_logger;
 use near_primitives::hash::CryptoHash;
 use near_primitives::serialize::to_base64;
 use near_primitives::transaction::SignedTransaction;
@@ -20,10 +21,10 @@ use near_primitives::types::BlockId;
 // Queries json-rpc block that doesn't exists
 // Checks if the struct is expected and contains the proper data
 #[test]
-fn test_block_unknown_block_error() {
+fn ultra_slow_test_block_unknown_block_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(4, |index| format!("block_unknown{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(4)
         .set_num_validator_seats(2)
         .set_num_lightclients(2)
@@ -39,7 +40,8 @@ fn test_block_unknown_block_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                spawn_interruptible(view_client.send(GetBlock::latest()).then(move |res| {
+                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
                             let client = new_client(&format!("http://{}", rpc_addrs_copy[2]));
@@ -64,7 +66,8 @@ fn test_block_unknown_block_error() {
                         }
                     }
                     future::ready(())
-                }));
+                });
+                spawn_interruptible(actor);
             }),
             100,
             40000,
@@ -74,13 +77,13 @@ fn test_block_unknown_block_error() {
 }
 
 // Queries json-rpc chunk that doesn't exists
-// (randomish chunk hash, we hope it won't happen in test case)
+// (random-ish chunk hash, we hope it won't happen in test case)
 // Checks if the struct is expected and contains the proper data
 #[test]
-fn test_chunk_unknown_chunk_error() {
+fn ultra_slow_test_chunk_unknown_chunk_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(4, |index| format!("chunk_unknown{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(4)
         .set_num_validator_seats(2)
         .set_num_lightclients(2)
@@ -96,7 +99,8 @@ fn test_chunk_unknown_chunk_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                spawn_interruptible(view_client.send(GetBlock::latest()).then(move |res| {
+                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
                             let client = new_client(&format!("http://{}", rpc_addrs_copy[2]));
@@ -132,7 +136,8 @@ fn test_chunk_unknown_chunk_error() {
                         }
                     }
                     future::ready(())
-                }));
+                });
+                spawn_interruptible(actor);
             }),
             100,
             40000,
@@ -144,10 +149,10 @@ fn test_chunk_unknown_chunk_error() {
 // Queries json-rpc EXPERIMENTAL_protocol_config that doesn't exists
 // Checks if the struct is expected and contains the proper data
 #[test]
-fn test_protocol_config_unknown_block_error() {
+fn ultra_slow_test_protocol_config_unknown_block_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(4, |index| format!("protocol_config_block_unknown{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(4)
         .set_num_validator_seats(2)
         .set_num_lightclients(2)
@@ -163,7 +168,8 @@ fn test_protocol_config_unknown_block_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                spawn_interruptible(view_client.send(GetBlock::latest()).then(move |res| {
+                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
                             let client = new_client(&format!("http://{}", rpc_addrs_copy[2]));
@@ -193,7 +199,8 @@ fn test_protocol_config_unknown_block_error() {
                         }
                     }
                     future::ready(())
-                }));
+                });
+                spawn_interruptible(actor);
             }),
             100,
             40000,
@@ -205,10 +212,10 @@ fn test_protocol_config_unknown_block_error() {
 // Queries json-rpc gas_price that doesn't exists
 // Checks if the struct is expected and contains the proper data
 #[test]
-fn test_gas_price_unknown_block_error() {
+fn ultra_slow_test_gas_price_unknown_block_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(4, |index| format!("gas_price_block_unknown{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(4)
         .set_num_validator_seats(2)
         .set_num_lightclients(2)
@@ -224,7 +231,8 @@ fn test_gas_price_unknown_block_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                spawn_interruptible(view_client.send(GetBlock::latest()).then(move |res| {
+                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
                             let client = new_client(&format!("http://{}", rpc_addrs_copy[2]));
@@ -250,7 +258,8 @@ fn test_gas_price_unknown_block_error() {
                         }
                     }
                     future::ready(())
-                }));
+                });
+                spawn_interruptible(actor);
             }),
             100,
             40000,
@@ -262,10 +271,10 @@ fn test_gas_price_unknown_block_error() {
 // Queries json-rpc EXPERIMENTAL_receipt that doesn't exists
 // Checks if the struct is expected and contains the proper data
 #[test]
-fn test_receipt_id_unknown_receipt_error() {
+fn ultra_slow_test_receipt_id_unknown_receipt_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(4, |index| format!("receipt_unknown{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(4)
         .set_num_validator_seats(2)
         .set_num_lightclients(2)
@@ -281,7 +290,8 @@ fn test_receipt_id_unknown_receipt_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                spawn_interruptible(view_client.send(GetBlock::latest()).then(move |res| {
+                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
                             let client = new_client(&format!("http://{}", rpc_addrs_copy[2]));
@@ -319,7 +329,8 @@ fn test_receipt_id_unknown_receipt_error() {
                         }
                     }
                     future::ready(())
-                }));
+                });
+                spawn_interruptible(actor);
             }),
             100,
             40000,
@@ -332,10 +343,11 @@ fn test_receipt_id_unknown_receipt_error() {
 /// Sends tx to first light client through `broadcast_tx_commit` and checks that the transaction has failed.
 /// Checks if the struct is expected and contains the proper data
 #[test]
-fn test_tx_invalid_tx_error() {
+#[ignore = "Invalid test setup. broadcast_tx_commit times out because we haven't implemented forwarding logic. Fix and reenable."]
+fn ultra_slow_test_tx_invalid_tx_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(4, |index| format!("tx_invalid{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(4)
         .set_num_validator_seats(2)
         .set_num_lightclients(2)
@@ -346,8 +358,7 @@ fn test_tx_invalid_tx_error() {
         let view_client = clients[0].1.clone();
 
         let genesis_hash = *genesis_block(&genesis).hash();
-        let signer =
-            InMemorySigner::from_seed("near.5".parse().unwrap(), KeyType::ED25519, "near.5");
+        let signer = InMemorySigner::test_signer(&"near.5".parse().unwrap());
         let transaction = SignedTransaction::send_money(
             1,
             "near.5".parse().unwrap(),
@@ -363,14 +374,15 @@ fn test_tx_invalid_tx_error() {
                 let transaction_copy = transaction.clone();
                 let tx_hash = transaction_copy.get_hash();
 
-                spawn_interruptible(view_client.send(GetBlock::latest()).then(move |res| {
+                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 10 {
                             let client = new_client(&format!("http://{}", rpc_addrs_copy[2]));
-                            let bytes = transaction_copy.try_to_vec().unwrap();
+                            let bytes = borsh::to_vec(&transaction_copy).unwrap();
                             spawn_interruptible(
                                 client
-                                    .EXPERIMENTAL_broadcast_tx_sync(to_base64(&bytes))
+                                    .broadcast_tx_commit(to_base64(&bytes))
                                     .map_err(move |err| {
                                         let error_json = serde_json::to_value(err).unwrap();
 
@@ -394,7 +406,8 @@ fn test_tx_invalid_tx_error() {
                         }
                     }
                     future::ready(())
-                }));
+                });
+                spawn_interruptible(actor);
             }),
             100,
             40000,
@@ -404,10 +417,10 @@ fn test_tx_invalid_tx_error() {
 }
 
 #[test]
-fn test_query_rpc_account_view_unknown_block_must_return_error() {
+fn ultra_slow_test_query_rpc_account_view_unknown_block_must_return_error() {
     init_integration_logger();
 
-    let cluster = NodeCluster::new(1, |index| format!("invalid_account{}", index))
+    let cluster = NodeCluster::default()
         .set_num_shards(1)
         .set_num_validator_seats(1)
         .set_num_lightclients(0)

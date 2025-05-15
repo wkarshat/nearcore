@@ -1,62 +1,63 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use clap::{App, AppSettings, Arg, SubCommand};
+use clap::{Arg, Command};
 
-use near_crypto::{InMemorySigner, KeyType, SecretKey, Signer};
+use near_crypto::{InMemorySigner, KeyType, SecretKey};
 use nearcore::get_default_home;
 
-fn generate_key_to_file(account_id: &str, key: SecretKey, path: PathBuf) {
+fn generate_key_to_file(account_id: &str, key: SecretKey, path: &PathBuf) -> std::io::Result<()> {
     let signer = InMemorySigner::from_secret_key(account_id.parse().unwrap(), key);
-    signer.write_to_file(path.as_path());
+    signer.write_to_file(path.as_path())
 }
 
 fn main() {
-    let default_home = get_default_home();
-    let matches = App::new("Key-pairs generator")
-        .setting(AppSettings::SubcommandRequiredElseHelp)
+    let matches = Command::new("Key-pairs generator")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
         .about("Generates: access key-pairs, validation key-pairs, network key-pairs")
         .arg(
-            Arg::with_name("home")
+            Arg::new("home")
                 .long("home")
-                .default_value_os(default_home.as_os_str())
+                .default_value(get_default_home().into_os_string())
+                .value_parser(clap::value_parser!(PathBuf))
                 .help("Directory for config and data (default \"~/.near\")")
-                .takes_value(true),
+                .action(clap::ArgAction::Set)
         )
         .arg(
-            Arg::with_name("account-id")
+            Arg::new("account-id")
                 .long("account-id")
-                .takes_value(true),
+                .action(clap::ArgAction::Set)
         )
         .arg(
-            Arg::with_name("generate-config")
+            Arg::new("generate-config")
                 .long("generate-config")
                 .help("Whether to generate a config file when generating keys. Requires account-id to be specified.")
-                .takes_value(false),
+                .action(clap::ArgAction::SetTrue),
         )
         .subcommand(
-            SubCommand::with_name("signer-keys").about("Generate signer keys.").arg(
-                Arg::with_name("num-keys")
+            Command::new("signer-keys").about("Generate signer keys.").arg(
+                Arg::new("num-keys")
                     .long("num-keys")
-                    .takes_value(true)
+                    .action(clap::ArgAction::Set)
                     .help("Number of signer keys to generate. (default 3)"),
             ),
         )
         .subcommand(
-            SubCommand::with_name("node-key").about("Generate key for the node communication."),
+            Command::new("node-key").about("Generate key for the node communication."),
         )
-        .subcommand(SubCommand::with_name("validator-key").about("Generate staking key."))
+        .subcommand(Command::new("validator-key").about("Generate staking key."))
         .get_matches();
 
-    let home_dir = matches.value_of("home").map(|dir| Path::new(dir)).unwrap();
+    let home_dir = matches.get_one::<PathBuf>("home").unwrap();
     fs::create_dir_all(home_dir).expect("Failed to create directory");
-    let account_id = matches.value_of("account-id");
-    let generate_config = matches.is_present("generate-config");
+    let account_id = matches.get_one::<String>("account-id");
+    let generate_config = matches.get_flag("generate-config");
 
     match matches.subcommand() {
-        ("signer-keys", Some(args)) => {
+        Some(("signer-keys", args)) => {
             let num_keys = args
-                .value_of("num-keys")
+                .get_one::<String>("num-keys")
                 .map(|x| x.parse().expect("Failed to parse number keys."))
                 .unwrap_or(3usize);
             let keys: Vec<SecretKey> =
@@ -72,16 +73,19 @@ fn main() {
                     let key_file_name = format!("signer{}_key.json", i);
                     let mut path = home_dir.to_path_buf();
                     path.push(&key_file_name);
-                    generate_key_to_file(account_id, key.clone(), path);
+                    if let Err(e) = generate_key_to_file(account_id, key.clone(), &path) {
+                        eprintln!("Error writing key to {}: {}", path.display(), e);
+                        return;
+                    }
                 }
 
                 pks.push(key.public_key());
             }
-            let pks: Vec<_> = pks.into_iter().map(|pk| format!("{}", pk)).collect();
+            let pks: Vec<_> = pks.into_iter().map(|pk| pk.to_string()).collect();
             println!("List of public keys:");
             println!("{}", pks.join(","));
         }
-        ("validator-key", Some(_)) => {
+        Some(("validator-key", _)) => {
             let key = SecretKey::from_random(KeyType::ED25519);
             println!("PK: {}", key.public_key());
             if generate_config {
@@ -89,18 +93,24 @@ fn main() {
                     account_id.expect("Account id must be specified if --generate-config is used");
                 let mut path = home_dir.to_path_buf();
                 path.push(nearcore::config::VALIDATOR_KEY_FILE);
-                generate_key_to_file(account_id, key, path);
+                if let Err(e) = generate_key_to_file(account_id, key, &path) {
+                    eprintln!("Error writing key to {}: {}", path.display(), e);
+                    return;
+                }
             }
         }
-        ("node-key", Some(_args)) => {
+        Some(("node-key", _args)) => {
             let key = SecretKey::from_random(KeyType::ED25519);
             println!("PK: {}", key.public_key());
             if generate_config {
                 let mut path = home_dir.to_path_buf();
                 path.push(nearcore::config::NODE_KEY_FILE);
-                generate_key_to_file("node", key, path);
+                if let Err(e) = generate_key_to_file("node", key, &path) {
+                    eprintln!("Error writing key to {}: {}", path.display(), e);
+                    return;
+                }
             }
         }
-        (_, _) => unreachable!(),
+        _ => unreachable!(),
     }
 }

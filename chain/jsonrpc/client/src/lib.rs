@@ -1,25 +1,23 @@
-use std::time::Duration;
-
 use awc::{Client, Connector};
-use futures::{future, future::LocalBoxFuture, FutureExt, TryFutureExt};
-use serde::Deserialize;
-use serde::Serialize;
-
+use futures::{FutureExt, TryFutureExt, future, future::LocalBoxFuture};
 use near_jsonrpc_primitives::errors::RpcError;
-use near_jsonrpc_primitives::message::{from_slice, Message};
+use near_jsonrpc_primitives::message::{Message, from_slice};
 use near_jsonrpc_primitives::types::changes::{
     RpcStateChangesInBlockByTypeRequest, RpcStateChangesInBlockByTypeResponse,
 };
+use near_jsonrpc_primitives::types::transactions::{
+    RpcSendTransactionRequest, RpcTransactionResponse, RpcTransactionStatusRequest,
+};
 use near_jsonrpc_primitives::types::validator::RpcValidatorsOrderedRequest;
 use near_primitives::hash::CryptoHash;
-use near_primitives::types::{AccountId, BlockId, BlockReference, MaybeBlockId, ShardId};
+use near_primitives::types::{BlockId, BlockReference, EpochReference, MaybeBlockId, ShardId};
 use near_primitives::views::validator_stake_view::ValidatorStakeView;
 use near_primitives::views::{
-    BlockView, ChunkView, EpochValidatorInfo, FinalExecutionOutcomeView, GasPriceView,
-    StatusResponse,
+    BlockView, ChunkView, EpochValidatorInfo, GasPriceView, StatusResponse,
 };
+use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum ChunkId {
     BlockShardId(BlockId, ShardId),
@@ -39,11 +37,10 @@ type RpcRequest<T> = LocalBoxFuture<'static, Result<T, RpcError>>;
 /// Prepare a `RPCRequest` with a given client, server address, method and parameters.
 fn call_method<P, R>(client: &Client, server_addr: &str, method: &str, params: P) -> RpcRequest<R>
 where
-    P: Serialize,
+    P: serde::Serialize,
     R: serde::de::DeserializeOwned + 'static,
 {
-    let request =
-        Message::request(method.to_string(), Some(serde_json::to_value(&params).unwrap()));
+    let request = Message::request(method.to_string(), serde_json::to_value(&params).unwrap());
     // TODO: simplify this.
     client
         .post(server_addr)
@@ -66,7 +63,7 @@ where
                     serde_json::from_value(x)
                         .map_err(|err| RpcError::parse_error(format!("Failed to parse: {:?}", err)))
                 }),
-                _ => Err(RpcError::parse_error(format!("Failed to parse JSON RPC response"))),
+                _ => Err(RpcError::parse_error("Failed to parse JSON RPC response".to_string())),
             })
         })
         .boxed_local()
@@ -80,7 +77,7 @@ fn call_http_get<R, P>(
     _params: P,
 ) -> HttpRequest<R>
 where
-    P: Serialize,
+    P: serde::Serialize,
     R: serde::de::DeserializeOwned + 'static,
 {
     // TODO: url encode params.
@@ -90,10 +87,8 @@ where
         .map_err(|err| err.to_string())
         .and_then(|mut response| {
             response.body().map(|body| match body {
-                Ok(bytes) => String::from_utf8(bytes.to_vec())
-                    .map_err(|err| format!("Error {:?} in {:?}", err, bytes))
-                    .and_then(|s| serde_json::from_str(&s).map_err(|err| err.to_string())),
-                Err(_) => Err("Payload error: {:?}".to_string()),
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string()),
+                Err(err) => Err(format!("Payload error: {err}")),
             })
         })
         .boxed_local()
@@ -102,6 +97,7 @@ where
 /// Expands a variable list of parameters into its serializable form. Is needed to make the params
 /// of a nullary method equal to `[]` instead of `()` and thus make sure it serializes to `[]`
 /// instead of `null`.
+/// cspell:ignore nullary
 #[doc(hidden)]
 macro_rules! expand_params {
     () => ([] as [(); 0]);
@@ -110,6 +106,7 @@ macro_rules! expand_params {
 
 /// Generates a simple HTTP client with automatic serialization and deserialization.
 /// Method calls get correct types automatically.
+/// cspell:ignore selff
 macro_rules! http_client {
     (
         $(#[$struct_attr:meta])*
@@ -136,7 +133,7 @@ macro_rules! http_client {
                 pub fn $method(&$selff $(, $arg_name: $arg_ty)*)
                     -> HttpRequest<$return_ty>
                 {
-                    let method = String::from(stringify!($method));
+                    let method = stringify!($method);
                     let params = expand_params!($($arg_name,)*);
                     call_http_get(&$selff.client, &$selff.server_addr, &method, params)
                 }
@@ -173,7 +170,7 @@ macro_rules! jsonrpc_client {
                 pub fn $method(&$selff $(, $arg_name: $arg_ty)*)
                     -> RpcRequest<$return_ty>
                 {
-                    let method = String::from(stringify!($method));
+                    let method = stringify!($method);
                     let params = expand_params!($($arg_name,)*);
                     call_method(&$selff.client, &$selff.server_addr, &method, params)
                 }
@@ -184,20 +181,12 @@ macro_rules! jsonrpc_client {
 
 jsonrpc_client!(pub struct JsonRpcClient {
     pub fn broadcast_tx_async(&self, tx: String) -> RpcRequest<String>;
-    pub fn broadcast_tx_commit(&self, tx: String) -> RpcRequest<FinalExecutionOutcomeView>;
+    pub fn broadcast_tx_commit(&self, tx: String) -> RpcRequest<RpcTransactionResponse>;
     pub fn status(&self) -> RpcRequest<StatusResponse>;
     #[allow(non_snake_case)]
-    pub fn EXPERIMENTAL_check_tx(&self, tx: String) -> RpcRequest<serde_json::Value>;
-    #[allow(non_snake_case)]
     pub fn EXPERIMENTAL_genesis_config(&self) -> RpcRequest<serde_json::Value>;
-    #[allow(non_snake_case)]
-    pub fn EXPERIMENTAL_broadcast_tx_sync(&self, tx: String) -> RpcRequest<serde_json::Value>;
-    #[allow(non_snake_case)]
-    pub fn EXPERIMENTAL_tx_status(&self, tx: String) -> RpcRequest<serde_json::Value>;
     pub fn health(&self) -> RpcRequest<()>;
-    pub fn tx(&self, hash: String, account_id: AccountId) -> RpcRequest<FinalExecutionOutcomeView>;
     pub fn chunk(&self, id: ChunkId) -> RpcRequest<ChunkView>;
-    pub fn validators(&self, block_id: MaybeBlockId) -> RpcRequest<EpochValidatorInfo>;
     pub fn gas_price(&self, block_id: MaybeBlockId) -> RpcRequest<GasPriceView>;
 });
 
@@ -225,6 +214,18 @@ impl JsonRpcClient {
 
     pub fn block(&self, request: BlockReference) -> RpcRequest<BlockView> {
         call_method(&self.client, &self.server_addr, "block", request)
+    }
+
+    pub fn tx(&self, request: RpcTransactionStatusRequest) -> RpcRequest<RpcTransactionResponse> {
+        call_method(&self.client, &self.server_addr, "tx", request)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn EXPERIMENTAL_tx_status(
+        &self,
+        request: RpcTransactionStatusRequest,
+    ) -> RpcRequest<RpcTransactionResponse> {
+        call_method(&self.client, &self.server_addr, "EXPERIMENTAL_tx_status", request)
     }
 
     #[allow(non_snake_case)]
@@ -257,6 +258,35 @@ impl JsonRpcClient {
         request: near_jsonrpc_primitives::types::config::RpcProtocolConfigRequest,
     ) -> RpcRequest<near_jsonrpc_primitives::types::config::RpcProtocolConfigResponse> {
         call_method(&self.client, &self.server_addr, "EXPERIMENTAL_protocol_config", request)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn EXPERIMENTAL_split_storage_info(
+        &self,
+        request: near_jsonrpc_primitives::types::split_storage::RpcSplitStorageInfoRequest,
+    ) -> RpcRequest<near_jsonrpc_primitives::types::split_storage::RpcSplitStorageInfoResponse>
+    {
+        call_method(&self.client, &self.server_addr, "EXPERIMENTAL_split_storage_info", request)
+    }
+
+    pub fn validators(
+        &self,
+        epoch_id_or_block_id: Option<EpochReference>,
+    ) -> RpcRequest<EpochValidatorInfo> {
+        let epoch_reference = match epoch_id_or_block_id {
+            Some(epoch_reference) => epoch_reference,
+            _ => EpochReference::Latest,
+        };
+        call_method(&self.client, &self.server_addr, "validators", epoch_reference)
+    }
+
+    pub fn send_tx(
+        &self,
+        signed_transaction: near_primitives::transaction::SignedTransaction,
+        wait_until: near_primitives::views::TxExecutionStatus,
+    ) -> RpcRequest<RpcTransactionResponse> {
+        let request = RpcSendTransactionRequest { signed_transaction, wait_until };
+        call_method(&self.client, &self.server_addr, "send_tx", request)
     }
 }
 

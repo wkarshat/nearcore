@@ -1,28 +1,39 @@
 [package]
 name = "runtime-tester"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
+
+[lints]
+workspace = true
 
 [dependencies]
-byteorder = "1.2"
-libfuzzer-sys = { version = "0.4"}
-log = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tempfile = "3"
+cpu-time.workspace = true
+libfuzzer-sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
 
-near-chain = { path = "../../chain/chain" }
-near-chain-configs = { path = "../../core/chain-configs" }
-near-crypto = { path = "../../core/crypto" }
-near-client = { path = "../../chain/client" }
-near-client-primitives = { path = "../../chain/client-primitives" }
-nearcore = { path = "../../nearcore" }
-near-logger-utils = { path = "../logger" }
-near-primitives = { path = "../../core/primitives" }
-near-store = { path = "../../core/store" }
-near-test-contracts = { path = "../../runtime/near-test-contracts" }
-testlib = { path = "../testlib" }
+integration-tests.workspace = true
+near-chain-configs.workspace = true
+near-chain.workspace = true
+near-client-primitives.workspace = true
+near-client.workspace = true
+nearcore.workspace = true
+near-crypto.workspace = true
+near-epoch-manager.workspace = true
+near-o11y.workspace = true
+near-parameters.workspace = true
+near-primitives.workspace = true
+near-store.workspace = true
+near-test-contracts.workspace = true
+near-vm-runner.workspace = true
+
+[dev-dependencies]
+testlib.workspace = true
+bolero.workspace = true

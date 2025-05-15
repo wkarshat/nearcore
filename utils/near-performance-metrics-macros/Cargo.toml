@@ -1,17 +1,19 @@
 [package]
 name = "near-performance-metrics-macros"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>", "Piotr Mikulski <piotr@near.org"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lints]
+workspace = true
 
 [dependencies]
-syn = { version = "1.0.54", features = ["full"] }
-quote = "1.0"
+quote.workspace = true
+syn.workspace = true
 
 [lib]
 proc-macro = true

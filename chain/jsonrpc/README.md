@@ -19,10 +19,10 @@ communicated through the CHANGELOG next to this file.
 
 1. We only add the APIs to the data that is already available in nearcore
    storage.
-2. We don't violate the guaranties described in the section above.
+2. We don't violate the guarantees described in the section above.
 3. We prefix new APIs with `EXPERIMENTAL_` (see the Experimental API Policies
    below).
-4. We document the API change on [NEAR Docs](https://docs.near.org/docs/develop/front-end/rpc)
+4. We document the API change on [NEAR Docs](https://docs.near.org/api/rpc/introduction)
    BEFORE merging the change to nearcore.
 5. We log changes to the methods and API input/output structures through
    CHANGELOG.md file in the jsonrpc crate.
@@ -34,7 +34,7 @@ When you introduce new API, we may go two ways:
 1. Hide the new API behind a feature-flag that is not enabled by default
 2. Prefix the method name with `EXPERIMENTAL_`
 
-Either way, we need to document the new API in our [RPC endpoint docs](https://docs.near.org/docs/develop/front-end/rpc).
+Either way, we need to document the new API in our [RPC endpoint docs](https://docs.near.org/api/rpc/introduction).
 
 Stabilization of the Experimental APIs is multistage:
 

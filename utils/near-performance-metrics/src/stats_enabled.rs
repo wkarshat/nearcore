@@ -1,37 +1,33 @@
 use bytesize::ByteSize;
 use futures;
 use futures::task::Context;
-use log::{info, warn};
-use near_rust_allocator_proxy::allocator::{
-    current_thread_memory_usage, current_thread_peak_memory_usage, get_tid, reset_memory_usage_max,
-    thread_memory_count, thread_memory_usage, total_memory_usage,
-};
-use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
-use strum::AsStaticRef;
+use tracing::{info, warn};
 
-static MEMORY_LIMIT: u64 = 512 * bytesize::MIB;
-static MIN_MEM_USAGE_REPORT_SIZE: u64 = 100 * bytesize::MIB;
+// cspell:words NTHREADS
 
 pub static NTHREADS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const SLOW_CALL_THRESHOLD: Duration = Duration::from_millis(500);
 const MIN_OCCUPANCY_RATIO_THRESHOLD: f64 = 0.02;
 
-pub(crate) static STATS: Lazy<Arc<Mutex<Stats>>> = Lazy::new(|| Arc::new(Mutex::new(Stats::new())));
-pub(crate) static REF_COUNTER: Lazy<Mutex<HashMap<(&'static str, u32), u128>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+pub(crate) static STATS: LazyLock<Arc<Mutex<Stats>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Stats::new())));
+pub(crate) static REF_COUNTER: LazyLock<Mutex<HashMap<(&'static str, u32), u128>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn get_thread_stats_logger() -> Arc<Mutex<ThreadStats>> {
     thread_local! {
         static LOCAL_STATS: Arc<Mutex<ThreadStats>> = {
             let res = Arc::new(Mutex::new(ThreadStats::new()));
-            STATS.lock().unwrap().add_entry(&res);
+            STATS.lock().add_entry(&res);
             res
         }
     }
@@ -127,10 +123,10 @@ impl ThreadStats {
 
     fn print_stats_and_clear(
         &mut self,
-        tid: usize,
+        tid: std::thread::ThreadId,
         sleep_time: Duration,
         now: Instant,
-    ) -> (f64, f64, ByteSize, usize) {
+    ) -> (f64, f64) {
         let mut ratio = self.time.as_nanos() as f64;
         if let Some(in_progress_since) = self.in_progress_since {
             let from = max(in_progress_since, self.last_check);
@@ -138,20 +134,16 @@ impl ThreadStats {
         }
         ratio /= sleep_time.as_nanos() as f64;
 
-        let tmu = ByteSize::b(thread_memory_usage(tid) as u64);
-        let show_stats = ratio >= MIN_OCCUPANCY_RATIO_THRESHOLD
-            || tmu + self.c_mem >= ByteSize::b(MIN_MEM_USAGE_REPORT_SIZE);
+        let show_stats = ratio >= MIN_OCCUPANCY_RATIO_THRESHOLD;
 
         if show_stats {
             let class_name = format!("{:?}", self.classes);
             warn!(
-                "    Thread:{} ratio: {:.3} {}:{} Rust mem: {}({}) C mem: {}",
+                "    {:?}: ratio: {:.3} {}:{:?} C mem: {}",
                 tid,
                 ratio,
                 class_name,
-                get_tid(),
-                tmu,
-                thread_memory_count(tid),
+                std::thread::current().id(),
                 self.c_mem,
             );
             if self.write_buf_added.as_u64() > 0
@@ -189,11 +181,7 @@ impl ThreadStats {
         self.c_mem = ByteSize::b(0);
         self.clear();
 
-        if show_stats {
-            (ratio, 0.0, ByteSize::default(), 0)
-        } else {
-            (ratio, ratio, ByteSize::b(thread_memory_usage(tid) as u64), thread_memory_count(tid))
-        }
+        if show_stats { (ratio, 0.0) } else { (ratio, ratio) }
     }
 
     fn clear(&mut self) {
@@ -204,7 +192,7 @@ impl ThreadStats {
 }
 
 pub(crate) struct Stats {
-    stats: HashMap<usize, Arc<Mutex<ThreadStats>>>,
+    stats: HashMap<std::thread::ThreadId, Arc<Mutex<ThreadStats>>>,
 }
 
 #[cfg(all(target_os = "linux", feature = "c_memory_stats"))]
@@ -241,37 +229,28 @@ impl Stats {
     }
 
     pub(crate) fn add_entry(&mut self, local_stats: &Arc<Mutex<ThreadStats>>) {
-        let tid = get_tid();
+        let tid = std::thread::current().id();
         self.stats.entry(tid).or_insert_with(|| Arc::clone(local_stats));
     }
 
-    fn print_stats(&mut self, sleep_time: Duration) {
+    fn print_stats(&self, sleep_time: Duration) {
         info!(
             "Performance stats {} threads (min ratio = {})",
             self.stats.len(),
             MIN_OCCUPANCY_RATIO_THRESHOLD
         );
-        let mut s: Vec<_> = self.stats.iter().collect();
-        s.sort_by_key(|f| f.0);
+        let s: Vec<_> = self.stats.iter().collect();
 
         let mut ratio = 0.0;
         let mut other_ratio = 0.0;
-        let mut other_memory_size = ByteSize::default();
-        let mut other_memory_count = 0;
         let now = Instant::now();
         for entry in s {
-            let (tmp_ratio, tmp_other_ratio, tmp_other_memory_size, tmp_other_memory_count) =
-                entry.1.lock().unwrap().print_stats_and_clear(*entry.0, sleep_time, now);
+            let (tmp_ratio, tmp_other_ratio) =
+                entry.1.lock().print_stats_and_clear(*entry.0, sleep_time, now);
             ratio += tmp_ratio;
             other_ratio += tmp_other_ratio;
-            other_memory_size += tmp_other_memory_size;
-            other_memory_count += tmp_other_memory_count;
         }
-        info!(
-            "    Other threads ratio {:.3} memory: {}({})",
-            other_ratio, other_memory_size, other_memory_count
-        );
-        info!("    Rust alloc total memory usage: {}", ByteSize::b(total_memory_usage() as u64));
+        info!("    Other threads ratio {:.3}", other_ratio);
         let c_memory_usage = get_c_memory_usage();
         if c_memory_usage > ByteSize::default() {
             info!("    C alloc total memory usage: {}", c_memory_usage);
@@ -298,9 +277,9 @@ pub fn measure_performance_with_debug<F, Message, Result>(
 ) -> Result
 where
     F: FnOnce(Message) -> Result,
-    Message: AsStaticRef<str>,
+    for<'a> &'a Message: Into<&'static str>,
 {
-    let msg_text: &'static str = msg.as_static();
+    let msg_text = (&msg).into();
     measure_performance_internal(class_name, msg, f, Some(msg_text))
 }
 
@@ -315,53 +294,25 @@ where
 {
     let stat = get_thread_stats_logger();
 
-    reset_memory_usage_max();
-    let initial_memory_usage = current_thread_memory_usage();
     let start = Instant::now();
-    stat.lock().unwrap().pre_log(start);
+    stat.lock().pre_log(start);
     let result = f(msg);
 
     let ended = Instant::now();
     let took = ended.saturating_duration_since(start);
 
-    let peak_memory =
-        ByteSize::b(current_thread_peak_memory_usage().saturating_sub(initial_memory_usage) as u64);
-
-    if peak_memory >= ByteSize::b(MEMORY_LIMIT) {
+    if took >= SLOW_CALL_THRESHOLD {
+        let text_field = msg_text.map_or(String::new(), |x| format!(" msg: {x}"));
         warn!(
-            "Function exceeded memory limit {}:{} {:?} took: {}ms peak_memory: {}",
+            "Function exceeded time limit {}:{:?} {:?} took: {}ms {}",
             class_name,
-            get_tid(),
+            std::thread::current().id(),
             std::any::type_name::<Message>(),
             took.as_millis(),
-            peak_memory,
+            text_field,
         );
     }
-
-    if took >= SLOW_CALL_THRESHOLD {
-        let text_field = msg_text.map(|x| format!(" msg: {}", x)).unwrap_or(format!(""));
-        if peak_memory > ByteSize::default() {
-            warn!(
-                "Function exceeded time limit {}:{} {:?} took: {}ms {} peak_memory: {}",
-                class_name,
-                get_tid(),
-                std::any::type_name::<Message>(),
-                took.as_millis(),
-                text_field,
-                peak_memory,
-            );
-        } else {
-            warn!(
-                "Function exceeded time limit {}:{} {:?} took: {}ms {}",
-                class_name,
-                get_tid(),
-                std::any::type_name::<Message>(),
-                took.as_millis(),
-                text_field,
-            );
-        }
-    }
-    stat.lock().unwrap().log(
+    stat.lock().log(
         class_name,
         std::any::type_name::<Message>(),
         0,
@@ -393,18 +344,18 @@ where
 
         let stat = get_thread_stats_logger();
         let start = Instant::now();
-        stat.lock().unwrap().pre_log(start);
+        stat.lock().pre_log(start);
 
         let res = unsafe { Pin::new_unchecked(&mut this.f) }.poll(cx);
         let ended = Instant::now();
         let took = ended.saturating_duration_since(start);
-        stat.lock().unwrap().log(this.class_name, this.file, this.line, took, ended, "");
+        stat.lock().log(this.class_name, this.file, this.line, took, ended, "");
 
         if took > SLOW_CALL_THRESHOLD {
             warn!(
-                "Function exceeded time limit {}:{} {}:{} took: {}ms",
+                "Function exceeded time limit {}:{:?} {}:{} took: {}ms",
                 this.class_name,
-                get_tid(),
+                std::thread::current().id(),
                 this.file,
                 this.line,
                 took.as_millis()
@@ -412,8 +363,7 @@ where
         }
         match res {
             Poll::Ready(x) => {
-                *REF_COUNTER.lock().unwrap().entry((this.file, this.line)).or_insert_with(|| 0) -=
-                    1;
+                *REF_COUNTER.lock().entry((this.file, this.line)).or_insert_with(|| 0) -= 1;
                 Poll::Ready(x)
             }
             Poll::Pending => Poll::Pending,
@@ -422,9 +372,9 @@ where
 }
 
 pub fn print_performance_stats(sleep_time: Duration) {
-    STATS.lock().unwrap().print_stats(sleep_time);
+    STATS.lock().print_stats(sleep_time);
     info!("Futures waiting for completion");
-    for entry in REF_COUNTER.lock().unwrap().iter() {
+    for entry in REF_COUNTER.lock().iter() {
         if *entry.1 > 0 {
             info!("    future {}:{} {}", (entry.0).0, (entry.0).1, entry.1);
         }

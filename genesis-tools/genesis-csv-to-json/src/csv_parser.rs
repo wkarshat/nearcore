@@ -1,21 +1,20 @@
 //! Constructs state of token holders from the csv file.
-use std::fs::File;
-use std::io::Read;
-use std::path::PathBuf;
-
 use chrono::DateTime;
+use chrono::Utc;
 use csv::ReaderBuilder;
-use near_primitives::time::Utc;
-use serde::{Deserialize, Serialize};
-
 use near_crypto::{KeyType, PublicKey};
-use near_network_primitives::types::PeerInfo;
+use near_network::types::PeerInfo;
+use near_primitives::account::AccountContract;
 use near_primitives::account::{AccessKey, AccessKeyPermission, Account, FunctionCallPermission};
-use near_primitives::hash::{hash, CryptoHash};
+use near_primitives::hash::{CryptoHash, hash};
+use near_primitives::receipt::ReceiptV0;
 use near_primitives::receipt::{ActionReceipt, Receipt, ReceiptEnum};
 use near_primitives::state_record::StateRecord;
 use near_primitives::transaction::{Action, FunctionCallAction};
 use near_primitives::types::{AccountId, AccountInfo, Balance, Gas};
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
 
 /// Methods that can be called by a non-privileged access key.
 const REGULAR_METHOD_NAMES: &[&str] = &["stake", "transfer"];
@@ -94,7 +93,7 @@ impl Row {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct Row {
     genesis_time: Option<DateTime<Utc>>,
     account_id: AccountId,
@@ -157,7 +156,7 @@ where
         if let Some(ref validator_key) = row.validator_key {
             initial_validators.push(AccountInfo {
                 account_id: row.account_id.clone(),
-                public_key: validator_key.clone().into(),
+                public_key: validator_key.clone(),
                 amount: row.validator_stake,
             });
         }
@@ -190,11 +189,16 @@ fn account_records(row: &Row, gas_price: Balance) -> Vec<StateRecord> {
 
     let mut res = vec![StateRecord::Account {
         account_id: row.account_id.clone(),
-        account: Account::new(row.amount, row.validator_stake, smart_contract_hash.into(), 0),
+        account: Account::new(
+            row.amount,
+            row.validator_stake,
+            AccountContract::from_local_code_hash(smart_contract_hash),
+            0,
+        ),
     }];
 
     // Add restricted access keys.
-    for (pks, method_names) in vec![
+    for (pks, method_names) in [
         (row.regular_pks.clone(), REGULAR_METHOD_NAMES),
         (row.privileged_pks.clone(), PRIVILEGED_METHOD_NAMES),
         (row.foundation_pks.clone(), FOUNDATION_METHOD_NAMES),
@@ -233,7 +237,7 @@ fn account_records(row: &Row, gas_price: Balance) -> Vec<StateRecord> {
     if let Some(ref smart_contract) = row.smart_contract {
         let args = match smart_contract.as_str() {
             "lockup.wasm" => {
-                let lockup = row.lockup.unwrap().timestamp_nanos();
+                let lockup = row.lockup.unwrap().timestamp_nanos_opt().unwrap();
                 lockup.to_le_bytes().to_vec()
             }
             "lockup_and_vesting.wasm" => {
@@ -241,18 +245,18 @@ fn account_records(row: &Row, gas_price: Balance) -> Vec<StateRecord> {
                 // Encode four dates as timestamps as i64 with LE encoding.
                 for date in &[&row.lockup, &row.vesting_start, &row.vesting_end, &row.vesting_cliff]
                 {
-                    let date = date.unwrap().timestamp_nanos();
+                    let date = date.unwrap().timestamp_nanos_opt().unwrap();
                     res.extend_from_slice(&date.to_le_bytes());
                 }
                 res
             }
             _ => unimplemented!(),
         };
-        let receipt = Receipt {
+        let receipt = Receipt::V0(ReceiptV0 {
             predecessor_id: row.account_id.clone(),
             receiver_id: row.account_id.clone(),
             // `receipt_id` can be anything as long as it is unique.
-            receipt_id: hash(row.account_id.as_ref().as_bytes()),
+            receipt_id: hash(row.account_id.as_bytes()),
             receipt: ReceiptEnum::Action(ActionReceipt {
                 signer_id: row.account_id.clone(),
                 // `signer_public_key` can be anything because the key checks are not applied when
@@ -261,21 +265,23 @@ fn account_records(row: &Row, gas_price: Balance) -> Vec<StateRecord> {
                 gas_price,
                 output_data_receivers: vec![],
                 input_data_ids: vec![],
-                actions: vec![Action::FunctionCall(FunctionCallAction {
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                     method_name: "init".to_string(),
                     args,
                     gas: INIT_GAS,
                     deposit: 0,
-                })],
+                }))],
             }),
-        };
-        res.push(StateRecord::PostponedReceipt(Box::new(receipt.into())));
+        });
+        res.push(StateRecord::PostponedReceipt(Box::new(receipt)));
     }
     res
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use chrono::TimeZone;
     use csv::WriterBuilder;
     use tempfile::NamedTempFile;
@@ -287,6 +293,10 @@ mod tests {
 
     #[test]
     fn test_with_file() {
+        fn timestamp(hour: u32, min: u32, sec: u32) -> Option<DateTime<Utc>> {
+            Some(Utc.with_ymd_and_hms(2019, 12, 21, hour, min, sec).single().unwrap())
+        }
+
         let file = NamedTempFile::new().unwrap();
         let mut writer = WriterBuilder::new().has_headers(true).from_writer(file.reopen().unwrap());
         writer
@@ -301,10 +311,10 @@ mod tests {
                 foundation_pks: vec![PublicKey::empty(KeyType::ED25519)],
                 full_pks: vec![],
                 amount: 1000,
-                lockup: Some(Utc.ymd(2019, 12, 21).and_hms(23, 0, 0)),
-                vesting_start: Some(Utc.ymd(2019, 12, 21).and_hms(22, 0, 0)),
-                vesting_end: Some(Utc.ymd(2019, 12, 21).and_hms(23, 30, 0)),
-                vesting_cliff: Some(Utc.ymd(2019, 12, 21).and_hms(22, 30, 20)),
+                lockup: timestamp(23, 0, 0),
+                vesting_start: timestamp(22, 0, 0),
+                vesting_end: timestamp(23, 30, 0),
+                vesting_cliff: timestamp(22, 30, 20),
                 validator_stake: 100,
                 validator_key: Some(PublicKey::empty(KeyType::ED25519)),
                 peer_info: Some(PeerInfo {
@@ -325,7 +335,7 @@ mod tests {
                 foundation_pks: vec![PublicKey::empty(KeyType::ED25519)],
                 full_pks: vec![],
                 amount: 2000,
-                lockup: Some(Utc.ymd(2019, 12, 21).and_hms(23, 0, 0)),
+                lockup: timestamp(23, 0, 0),
                 vesting_start: None,
                 vesting_end: None,
                 vesting_cliff: None,
@@ -342,9 +352,8 @@ mod tests {
 
     #[test]
     fn test_res_file() {
-        lazy_static_include::lazy_static_include_bytes! {
-            RES => "res/test_accounts.csv"
-        }
-        keys_to_state_records(&RES[..], 1).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("res/test_accounts.csv");
+        let res = std::fs::read(path).unwrap();
+        keys_to_state_records(&res[..], 1).unwrap();
     }
 }

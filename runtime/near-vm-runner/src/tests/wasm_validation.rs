@@ -1,6 +1,10 @@
-use crate::prepare::prepare_contract;
-use crate::vm_kind::VMKind;
-use near_vm_logic::VMConfig;
+use super::test_builder::test_builder;
+#[cfg(feature = "prepare")]
+use super::test_vm_config;
+#[cfg(feature = "prepare")]
+use crate::tests::with_vm_variants;
+use expect_test::expect;
+use near_primitives_core::version::ProtocolFeature;
 
 static SIMD: &str = r#"
 (module
@@ -98,25 +102,55 @@ static EXPECTED_UNSUPPORTED: &[(&str, &str)] = &[
 ];
 
 #[test]
+#[cfg(feature = "prepare")]
 fn ensure_fails_verification() {
-    for (feature_name, wat) in EXPECTED_UNSUPPORTED {
-        let wasm = wat::parse_str(wat).expect("parsing test wat should succeed");
-        let config = VMConfig::test();
-        if let Ok(_) = prepare_contract(&wasm, &config) {
-            panic!("wasm containing use of {} feature did not fail to prepare", feature_name);
-        }
-    }
-}
-
-#[test]
-fn ensure_fails_execution() {
-    crate::tests::with_vm_variants(|vm_kind: VMKind| {
+    let config = test_vm_config();
+    with_vm_variants(&config, |kind| {
         for (feature_name, wat) in EXPECTED_UNSUPPORTED {
             let wasm = wat::parse_str(wat).expect("parsing test wat should succeed");
-            let (_, err) = crate::tests::make_simple_contract_call_vm(&wasm, "entry", vm_kind);
-            if err.is_none() {
+            if let Ok(_) = crate::prepare::prepare_contract(&wasm, &config, kind) {
                 panic!("wasm containing use of {} feature did not fail to prepare", feature_name);
             }
         }
     });
+}
+
+#[test]
+fn ensure_fails_execution() {
+    for (_feature_name, wat) in EXPECTED_UNSUPPORTED {
+        test_builder().wat(wat).opaque_error().opaque_outcome().expect(&expect![[r#"
+            Err: ...
+        "#]]);
+    }
+}
+
+#[test]
+fn extension_saturating_float_to_int() {
+    #[allow(deprecated)]
+    test_builder()
+        .wat(
+            r#"
+            (module
+                (func $test_trunc (param $x f64) (result i32) (i32.trunc_sat_f64_s (local.get $x)))
+            )
+            "#,
+        )
+        .protocol_features(&[
+            ProtocolFeature::SaturatingFloatToInt,
+            ProtocolFeature::FixContractLoadingCost,
+        ])
+        .expects(&[
+            expect![[r#"
+                VMOutcome: balance 4 storage_usage 12 return data None burnt gas 0 used gas 0
+                Err: PrepareError: Error happened while deserializing the module.
+            "#]],
+            expect![[r#"
+                VMOutcome: balance 0 storage_usage 0 return data None burnt gas 0 used gas 0
+                Err: MethodNotFound
+            "#]],
+            expect![[r#"
+                VMOutcome: balance 4 storage_usage 12 return data None burnt gas 100803663 used gas 100803663
+                Err: MethodNotFound
+            "#]],
+        ]);
 }

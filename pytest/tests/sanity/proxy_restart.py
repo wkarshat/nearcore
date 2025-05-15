@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# cspell:words Proxify
 # Start two nodes. Proxify both nodes. Kill one of them, restart it
 # and wait until block at height >= 20.
 import sys, time
@@ -12,12 +13,12 @@ from peer import *
 from proxy import ProxyHandler
 import utils
 
-TIMEOUT = 40
 TARGET_HEIGHT = 20
 
-nodes = start_cluster(2, 0, 1, None, [], {}, ProxyHandler)
+if __name__ == '__main__':
+    nodes = start_cluster(2, 0, 1, None, [], {}, ProxyHandler)
 
-nodes[1].kill()
-nodes[1].start(boot_node=nodes[0])
+    nodes[1].kill()
+    nodes[1].start(boot_node=nodes[0])
 
-utils.wait_for_blocks(nodes[1], target=TARGET_HEIGHT, timeout=TIMEOUT)
+    utils.wait_for_blocks(nodes[1], target=TARGET_HEIGHT)

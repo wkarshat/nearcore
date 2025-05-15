@@ -1,13 +1,17 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
+use crate::doomslug::trackable::TrackableBlockHeightValue;
+use crate::metrics;
+use near_async::time::{Clock, Duration, Instant, Utc};
+use near_client_primitives::debug::{ApprovalAtHeightStatus, ApprovalHistoryEntry};
 use near_crypto::Signature;
 use near_primitives::block::{Approval, ApprovalInner};
 use near_primitives::hash::CryptoHash;
-use near_primitives::time::Clock;
 use near_primitives::types::{AccountId, ApprovalStake, Balance, BlockHeight, BlockHeightDelta};
 use near_primitives::validator_signer::ValidatorSigner;
+use num_rational::Rational32;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use time::ext::InstantExt as _;
+use tracing::{debug, debug_span, field, info};
 
 /// Have that many iterations in the timer instead of `loop` to prevent potential bugs from blocking
 /// the node
@@ -20,11 +24,17 @@ const MAX_TIMER_ITERS: usize = 20;
 /// thus 10_000 heights in practice will mean on the order of one hundred entries.
 const MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS: BlockHeight = 10_000;
 
+// Number of blocks (before head) for which to keep the history of approvals (for debugging).
+const MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS: u64 = 20;
+
+// Maximum amount of historical approvals that we'd keep for debugging purposes.
+const MAX_HISTORY_SIZE: usize = 1000;
+
 /// The threshold for doomslug to create a block.
 /// `TwoThirds` means the block can only be produced if at least 2/3 of the stake is approving it,
 ///             and is what should be used in production (and what guarantees finality)
 /// `NoApprovals` means the block production is not blocked on approvals. This is used
-///             in many tests (e.g. `cross_shard_tx`) to create lots of forkfulness.
+///             in many tests (e.g. `cross_shard_tx`) to create lots of forks.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum DoomslugThresholdMode {
     NoApprovals,
@@ -46,6 +56,7 @@ struct DoomslugTimer {
     min_delay: Duration,
     delay_step: Duration,
     max_delay: Duration,
+    chunk_wait_mult: Rational32,
 }
 
 struct DoomslugTip {
@@ -54,7 +65,8 @@ struct DoomslugTip {
 }
 
 struct DoomslugApprovalsTracker {
-    witness: HashMap<AccountId, Approval>,
+    clock: Clock,
+    witness: HashMap<AccountId, (Approval, Utc)>,
     account_id_to_stakes: HashMap<AccountId, (Balance, Balance)>,
     total_stake_this_epoch: Balance,
     approved_stake_this_epoch: Balance,
@@ -62,6 +74,29 @@ struct DoomslugApprovalsTracker {
     approved_stake_next_epoch: Balance,
     time_passed_threshold: Option<Instant>,
     threshold_mode: DoomslugThresholdMode,
+}
+
+mod trackable {
+    use near_o11y::metrics::IntGauge;
+    use near_primitives::types::BlockHeight;
+
+    pub struct TrackableBlockHeightValue(BlockHeight, &'static std::sync::LazyLock<IntGauge>);
+
+    impl TrackableBlockHeightValue {
+        pub fn new(value: BlockHeight, gauge: &'static std::sync::LazyLock<IntGauge>) -> Self {
+            gauge.set(value as i64);
+            Self(value, gauge)
+        }
+
+        pub fn get(&self) -> BlockHeight {
+            self.0
+        }
+
+        pub fn set(&mut self, new: BlockHeight) {
+            self.0 = new;
+            self.1.set(self.0 as i64);
+        }
+    }
 }
 
 /// Approvals can arrive before the corresponding blocks, and we need a meaningful way to keep as
@@ -79,6 +114,7 @@ struct DoomslugApprovalsTracker {
 /// responsible for ensuring that only approvals for proper account_ids with valid signatures are
 /// provided.
 struct DoomslugApprovalsTrackersAtHeight {
+    clock: Clock,
     approval_trackers: HashMap<ApprovalInner, DoomslugApprovalsTracker>,
     last_approval_per_account: HashMap<AccountId, ApprovalInner>,
 }
@@ -87,23 +123,29 @@ struct DoomslugApprovalsTrackersAtHeight {
 /// happens via `PersistentDoomslug` struct. The split is to simplify testing of the logic separate
 /// from the chain.
 pub struct Doomslug {
+    clock: Clock,
     approval_tracking: HashMap<BlockHeight, DoomslugApprovalsTrackersAtHeight>,
     /// Largest target height for which we issued an approval
-    largest_target_height: BlockHeight,
+    largest_target_height: TrackableBlockHeightValue,
     /// Largest height for which we saw a block containing 1/2 endorsements in it
-    largest_final_height: BlockHeight,
+    largest_final_height: TrackableBlockHeightValue,
     /// Largest height for which we saw threshold approvals (and thus can potentially create a block)
-    largest_threshold_height: BlockHeight,
+    largest_threshold_height: TrackableBlockHeightValue,
+    /// Largest target height of approvals that we've received
+    largest_approval_height: TrackableBlockHeightValue,
     /// Information Doomslug tracks about the chain tip
     tip: DoomslugTip,
     /// Whether an endorsement (or in general an approval) was sent since updating the tip
     endorsement_pending: bool,
     /// Information to track the timer (see `start_timer` routine in the paper)
     timer: DoomslugTimer,
-    signer: Option<Arc<dyn ValidatorSigner>>,
     /// How many approvals to have before producing a block. In production should be always `HalfStake`,
-    ///    but for many tests we use `NoApprovals` to invoke more forkfulness
+    ///    but for many tests we use `NoApprovals` to invoke more forks
     threshold_mode: DoomslugThresholdMode,
+
+    /// Approvals that were created by this doomslug instance (for debugging only).
+    /// Keeps up to MAX_HISTORY_SIZE entries.
+    history: VecDeque<ApprovalHistoryEntry>,
 }
 
 impl DoomslugTimer {
@@ -123,6 +165,7 @@ impl DoomslugTimer {
 
 impl DoomslugApprovalsTracker {
     fn new(
+        clock: Clock,
         account_id_to_stakes: HashMap<AccountId, (Balance, Balance)>,
         threshold_mode: DoomslugThresholdMode,
     ) -> Self {
@@ -130,6 +173,7 @@ impl DoomslugApprovalsTracker {
         let total_stake_next_epoch = account_id_to_stakes.values().map(|(_, x)| x).sum::<Balance>();
 
         DoomslugApprovalsTracker {
+            clock,
             witness: Default::default(),
             account_id_to_stakes,
             total_stake_this_epoch,
@@ -151,15 +195,11 @@ impl DoomslugApprovalsTracker {
     ///
     /// # Returns
     /// Whether the block is ready to be produced
-    fn process_approval(
-        &mut self,
-        now: Instant,
-        approval: &Approval,
-    ) -> DoomslugBlockProductionReadiness {
+    fn process_approval(&mut self, approval: &Approval) -> DoomslugBlockProductionReadiness {
         let mut increment_approved_stake = false;
         self.witness.entry(approval.account_id.clone()).or_insert_with(|| {
             increment_approved_stake = true;
-            approval.clone()
+            (approval.clone(), self.clock.now_utc())
         });
 
         if increment_approved_stake {
@@ -170,7 +210,7 @@ impl DoomslugApprovalsTracker {
 
         // We call to `get_block_production_readiness` here so that if the number of approvals crossed
         // the threshold, the timer for block production starts.
-        self.get_block_production_readiness(now)
+        self.get_block_production_readiness()
     }
 
     /// Withdraws an approval. This happens if a newer approval for the same `target_height` comes
@@ -179,7 +219,7 @@ impl DoomslugApprovalsTracker {
     fn withdraw_approval(&mut self, account_id: &AccountId) {
         let approval = match self.witness.remove(account_id) {
             None => return,
-            Some(approval) => approval,
+            Some(approval) => approval.0,
         };
 
         let stakes = self.account_id_to_stakes.get(&approval.account_id).map_or((0, 0), |x| *x);
@@ -196,25 +236,33 @@ impl DoomslugApprovalsTracker {
     /// `NotReady` if the block doesn't have enough approvals yet to cross the threshold
     /// `ReadySince` if the block has enough approvals to pass the threshold, and since when it
     ///     does
-    fn get_block_production_readiness(&mut self, now: Instant) -> DoomslugBlockProductionReadiness {
+    fn get_block_production_readiness(&mut self) -> DoomslugBlockProductionReadiness {
         if (self.approved_stake_this_epoch > self.total_stake_this_epoch * 2 / 3
             && (self.approved_stake_next_epoch > self.total_stake_next_epoch * 2 / 3
                 || self.total_stake_next_epoch == 0))
             || self.threshold_mode == DoomslugThresholdMode::NoApprovals
         {
             if self.time_passed_threshold == None {
-                self.time_passed_threshold = Some(now);
+                self.time_passed_threshold = Some(self.clock.now());
             }
             DoomslugBlockProductionReadiness::ReadySince(self.time_passed_threshold.unwrap())
         } else {
             DoomslugBlockProductionReadiness::NotReady
         }
     }
+
+    // Get witnesses together with their arrival time.
+    fn get_witnesses(&self) -> Vec<(AccountId, Utc)> {
+        self.witness
+            .iter()
+            .map(|(key, (_, arrival_time))| (key.clone(), *arrival_time))
+            .collect::<Vec<_>>()
+    }
 }
 
 impl DoomslugApprovalsTrackersAtHeight {
-    fn new() -> Self {
-        Self { approval_trackers: HashMap::new(), last_approval_per_account: HashMap::new() }
+    fn new(clock: Clock) -> Self {
+        Self { clock, approval_trackers: HashMap::new(), last_approval_per_account: HashMap::new() }
     }
 
     /// This method is a wrapper around `DoomslugApprovalsTracker::process_approval`, see comment
@@ -224,7 +272,6 @@ impl DoomslugApprovalsTrackersAtHeight {
     /// corresponding tracker, and associate the new approval with the account.
     ///
     /// # Arguments
-    /// * `now`      - the current timestamp
     /// * `approval` - the approval to be processed
     /// * `stakes`   - all the stakes of all the block producers in the current epoch
     /// * `threshold_mode` - how many approvals are needed to produce a block. Is used to compute
@@ -234,9 +281,8 @@ impl DoomslugApprovalsTrackersAtHeight {
     /// Same as `DoomslugApprovalsTracker::process_approval`
     fn process_approval(
         &mut self,
-        now: Instant,
         approval: &Approval,
-        stakes: &Vec<(ApprovalStake, bool)>,
+        stakes: &[ApprovalStake],
         threshold_mode: DoomslugThresholdMode,
     ) -> DoomslugBlockProductionReadiness {
         if let Some(last_parent) = self.last_approval_per_account.get(&approval.account_id) {
@@ -256,13 +302,7 @@ impl DoomslugApprovalsTrackersAtHeight {
 
         let account_id_to_stakes = stakes
             .iter()
-            .filter_map(|(x, is_slashed)| {
-                if *is_slashed {
-                    None
-                } else {
-                    Some((x.account_id.clone(), (x.stake_this_epoch, x.stake_next_epoch)))
-                }
-            })
+            .map(|x| (x.account_id.clone(), (x.stake_this_epoch, x.stake_next_epoch)))
             .collect::<HashMap<_, _>>();
 
         assert_eq!(account_id_to_stakes.len(), stakes.len());
@@ -274,39 +314,81 @@ impl DoomslugApprovalsTrackersAtHeight {
         self.last_approval_per_account.insert(approval.account_id.clone(), approval.inner.clone());
         self.approval_trackers
             .entry(approval.inner.clone())
-            .or_insert_with(|| DoomslugApprovalsTracker::new(account_id_to_stakes, threshold_mode))
-            .process_approval(now, approval)
+            .or_insert_with(|| {
+                DoomslugApprovalsTracker::new(
+                    self.clock.clone(),
+                    account_id_to_stakes,
+                    threshold_mode,
+                )
+            })
+            .process_approval(approval)
+    }
+
+    /// Returns the current approvals status for the trackers at this height.
+    /// Status contains information about which account voted (and for what) and whether the doomslug voting threshold was reached.
+    pub fn status(&self) -> ApprovalAtHeightStatus {
+        let approvals = self
+            .approval_trackers
+            .iter()
+            .flat_map(|(approval, tracker)| {
+                let witnesses = tracker.get_witnesses();
+                witnesses.into_iter().map(|(account_name, approval_time)| {
+                    (account_name, (approval.clone(), approval_time))
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let threshold_approval = self
+            .approval_trackers
+            .iter()
+            .filter_map(|(_, tracker)| tracker.time_passed_threshold)
+            .min()
+            .map(|ts| self.clock.now_utc() - (self.clock.now() - ts));
+        ApprovalAtHeightStatus { approvals, ready_at: threshold_approval }
     }
 }
 
 impl Doomslug {
     pub fn new(
+        clock: Clock,
         largest_target_height: BlockHeight,
         endorsement_delay: Duration,
         min_delay: Duration,
         delay_step: Duration,
         max_delay: Duration,
-        signer: Option<Arc<dyn ValidatorSigner>>,
+        chunk_wait_mult: Rational32,
         threshold_mode: DoomslugThresholdMode,
     ) -> Self {
         Doomslug {
+            clock: clock.clone(),
             approval_tracking: HashMap::new(),
-            largest_target_height,
-            largest_final_height: 0,
-            largest_threshold_height: 0,
+            largest_target_height: TrackableBlockHeightValue::new(
+                largest_target_height,
+                &metrics::LARGEST_TARGET_HEIGHT,
+            ),
+            largest_approval_height: TrackableBlockHeightValue::new(
+                0,
+                &metrics::LARGEST_APPROVAL_HEIGHT,
+            ),
+            largest_final_height: TrackableBlockHeightValue::new(0, &metrics::LARGEST_FINAL_HEIGHT),
+            largest_threshold_height: TrackableBlockHeightValue::new(
+                0,
+                &metrics::LARGEST_THRESHOLD_HEIGHT,
+            ),
             tip: DoomslugTip { block_hash: CryptoHash::default(), height: 0 },
             endorsement_pending: false,
             timer: DoomslugTimer {
-                started: Clock::instant(),
-                last_endorsement_sent: Clock::instant(),
+                started: clock.now(),
+                last_endorsement_sent: clock.now(),
                 height: 0,
                 endorsement_delay,
                 min_delay,
                 delay_step,
                 max_delay,
+                chunk_wait_mult,
             },
-            signer,
             threshold_mode,
+            history: VecDeque::new(),
         }
     }
 
@@ -321,18 +403,23 @@ impl Doomslug {
     }
 
     /// Returns the largest height for which we have enough approvals to be theoretically able to
-    ///     produce a block (in practice a blocks might not be produceable yet if not enough time
+    ///     produce a block (in practice a blocks might not be producible yet if not enough time
     ///     passed since it accumulated enough approvals)
     pub fn get_largest_height_crossing_threshold(&self) -> BlockHeight {
-        self.largest_threshold_height
+        self.largest_threshold_height.get()
+    }
+
+    /// Returns the largest height for which we've received an approval
+    pub fn get_largest_approval_height(&self) -> BlockHeight {
+        self.largest_approval_height.get()
     }
 
     pub fn get_largest_final_height(&self) -> BlockHeight {
-        self.largest_final_height
+        self.largest_final_height.get()
     }
 
     pub fn get_largest_target_height(&self) -> BlockHeight {
-        self.largest_target_height
+        self.largest_target_height.get()
     }
 
     pub fn get_timer_height(&self) -> BlockHeight {
@@ -341,6 +428,19 @@ impl Doomslug {
 
     pub fn get_timer_start(&self) -> Instant {
         self.timer.started
+    }
+
+    /// Returns currently available approval history.
+    pub fn get_approval_history(&self) -> Vec<ApprovalHistoryEntry> {
+        self.history.iter().cloned().collect::<Vec<_>>()
+    }
+
+    /// Adds new approval to the history.
+    fn update_history(&mut self, entry: ApprovalHistoryEntry) {
+        while self.history.len() >= MAX_HISTORY_SIZE {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
     }
 
     /// Is expected to be called periodically and processed the timer (`start_timer` in the paper)
@@ -359,11 +459,13 @@ impl Doomslug {
     /// A vector of approvals that need to be sent to other block producers as a result of processing
     /// the timers
     #[must_use]
-    pub fn process_timer(&mut self, cur_time: Instant) -> Vec<Approval> {
+    pub fn process_timer(&mut self, signer: &Option<Arc<ValidatorSigner>>) -> Vec<Approval> {
+        let now = self.clock.now();
         let mut ret = vec![];
         for _ in 0..MAX_TIMER_ITERS {
-            let skip_delay =
-                self.timer.get_delay(self.timer.height.saturating_sub(self.largest_final_height));
+            let skip_delay = self
+                .timer
+                .get_delay(self.timer.height.saturating_sub(self.largest_final_height.get()));
 
             // The `endorsement_delay` is time to send approval to the block producer at `timer.height`,
             // while the `skip_delay` is the time before sending the approval to BP of `timer_height + 1`,
@@ -373,29 +475,54 @@ impl Doomslug {
             let tip_height = self.tip.height;
 
             if self.endorsement_pending
-                && cur_time >= self.timer.last_endorsement_sent + self.timer.endorsement_delay
+                && now >= self.timer.last_endorsement_sent + self.timer.endorsement_delay
             {
-                if tip_height >= self.largest_target_height {
-                    self.largest_target_height = tip_height + 1;
+                if tip_height >= self.largest_target_height.get() {
+                    self.largest_target_height.set(tip_height + 1);
 
-                    if let Some(approval) = self.create_approval(tip_height + 1) {
+                    if let Some(approval) = self.create_approval(tip_height + 1, signer) {
                         ret.push(approval);
                     }
+                    self.update_history(ApprovalHistoryEntry {
+                        parent_height: tip_height,
+                        target_height: tip_height + 1,
+                        timer_started_ago_millis: (self
+                            .clock
+                            .now()
+                            .signed_duration_since(self.timer.last_endorsement_sent))
+                        .whole_milliseconds()
+                        .max(0) as u64,
+                        expected_delay_millis: self.timer.endorsement_delay.whole_milliseconds()
+                            as u64,
+                        approval_creation_time: self.clock.now_utc(),
+                    });
                 }
 
-                self.timer.last_endorsement_sent = cur_time;
+                self.timer.last_endorsement_sent = now;
                 self.endorsement_pending = false;
             }
 
-            if cur_time >= self.timer.started + skip_delay {
+            if now >= self.timer.started + skip_delay {
                 debug_assert!(!self.endorsement_pending);
 
-                self.largest_target_height =
-                    std::cmp::max(self.timer.height + 1, self.largest_target_height);
+                self.largest_target_height
+                    .set(std::cmp::max(self.timer.height + 1, self.largest_target_height.get()));
 
-                if let Some(approval) = self.create_approval(self.timer.height + 1) {
+                if let Some(approval) = self.create_approval(self.timer.height + 1, signer) {
                     ret.push(approval);
                 }
+                self.update_history(ApprovalHistoryEntry {
+                    parent_height: tip_height,
+                    target_height: self.timer.height + 1,
+                    timer_started_ago_millis: (self
+                        .clock
+                        .now()
+                        .signed_duration_since(self.timer.started))
+                    .whole_milliseconds()
+                    .max(0) as u64,
+                    expected_delay_millis: skip_delay.whole_milliseconds() as u64,
+                    approval_creation_time: self.clock.now_utc(),
+                });
 
                 // Restart the timer
                 self.timer.started += skip_delay;
@@ -408,9 +535,13 @@ impl Doomslug {
         ret
     }
 
-    pub fn create_approval(&self, target_height: BlockHeight) -> Option<Approval> {
-        self.signer.as_ref().map(|signer| {
-            Approval::new(self.tip.block_hash, self.tip.height, target_height, &**signer)
+    fn create_approval(
+        &self,
+        target_height: BlockHeight,
+        signer: &Option<Arc<ValidatorSigner>>,
+    ) -> Option<Approval> {
+        signer.as_ref().map(|signer| {
+            Approval::new(self.tip.block_hash, self.tip.height, target_height, &*signer)
         })
     }
 
@@ -425,47 +556,45 @@ impl Doomslug {
     /// * `stakes`    - the vector of validator stakes in the current epoch
     pub fn can_approved_block_be_produced(
         mode: DoomslugThresholdMode,
-        approvals: &[Option<Signature>],
-        stakes: &Vec<(Balance, Balance, bool)>,
+        approvals: &[Option<Box<Signature>>],
+        stakes: &[(Balance, Balance)],
     ) -> bool {
         if mode == DoomslugThresholdMode::NoApprovals {
             return true;
         }
 
-        let threshold1 = stakes.iter().map(|(x, _, _)| x).sum::<Balance>() * 2 / 3;
-        let threshold2 = stakes.iter().map(|(_, x, _)| x).sum::<Balance>() * 2 / 3;
+        let threshold1 = stakes.iter().map(|(x, _)| x).sum::<Balance>() * 2 / 3;
+        let threshold2 = stakes.iter().map(|(_, x)| x).sum::<Balance>() * 2 / 3;
 
         let approved_stake1 = approvals
             .iter()
             .zip(stakes.iter())
-            .filter(|(_, (_, _, is_slashed))| !*is_slashed)
-            .map(|(approval, (stake, _, _))| if approval.is_some() { *stake } else { 0 })
+            .map(|(approval, (stake, _))| if approval.is_some() { *stake } else { 0 })
             .sum::<Balance>();
 
         let approved_stake2 = approvals
             .iter()
             .zip(stakes.iter())
-            .filter(|(_, (_, _, is_slashed))| !*is_slashed)
-            .map(|(approval, (_, stake, _))| if approval.is_some() { *stake } else { 0 })
+            .map(|(approval, (_, stake))| if approval.is_some() { *stake } else { 0 })
             .sum::<Balance>();
 
         (approved_stake1 > threshold1 || threshold1 == 0)
             && (approved_stake2 > threshold2 || threshold2 == 0)
     }
 
-    pub fn remove_witness(
-        &mut self,
+    pub fn get_witness(
+        &self,
         prev_hash: &CryptoHash,
         parent_height: BlockHeight,
         target_height: BlockHeight,
-    ) -> HashMap<AccountId, Approval> {
+    ) -> HashMap<AccountId, (Approval, Utc)> {
         let hash_or_height = ApprovalInner::new(prev_hash, parent_height, target_height);
-        if let Some(approval_trackers_at_height) = self.approval_tracking.get_mut(&target_height) {
+        if let Some(approval_trackers_at_height) = self.approval_tracking.get(&target_height) {
             let approvals_tracker =
-                approval_trackers_at_height.approval_trackers.remove(&hash_or_height);
+                approval_trackers_at_height.approval_trackers.get(&hash_or_height);
             match approvals_tracker {
                 None => HashMap::new(),
-                Some(approvals_tracker) => approvals_tracker.witness,
+                Some(approvals_tracker) => approvals_tracker.witness.clone(),
             }
         } else {
             HashMap::new()
@@ -475,13 +604,11 @@ impl Doomslug {
     /// Updates the current tip of the chain. Restarts the timer accordingly.
     ///
     /// # Arguments
-    /// * `now`            - current time. Doesn't call to `Utc::now()` directly to simplify testing
     /// * `block_hash`     - the hash of the new tip
     /// * `height`         - the height of the tip
     /// * `last_ds_final_height` - last height at which a block in this chain has doomslug finality
     pub fn set_tip(
         &mut self,
-        now: Instant,
         block_hash: CryptoHash,
         height: BlockHeight,
         last_final_height: BlockHeight,
@@ -489,12 +616,14 @@ impl Doomslug {
         debug_assert!(height > self.tip.height || self.tip.height == 0);
         self.tip = DoomslugTip { block_hash, height };
 
-        self.largest_final_height = last_final_height;
+        self.largest_final_height.set(last_final_height);
         self.timer.height = height + 1;
-        self.timer.started = now;
+        self.timer.started = self.clock.now();
 
-        self.approval_tracking
-            .retain(|h, _| *h > height && *h <= height + MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS);
+        self.approval_tracking.retain(|h, _| {
+            *h > height.saturating_sub(MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS)
+                && *h <= height + MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS
+        });
 
         self.endorsement_pending = true;
     }
@@ -505,20 +634,23 @@ impl Doomslug {
     #[must_use]
     fn on_approval_message_internal(
         &mut self,
-        now: Instant,
         approval: &Approval,
-        stakes: &Vec<(ApprovalStake, bool)>,
+        stakes: &[ApprovalStake],
     ) -> DoomslugBlockProductionReadiness {
         let threshold_mode = self.threshold_mode;
         let ret = self
             .approval_tracking
             .entry(approval.target_height)
-            .or_insert_with(|| DoomslugApprovalsTrackersAtHeight::new())
-            .process_approval(now, approval, stakes, threshold_mode);
+            .or_insert_with(|| DoomslugApprovalsTrackersAtHeight::new(self.clock.clone()))
+            .process_approval(approval, stakes, threshold_mode);
+
+        if approval.target_height > self.largest_approval_height.get() {
+            self.largest_approval_height.set(approval.target_height);
+        }
 
         if ret != DoomslugBlockProductionReadiness::NotReady {
-            if approval.target_height > self.largest_threshold_height {
-                self.largest_threshold_height = approval.target_height;
+            if approval.target_height > self.largest_threshold_height.get() {
+                self.largest_threshold_height.set(approval.target_height);
             }
         }
 
@@ -526,19 +658,21 @@ impl Doomslug {
     }
 
     /// Processes single approval
-    pub fn on_approval_message(
-        &mut self,
-        now: Instant,
-        approval: &Approval,
-        stakes: &Vec<(ApprovalStake, bool)>,
-    ) {
+    pub fn on_approval_message(&mut self, approval: &Approval, stakes: &[ApprovalStake]) {
         if approval.target_height < self.tip.height
             || approval.target_height > self.tip.height + MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS
         {
             return;
         }
 
-        let _ = self.on_approval_message_internal(now, approval, stakes);
+        let _ = self.on_approval_message_internal(approval, stakes);
+    }
+
+    /// Gets the current status of approvals for a given height.
+    /// It will only work for heights that we have in memory, that is that are not older than MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS
+    /// blocks from the head.
+    pub fn approval_status_at_height(&self, height: &BlockHeight) -> ApprovalAtHeightStatus {
+        self.approval_tracking.get(height).map(|it| it.status()).unwrap_or_default()
     }
 
     /// Returns whether we can produce a block for this height. The check for whether `me` is the
@@ -559,123 +693,159 @@ impl Doomslug {
     #[must_use]
     pub fn ready_to_produce_block(
         &mut self,
-        now: Instant,
         target_height: BlockHeight,
         has_enough_chunks: bool,
+        log_block_production_info: bool,
     ) -> bool {
+        let span = debug_span!(
+            target: "doomslug",
+            "ready_to_produce_block",
+            has_enough_chunks,
+            target_height,
+            enough_approvals_for = field::Empty,
+            ready_to_produce_block = field::Empty,
+            need_to_wait = field::Empty)
+        .entered();
+        let now = self.clock.now();
         let hash_or_height =
             ApprovalInner::new(&self.tip.block_hash, self.tip.height, target_height);
-        if let Some(approval_trackers_at_height) = self.approval_tracking.get_mut(&target_height) {
-            if let Some(approval_tracker) =
-                approval_trackers_at_height.approval_trackers.get_mut(&hash_or_height)
-            {
-                let block_production_readiness =
-                    approval_tracker.get_block_production_readiness(now);
-                match block_production_readiness {
-                    DoomslugBlockProductionReadiness::NotReady => false,
-                    DoomslugBlockProductionReadiness::ReadySince(when) => {
-                        if has_enough_chunks {
-                            true
-                        } else {
-                            let delay = self.timer.get_delay(
-                                self.timer.height.saturating_sub(self.largest_final_height),
-                            ) / 6;
+        let Some(approval_trackers_at_height) = self.approval_tracking.get_mut(&target_height)
+        else {
+            debug!(target: "doomslug", target_height, "No approval trackers at height");
+            return false;
+        };
+        let Some(approval_tracker) =
+            approval_trackers_at_height.approval_trackers.get_mut(&hash_or_height)
+        else {
+            debug!(target: "doomslug", target_height, ?hash_or_height, "No approval tracker");
+            return false;
+        };
 
-                            now > when + delay
-                        }
-                    }
-                }
-            } else {
-                false
+        let when = match approval_tracker.get_block_production_readiness() {
+            DoomslugBlockProductionReadiness::NotReady => {
+                debug!(target: "doomslug", target_height, ?hash_or_height, "Not ready to produce block");
+                return false;
             }
-        } else {
-            false
+            DoomslugBlockProductionReadiness::ReadySince(when) => when,
+        };
+
+        let enough_approvals_for = now - when;
+        span.record("enough_approvals_for", enough_approvals_for.as_secs_f64());
+        span.record("ready_to_produce_block", true);
+        if has_enough_chunks {
+            if log_block_production_info {
+                info!(
+                    target: "doomslug", target_height, ?enough_approvals_for,
+                    "ready to produce block, has enough approvals, has enough chunks"
+                );
+            }
+            return true;
         }
+
+        let delay =
+            self.timer.get_delay(self.timer.height.saturating_sub(self.largest_final_height.get()))
+                * *self.timer.chunk_wait_mult.numer()
+                / *self.timer.chunk_wait_mult.denom();
+
+        let ready = now > when + delay;
+        span.record("need_to_wait", !ready);
+        if log_block_production_info {
+            if ready {
+                info!(
+                    target: "doomslug", target_height, ?enough_approvals_for,
+                    "ready to produce block, but does not have enough chunks"
+                );
+            } else {
+                info!(
+                    target: "doomslug", target_height, need_to_wait_for = ?(when + delay - now),
+                    ?enough_approvals_for, "not ready to produce block, need to wait"
+                );
+            }
+        }
+        ready
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use near_crypto::{KeyType, SecretKey};
-    use near_primitives::block::{Approval, ApprovalInner};
-    use near_primitives::hash::hash;
-    use near_primitives::time::Clock;
-    use near_primitives::types::ApprovalStake;
-    use near_primitives::validator_signer::InMemoryValidatorSigner;
-
+    use crate::Doomslug;
     use crate::doomslug::{
         DoomslugApprovalsTrackersAtHeight, DoomslugBlockProductionReadiness, DoomslugThresholdMode,
     };
-    use crate::Doomslug;
+    use near_async::time::{Duration, FakeClock, Utc};
+    use near_crypto::{KeyType, SecretKey};
+    use near_primitives::block::{Approval, ApprovalInner};
+    use near_primitives::hash::hash;
+    use near_primitives::test_utils::create_test_signer;
+    use near_primitives::types::ApprovalStake;
+    use num_rational::Rational32;
+    use std::sync::Arc;
 
     #[test]
     fn test_endorsements_and_skips_basic() {
+        let clock = FakeClock::new(Utc::UNIX_EPOCH);
+        let signer = Some(Arc::new(create_test_signer("test").into()));
         let mut ds = Doomslug::new(
+            clock.clock(),
             0,
-            Duration::from_millis(400),
-            Duration::from_millis(1000),
-            Duration::from_millis(100),
-            Duration::from_millis(3000),
-            Some(Arc::new(InMemoryValidatorSigner::from_seed(
-                "test".parse().unwrap(),
-                KeyType::ED25519,
-                "test",
-            ))),
+            Duration::milliseconds(400),
+            Duration::milliseconds(1000),
+            Duration::milliseconds(100),
+            Duration::milliseconds(3000),
+            Rational32::new(1, 3),
             DoomslugThresholdMode::TwoThirds,
         );
 
-        let mut now = Clock::instant(); // For the test purposes the absolute value of the initial instant doesn't matter
-
         // Set a new tip, must produce an endorsement
-        ds.set_tip(now, hash(&[1]), 1, 1);
-        assert_eq!(ds.process_timer(now + Duration::from_millis(399)).len(), 0);
-        let approval =
-            ds.process_timer(now + Duration::from_millis(400)).into_iter().nth(0).unwrap();
+        ds.set_tip(hash(&[1]), 1, 1);
+        clock.advance(Duration::milliseconds(399));
+        assert_eq!(ds.process_timer(&signer).len(), 0);
+        clock.advance(Duration::milliseconds(1));
+        let approval = ds.process_timer(&signer).into_iter().nth(0).unwrap();
         assert_eq!(approval.inner, ApprovalInner::Endorsement(hash(&[1])));
         assert_eq!(approval.target_height, 2);
 
         // Same tip => no approval
-        assert_eq!(ds.process_timer(now + Duration::from_millis(400)), vec![]);
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
         // The block was `ds_final` and therefore started the timer. Try checking before one second expires
-        assert_eq!(ds.process_timer(now + Duration::from_millis(999)), vec![]);
+        clock.advance(Duration::milliseconds(599));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
         // But one second should trigger the skip
-        match ds.process_timer(now + Duration::from_millis(1000)) {
-            approvals if approvals.len() == 0 => assert!(false),
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
             approvals => {
                 assert_eq!(approvals[0].inner, ApprovalInner::Skip(1));
                 assert_eq!(approvals[0].target_height, 3);
             }
         }
 
-        // Shift now 1 second forward
-        now += Duration::from_millis(1000);
+        // Not processing a block at height 2 should not produce an approval
+        ds.set_tip(hash(&[2]), 2, 0);
+        clock.advance(Duration::milliseconds(400));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
-        // Not processing a block at height 2 should not produce an appoval
-        ds.set_tip(now, hash(&[2]), 2, 0);
-        assert_eq!(ds.process_timer(now + Duration::from_millis(400)), vec![]);
-
-        // Shift now 1 second forward
-        now += Duration::from_millis(1000);
+        // Go forward more so we have 1 second
+        clock.advance(Duration::milliseconds(600));
 
         // But at height 3 should (also neither block has finality set, keep last final at 0 for now)
-        ds.set_tip(now, hash(&[3]), 3, 0);
-        let approval =
-            ds.process_timer(now + Duration::from_millis(400)).into_iter().nth(0).unwrap();
+        ds.set_tip(hash(&[3]), 3, 0);
+        clock.advance(Duration::milliseconds(400));
+        let approval = ds.process_timer(&signer).into_iter().nth(0).unwrap();
         assert_eq!(approval.inner, ApprovalInner::Endorsement(hash(&[3])));
         assert_eq!(approval.target_height, 4);
 
-        // Move 1 second further
-        now += Duration::from_millis(1000);
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(600));
 
-        assert_eq!(ds.process_timer(now + Duration::from_millis(199)), vec![]);
+        clock.advance(Duration::milliseconds(199));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
-        match ds.process_timer(now + Duration::from_millis(200)) {
-            approvals if approvals.len() == 0 => assert!(false),
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
             approvals if approvals.len() == 1 => {
                 assert_eq!(approvals[0].inner, ApprovalInner::Skip(3));
                 assert_eq!(approvals[0].target_height, 5);
@@ -683,59 +853,67 @@ mod tests {
             _ => assert!(false),
         }
 
-        // Move 1 second further
-        now += Duration::from_millis(1000);
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(800));
 
         // Now skip 5 (the extra delay is 200+300 = 500)
-        assert_eq!(ds.process_timer(now + Duration::from_millis(499)), vec![]);
+        clock.advance(Duration::milliseconds(499));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
-        match ds.process_timer(now + Duration::from_millis(500)) {
-            approvals if approvals.len() == 0 => assert!(false),
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
             approvals => {
                 assert_eq!(approvals[0].inner, ApprovalInner::Skip(3));
                 assert_eq!(approvals[0].target_height, 6);
             }
         }
 
-        // Move 1 second further
-        now += Duration::from_millis(1000);
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(500));
 
         // Skip 6 (the extra delay is 0+200+300+400 = 900)
-        assert_eq!(ds.process_timer(now + Duration::from_millis(899)), vec![]);
+        clock.advance(Duration::milliseconds(899));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
-        match ds.process_timer(now + Duration::from_millis(900)) {
-            approvals if approvals.len() == 0 => assert!(false),
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
             approvals => {
                 assert_eq!(approvals[0].inner, ApprovalInner::Skip(3));
                 assert_eq!(approvals[0].target_height, 7);
             }
         }
 
-        // Move 1 second further
-        now += Duration::from_millis(1000);
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(100));
 
         // Accept block at 5 with finality on the prev block, expect it to not produce an approval
-        ds.set_tip(now, hash(&[5]), 5, 4);
-        assert_eq!(ds.process_timer(now + Duration::from_millis(400)), vec![]);
+        ds.set_tip(hash(&[5]), 5, 4);
+        clock.advance(Duration::milliseconds(400));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
         // Skip a whole bunch of heights by moving 100 seconds ahead
-        now += Duration::from_millis(100_000);
-        assert!(ds.process_timer(now).len() > 10);
+        clock.advance(Duration::seconds(100));
+        assert!(ds.process_timer(&signer).len() > 10);
 
         // Add some random small number of milliseconds to test that when the next block is added, the
         // timer is reset
-        now += Duration::from_millis(17);
+        clock.advance(Duration::milliseconds(17));
 
         // No approval, since we skipped 6
-        ds.set_tip(now, hash(&[6]), 6, 4);
-        assert_eq!(ds.process_timer(now + Duration::from_millis(400)), vec![]);
+        ds.set_tip(hash(&[6]), 6, 4);
+        clock.advance(Duration::milliseconds(400));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
         // The block height was less than the timer height, and thus the timer was reset.
         // The wait time for height 7 with last ds final block at 5 is 1100
-        assert_eq!(ds.process_timer(now + Duration::from_millis(1099)), vec![]);
+        clock.advance(Duration::milliseconds(699));
+        assert_eq!(ds.process_timer(&signer), vec![]);
 
-        match ds.process_timer(now + Duration::from_millis(1100)) {
-            approvals if approvals.len() == 0 => assert!(false),
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
             approvals => {
                 assert_eq!(approvals[0].inner, ApprovalInner::Skip(6));
                 assert_eq!(approvals[0].target_height, 8);
@@ -755,35 +933,23 @@ mod tests {
                 stake_next_epoch: *stake_next_epoch,
                 public_key: SecretKey::from_seed(KeyType::ED25519, account_id).public_key(),
             })
-            .map(|stake| (stake, false))
             .collect::<Vec<_>>();
         let signers = accounts
             .iter()
-            .map(|(account_id, _, _)| {
-                InMemoryValidatorSigner::from_seed(
-                    account_id.parse().unwrap(),
-                    KeyType::ED25519,
-                    account_id,
-                )
-            })
+            .map(|(account_id, _, _)| create_test_signer(account_id))
             .collect::<Vec<_>>();
 
-        let signer = Arc::new(InMemoryValidatorSigner::from_seed(
-            "test".parse().unwrap(),
-            KeyType::ED25519,
-            "test",
-        ));
+        let clock = FakeClock::new(Utc::UNIX_EPOCH);
         let mut ds = Doomslug::new(
+            clock.clock(),
             0,
-            Duration::from_millis(400),
-            Duration::from_millis(1000),
-            Duration::from_millis(100),
-            Duration::from_millis(3000),
-            Some(signer),
+            Duration::milliseconds(400),
+            Duration::milliseconds(1000),
+            Duration::milliseconds(100),
+            Duration::milliseconds(3000),
+            Rational32::new(1, 3),
             DoomslugThresholdMode::TwoThirds,
         );
-
-        let mut now = Clock::instant();
 
         // In the comments below the format is
         // account, height -> approved stake
@@ -792,7 +958,6 @@ mod tests {
         // "test1", 2 -> 2
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 2, &signers[0]),
                 &stakes,
             ),
@@ -802,7 +967,6 @@ mod tests {
         // "test3", 4 -> 3
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 4, &signers[2]),
                 &stakes,
             ),
@@ -812,17 +976,17 @@ mod tests {
         // "test4", 4 -> 4
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 4, &signers[3]),
                 &stakes,
             ),
             DoomslugBlockProductionReadiness::NotReady,
         );
 
+        clock.advance(Duration::milliseconds(100));
+
         // "test1", 4 -> same account, still 5
         assert_eq!(
             ds.on_approval_message_internal(
-                now + Duration::from_millis(100),
                 &Approval::new(hash(&[1]), 1, 4, &signers[3]),
                 &stakes,
             ),
@@ -832,49 +996,44 @@ mod tests {
         // "test2", 4 -> 5
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 4, &signers[1]),
                 &stakes,
             ),
-            DoomslugBlockProductionReadiness::ReadySince(now),
+            DoomslugBlockProductionReadiness::ReadySince(clock.now()),
         );
 
         // "test1", 4 -> 7
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 4, &signers[0]),
                 &stakes,
             ),
-            DoomslugBlockProductionReadiness::ReadySince(now),
+            DoomslugBlockProductionReadiness::ReadySince(clock.now()),
         );
 
         // "test4", 2 -> 3
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 2, &signers[3]),
                 &stakes,
             ),
             DoomslugBlockProductionReadiness::NotReady,
         );
 
-        now += Duration::from_millis(200);
+        clock.advance(Duration::milliseconds(200));
 
         // "test3", 2 -> 6
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[1]), 1, 2, &signers[2]),
                 &stakes,
             ),
-            DoomslugBlockProductionReadiness::ReadySince(now),
+            DoomslugBlockProductionReadiness::ReadySince(clock.now()),
         );
 
         // A different parent hash
         assert_eq!(
             ds.on_approval_message_internal(
-                now,
                 &Approval::new(hash(&[2]), 2, 4, &signers[1]),
                 &stakes,
             ),
@@ -887,13 +1046,7 @@ mod tests {
         let accounts = vec![("test1", 2, 0), ("test2", 1, 2), ("test3", 3, 3), ("test4", 2, 2)];
         let signers = accounts
             .iter()
-            .map(|(account_id, _, _)| {
-                InMemoryValidatorSigner::from_seed(
-                    account_id.parse().unwrap(),
-                    KeyType::ED25519,
-                    account_id,
-                )
-            })
+            .map(|(account_id, _, _)| create_test_signer(account_id))
             .collect::<Vec<_>>();
         let stakes = accounts
             .into_iter()
@@ -903,9 +1056,9 @@ mod tests {
                 stake_next_epoch,
                 public_key: SecretKey::from_seed(KeyType::ED25519, account_id).public_key(),
             })
-            .map(|stake| (stake, false))
             .collect::<Vec<_>>();
-        let mut tracker = DoomslugApprovalsTrackersAtHeight::new();
+        let clock = FakeClock::new(Utc::UNIX_EPOCH);
+        let mut tracker = DoomslugApprovalsTrackersAtHeight::new(clock.clock());
 
         let a1_1 = Approval::new(hash(&[1]), 1, 4, &signers[0]);
         let a1_2 = Approval::new(hash(&[1]), 1, 4, &signers[1]);
@@ -916,12 +1069,7 @@ mod tests {
         let a2_3 = Approval::new(hash(&[3]), 3, 4, &signers[2]);
 
         // Process first approval, and then process it again and make sure it works
-        tracker.process_approval(
-            Clock::instant(),
-            &a1_1,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a1_1, &stakes, DoomslugThresholdMode::TwoThirds);
 
         assert_eq!(
             tracker
@@ -941,12 +1089,7 @@ mod tests {
             0
         );
 
-        tracker.process_approval(
-            Clock::instant(),
-            &a1_1,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a1_1, &stakes, DoomslugThresholdMode::TwoThirds);
 
         assert_eq!(
             tracker
@@ -967,18 +1110,8 @@ mod tests {
         );
 
         // Process the remaining two approvals on the first block
-        tracker.process_approval(
-            Clock::instant(),
-            &a1_2,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
-        tracker.process_approval(
-            Clock::instant(),
-            &a1_3,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a1_2, &stakes, DoomslugThresholdMode::TwoThirds);
+        tracker.process_approval(&a1_3, &stakes, DoomslugThresholdMode::TwoThirds);
 
         assert_eq!(
             tracker
@@ -999,12 +1132,7 @@ mod tests {
         );
 
         // Process new approvals one by one, expect the approved and endorsed stake to slowly decrease
-        tracker.process_approval(
-            Clock::instant(),
-            &a2_1,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a2_1, &stakes, DoomslugThresholdMode::TwoThirds);
 
         assert_eq!(
             tracker
@@ -1024,12 +1152,7 @@ mod tests {
             5
         );
 
-        tracker.process_approval(
-            Clock::instant(),
-            &a2_2,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a2_2, &stakes, DoomslugThresholdMode::TwoThirds);
 
         assert_eq!(
             tracker
@@ -1050,14 +1173,9 @@ mod tests {
         );
 
         // As we update the last of the three approvals, the tracker for the first block should be completely removed
-        tracker.process_approval(
-            Clock::instant(),
-            &a2_3,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a2_3, &stakes, DoomslugThresholdMode::TwoThirds);
 
-        assert!(tracker.approval_trackers.get(&ApprovalInner::Skip(1)).is_none());
+        assert!(!tracker.approval_trackers.contains_key(&ApprovalInner::Skip(1)));
 
         // Check the approved and endorsed stake for the new block, and also ensure that processing one of the same approvals
         // again works fine
@@ -1080,12 +1198,7 @@ mod tests {
             5
         );
 
-        tracker.process_approval(
-            Clock::instant(),
-            &a2_3,
-            &stakes,
-            DoomslugThresholdMode::TwoThirds,
-        );
+        tracker.process_approval(&a2_3, &stakes, DoomslugThresholdMode::TwoThirds);
 
         assert_eq!(
             tracker

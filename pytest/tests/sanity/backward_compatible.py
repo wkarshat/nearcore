@@ -25,10 +25,8 @@ def main():
     executables = branches.prepare_ab_test()
 
     # Setup local network.
-    subprocess.check_call([
-        executables.stable.neard,
-        "--home=%s" % node_root, "testnet", "--v", "2", "--prefix", "test"
-    ])
+    subprocess.check_call((executables.stable.neard, f'--home={node_root}',
+                           'localnet', '-v', '2', '--prefix', 'test'))
 
     # Run both binaries at the same time.
     config = executables.stable.node_config()
@@ -43,7 +41,6 @@ def main():
 
     # Check it all works.
     BLOCKS = 100
-    TIMEOUT = 150
     max_height = -1
     started = time.time()
 
@@ -68,13 +65,15 @@ def main():
     block_height = stable_node.get_latest_block().height
     nonce = block_height * 1_000_000 - 1
 
-    tx = sign_deploy_contract_tx(new_signer_key, utils.load_test_contract(),
-                                 nonce, block_hash)
+    test_contract = utils.load_test_contract(
+        config=executables.current.node_config())
+    tx = sign_deploy_contract_tx(new_signer_key, test_contract, nonce,
+                                 block_hash)
     res = stable_node.send_tx_and_wait(tx, timeout=20)
     assert 'error' not in res, res
 
-    tx = sign_deploy_contract_tx(stable_node.signer_key,
-                                 utils.load_test_contract(), 3, block_hash)
+    tx = sign_deploy_contract_tx(stable_node.signer_key, test_contract, 3,
+                                 block_hash)
     res = stable_node.send_tx_and_wait(tx, timeout=20)
     assert 'error' not in res, res
 
@@ -115,7 +114,7 @@ def main():
     assert 'error' not in res, res
     assert 'Failure' not in res['result']['status'], res
 
-    utils.wait_for_blocks(current_node, target=BLOCKS, timeout=TIMEOUT)
+    utils.wait_for_blocks(current_node, target=BLOCKS)
 
 
 if __name__ == "__main__":

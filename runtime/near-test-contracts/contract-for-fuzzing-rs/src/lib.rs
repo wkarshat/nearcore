@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 use std::mem::size_of;
 
 #[allow(unused)]
@@ -15,7 +17,6 @@ extern "C" {
     fn signer_account_pk(register_id: u64);
     fn predecessor_account_id(register_id: u64);
     fn input(register_id: u64);
-    // TODO #1903 fn block_height() -> u64;
     fn block_index() -> u64;
     fn block_timestamp() -> u64;
     fn epoch_height() -> u64;
@@ -146,15 +147,12 @@ extern "C" {
     // #################
     // # alt_bn128 API #
     // #################
-    #[cfg(feature = "protocol_feature_alt_bn128")]
     fn alt_bn128_g1_multiexp(value_len: u64, value_ptr: u64, register_id: u64);
-    #[cfg(feature = "protocol_feature_alt_bn128")]
     fn alt_bn128_g1_sum(value_len: u64, value_ptr: u64, register_id: u64);
-    #[cfg(feature = "protocol_feature_alt_bn128")]
     fn alt_bn128_pairing_check(value_len: u64, value_ptr: u64) -> u64;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe fn number_from_input() {
     input(0);
     let value = [0u8; size_of::<u64>()];
@@ -162,7 +160,7 @@ pub unsafe fn number_from_input() {
     value_return(value.len() as u64, &value as *const u8 as u64);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe fn count_sum() {
     input(0);
     let data = [0u8; size_of::<u64>()];
@@ -187,7 +185,7 @@ pub unsafe fn count_sum() {
     value_return(value.len() as u64, &value as *const u8 as u64);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe fn sum_of_numbers() {
     input(0);
     let data = [0u8; size_of::<u64>()];
@@ -196,7 +194,7 @@ pub unsafe fn sum_of_numbers() {
     let number_of_numbers = u64::from_le_bytes(data);
     let mut promise_ids = vec![];
 
-    for i in 1..=number_of_numbers {
+    for _ in 1..=number_of_numbers {
         let i: u64 = 1;
         let method_name = "number_from_input".as_bytes();
         let account_id = {
@@ -246,10 +244,10 @@ pub unsafe fn sum_of_numbers() {
 }
 
 // Function that does not do anything at all.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn noop() {}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe fn data_producer() {
     input(0);
     let data = [0u8; size_of::<u64>()];
@@ -260,7 +258,7 @@ pub unsafe fn data_producer() {
     value_return(data.len() as _, data.as_ptr() as _);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe fn data_receipt_with_size() {
     input(0);
     let data = [0u8; size_of::<u64>()];
@@ -274,7 +272,6 @@ pub unsafe fn data_receipt_with_size() {
 
     let method_name = b"data_producer";
     let args = size.to_le_bytes();
-    let mut ids = [0u64; 10];
     let amount = 0u128;
     let gas = prepaid_gas();
     let id = promise_create(

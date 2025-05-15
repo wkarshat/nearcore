@@ -1,3 +1,5 @@
+use near_account_id::AccountId;
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ParseKeyTypeError {
     #[error("unknown key type '{unknown_key_type}'")]
@@ -8,7 +10,9 @@ pub enum ParseKeyTypeError {
 pub enum ParseKeyError {
     #[error("unknown key type '{unknown_key_type}'")]
     UnknownKeyType { unknown_key_type: String },
-    #[error("invalid key length: expected the input of {expected_length} bytes, but {received_length} was given")]
+    #[error(
+        "invalid key length: expected the input of {expected_length} bytes, but {received_length} was given"
+    )]
     InvalidLength { expected_length: usize, received_length: usize },
     #[error("invalid key data: {error_message}")]
     InvalidData { error_message: String },
@@ -28,7 +32,9 @@ impl From<ParseKeyTypeError> for ParseKeyError {
 pub enum ParseSignatureError {
     #[error("unknown key type '{unknown_key_type}'")]
     UnknownKeyType { unknown_key_type: String },
-    #[error("invalid signature length: expected the input of {expected_length} bytes, but {received_length} was given")]
+    #[error(
+        "invalid signature length: expected the input of {expected_length} bytes, but {received_length} was given"
+    )]
     InvalidLength { expected_length: usize, received_length: usize },
     #[error("invalid signature data: {error_message}")]
     InvalidData { error_message: String },
@@ -42,4 +48,10 @@ impl From<ParseKeyTypeError> for ParseSignatureError {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ImplicitPublicKeyError {
+    #[error("'{account_id}' is not a NEAR-implicit account")]
+    AccountIsNotNearImplicit { account_id: AccountId },
 }

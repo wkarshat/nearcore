@@ -1,19 +1,19 @@
+use ::time::ext::InstantExt as _;
+use near_async::time;
 use near_primitives::hash::CryptoHash;
 use near_primitives::network::PeerId;
-use near_primitives::time::Clock;
-use std::collections::{btree_map, BTreeMap, BTreeSet, HashMap};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map};
 
 /// default value for `capacity`
 const DEFAULT_CAPACITY: usize = 100_000;
 /// default value for `evict_timeout`
-const DEFAULT_CACHE_EVICT_TIMEOUT: Duration = Duration::from_millis(120_000);
+const DEFAULT_CACHE_EVICT_TIMEOUT: time::Duration = time::Duration::milliseconds(120_000);
 /// default value for `remove_frequent_min_size`
 const DEFAULT_REMOVE_BATCH_SIZE: usize = 100;
 
 /// Cache to store route back messages.
 ///
-/// The interface of the cache is similar to a regular HashMap:
+/// The interface of the cache is similar to a regular `HashMap`:
 /// elements can be inserted, fetched and removed.
 ///
 /// Motivation behind the following (complex) design:
@@ -37,7 +37,7 @@ const DEFAULT_REMOVE_BATCH_SIZE: usize = 100;
 /// 2. For every peer store how many message should be routed to it.
 ///
 /// First are removed messages that have been in the cache more time than
-/// EVICTED_TIMEOUT. If no message was removed, it is removed the oldest
+/// `EVICTED_TIMEOUT`. If no message was removed, it is removed the oldest
 /// message from the peer with more messages in the cache.
 ///
 /// Rationale:
@@ -45,17 +45,17 @@ const DEFAULT_REMOVE_BATCH_SIZE: usize = 100;
 /// - Old entries in the cache will be eventually removed (no memory leak).
 /// - If the cache is not at full capacity, all new records will be stored.
 /// - If a peer try to abuse the system, it will be able to allocate at most
-///     $capacity / number_of_active_connections$ entries.
+///     `capacity / number_of_active_connections` entries.
 pub struct RouteBackCache {
     /// Maximum number of records allowed in the cache.
     capacity: usize,
     /// Maximum time allowed before removing a record from the cache.
-    evict_timeout: Duration,
+    evict_timeout: time::Duration,
     /// Minimum number of records to delete from offending peer when the cache is full.
     remove_frequent_min_size: usize,
     /// Main map from message hash to time where it was created + target peer
     /// Size: O(capacity)
-    main: HashMap<CryptoHash, (Instant, PeerId)>,
+    main: HashMap<CryptoHash, (time::Instant, PeerId)>,
     /// Number of records allocated by each PeerId.
     /// The size is stored with negative sign, to order in PeerId in decreasing order.
     /// To avoid handling with negative number all sizes are added by capacity.
@@ -64,7 +64,7 @@ pub struct RouteBackCache {
     /// List of all hashes associated with each PeerId. Hashes within each PeerId
     /// are sorted by the time they arrived from older to newer.
     /// Size: O(capacity)
-    record_per_target: BTreeMap<PeerId, BTreeSet<(Instant, CryptoHash)>>,
+    record_per_target: BTreeMap<PeerId, BTreeSet<(time::Instant, CryptoHash)>>,
 }
 
 impl Default for RouteBackCache {
@@ -74,7 +74,11 @@ impl Default for RouteBackCache {
 }
 
 impl RouteBackCache {
-    pub fn new(capacity: usize, evict_timeout: Duration, remove_frequent_min_size: usize) -> Self {
+    pub fn new(
+        capacity: usize,
+        evict_timeout: time::Duration,
+        remove_frequent_min_size: usize,
+    ) -> Self {
         assert!(capacity > 0);
 
         Self {
@@ -134,15 +138,18 @@ impl RouteBackCache {
         }
     }
 
-    fn remove_evicted(&mut self) {
+    fn remove_evicted(&mut self, clock: &time::Clock) {
         if self.is_full() {
             self.remove_frequent();
 
-            let now = Clock::instant();
-            let remove_until = now - self.evict_timeout;
+            let now = clock.now();
+            let remove_until = match now.checked_sub_signed(self.evict_timeout) {
+                Some(t) => t,
+                None => return,
+            };
             let mut remove_empty = vec![];
 
-            for (key, value) in self.record_per_target.iter_mut() {
+            for (key, value) in &mut self.record_per_target {
                 let prev_size = value.len();
                 let keep = value.split_off(&(remove_until, CryptoHash::default()));
 
@@ -176,8 +183,8 @@ impl RouteBackCache {
         self.main.get(hash).map(|(_, target)| target)
     }
 
-    pub fn remove(&mut self, hash: &CryptoHash) -> Option<PeerId> {
-        self.remove_evicted();
+    pub fn remove(&mut self, clock: &time::Clock, hash: &CryptoHash) -> Option<PeerId> {
+        self.remove_evicted(clock);
 
         if let Some((time, target)) = self.main.remove(hash) {
             // Number of elements associated with this target
@@ -208,14 +215,14 @@ impl RouteBackCache {
         }
     }
 
-    pub fn insert(&mut self, hash: CryptoHash, target: PeerId) {
+    pub fn insert(&mut self, clock: &time::Clock, hash: CryptoHash, target: PeerId) {
         if self.main.contains_key(&hash) {
             return;
         }
 
-        self.remove_evicted();
+        self.remove_evicted(clock);
 
-        let now = Clock::instant();
+        let now = clock.now();
 
         self.main.insert(hash, (now, target.clone()));
 
@@ -236,15 +243,13 @@ impl RouteBackCache {
 mod test {
     use super::*;
     use near_primitives::hash::hash;
-    use std::thread;
-    use std::time::Duration;
 
     /// Check internal state of the cache is ok
     fn check_consistency(cache: &RouteBackCache) {
         assert!(cache.main.len() <= cache.capacity);
         assert_eq!(cache.size_per_target.len(), cache.record_per_target.len());
 
-        for (neg_size, target) in cache.size_per_target.iter() {
+        for (neg_size, target) in &cache.size_per_target {
             let size = cache.capacity - neg_size;
             assert!(size > 0);
             assert_eq!(size, cache.record_per_target.get(target).map(|x| x.len()).unwrap());
@@ -252,10 +257,10 @@ mod test {
 
         let mut total = 0;
 
-        for (target, records) in cache.record_per_target.iter() {
+        for (target, records) in &cache.record_per_target {
             total += records.len();
 
-            for (time, record) in records.iter() {
+            for (time, record) in records {
                 assert_eq!(cache.main.get(record).unwrap(), &(*time, target.clone()));
             }
         }
@@ -269,15 +274,16 @@ mod test {
 
     #[test]
     fn simple() {
-        let mut cache = RouteBackCache::new(100, Duration::from_millis(1000000000), 1);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(100, time::Duration::milliseconds(1000000000), 1);
         let (peer0, hash0) = create_message(0);
 
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), None);
-        cache.insert(hash0, peer0.clone());
+        cache.insert(&clock.clock(), hash0, peer0.clone());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), Some(&peer0));
-        assert_eq!(cache.remove(&hash0), Some(peer0));
+        assert_eq!(cache.remove(&clock.clock(), &hash0), Some(peer0));
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), None);
     }
@@ -285,14 +291,15 @@ mod test {
     /// Check record is removed after some timeout.
     #[test]
     fn evicted() {
-        let mut cache = RouteBackCache::new(1, Duration::from_millis(1), 1);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(1, time::Duration::milliseconds(1), 1);
         let (peer0, hash0) = create_message(0);
 
-        cache.insert(hash0, peer0.clone());
+        cache.insert(&clock.clock(), hash0, peer0.clone());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), Some(&peer0));
-        thread::sleep(Duration::from_millis(2));
-        cache.remove_evicted();
+        clock.advance(time::Duration::milliseconds(2));
+        cache.remove_evicted(&clock.clock());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), None);
     }
@@ -300,15 +307,16 @@ mod test {
     /// Check element is removed after timeout triggered by insert at max capacity.
     #[test]
     fn insert_evicted() {
-        let mut cache = RouteBackCache::new(1, Duration::from_millis(1), 1);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(1, time::Duration::milliseconds(1), 1);
         let (peer0, hash0) = create_message(0);
         let (peer1, hash1) = create_message(1);
 
-        cache.insert(hash0, peer0.clone());
+        cache.insert(&clock.clock(), hash0, peer0.clone());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), Some(&peer0));
-        thread::sleep(Duration::from_millis(2));
-        cache.insert(hash1, peer1.clone());
+        clock.advance(time::Duration::milliseconds(2));
+        cache.insert(&clock.clock(), hash1, peer1.clone());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash1), Some(&peer1));
         assert_eq!(cache.get(&hash0), None);
@@ -317,15 +325,16 @@ mod test {
     /// Check element is removed after insert because cache is at max capacity.
     #[test]
     fn insert_override() {
-        let mut cache = RouteBackCache::new(1, Duration::from_millis(1000000000), 1);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(1, time::Duration::milliseconds(1000000000), 1);
         let (peer0, hash0) = create_message(0);
         let (peer1, hash1) = create_message(1);
 
-        cache.insert(hash0, peer0.clone());
+        cache.insert(&clock.clock(), hash0, peer0.clone());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash0), Some(&peer0));
-        thread::sleep(Duration::from_millis(2));
-        cache.insert(hash1, peer1.clone());
+        clock.advance(time::Duration::milliseconds(2));
+        cache.insert(&clock.clock(), hash1, peer1.clone());
         check_consistency(&cache);
         assert_eq!(cache.get(&hash1), Some(&peer1));
         assert_eq!(cache.get(&hash0), None);
@@ -335,17 +344,18 @@ mod test {
     /// Check that old element from peer0 is removed, even while peer1 has more elements.
     #[test]
     fn prefer_evict() {
-        let mut cache = RouteBackCache::new(3, Duration::from_millis(100), 1);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(3, time::Duration::milliseconds(100), 1);
         let (peer0, hash0) = create_message(0);
         let (peer1, hash1) = create_message(1);
         let (_, hash2) = create_message(2);
         let (peer3, hash3) = create_message(3);
 
-        cache.insert(hash0, peer0);
-        thread::sleep(Duration::from_millis(1100));
-        cache.insert(hash1, peer1.clone());
-        cache.insert(hash2, peer1);
-        cache.insert(hash3, peer3);
+        cache.insert(&clock.clock(), hash0, peer0);
+        clock.advance(time::Duration::milliseconds(1100));
+        cache.insert(&clock.clock(), hash1, peer1.clone());
+        cache.insert(&clock.clock(), hash2, peer1);
+        cache.insert(&clock.clock(), hash3, peer3);
         check_consistency(&cache);
 
         assert!(cache.get(&hash0).is_none()); // This is removed because it was evicted
@@ -358,17 +368,18 @@ mod test {
     /// Check that older element from peer1 is removed, since evict timeout haven't passed yet.
     #[test]
     fn prefer_full() {
-        let mut cache = RouteBackCache::new(3, Duration::from_millis(100000), 1);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(3, time::Duration::milliseconds(100000), 1);
         let (peer0, hash0) = create_message(0);
         let (peer1, hash1) = create_message(1);
         let (_, hash2) = create_message(2);
         let (peer3, hash3) = create_message(3);
 
-        cache.insert(hash0, peer0);
-        thread::sleep(Duration::from_millis(1000));
-        cache.insert(hash1, peer1.clone());
-        cache.insert(hash2, peer1);
-        cache.insert(hash3, peer3);
+        cache.insert(&clock.clock(), hash0, peer0);
+        clock.advance(time::Duration::milliseconds(1000));
+        cache.insert(&clock.clock(), hash1, peer1.clone());
+        cache.insert(&clock.clock(), hash2, peer1);
+        cache.insert(&clock.clock(), hash3, peer3);
         check_consistency(&cache);
 
         assert!(cache.get(&hash0).is_some());
@@ -381,17 +392,18 @@ mod test {
     /// Check that older element from peer1 is removed, since evict timeout haven't passed yet.
     #[test]
     fn remove_all_frequent() {
-        let mut cache = RouteBackCache::new(3, Duration::from_millis(100000), 2);
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(3, time::Duration::milliseconds(100000), 2);
         let (peer0, hash0) = create_message(0);
         let (peer1, hash1) = create_message(1);
         let (_, hash2) = create_message(2);
         let (peer3, hash3) = create_message(3);
 
-        cache.insert(hash0, peer0);
-        thread::sleep(Duration::from_millis(1000));
-        cache.insert(hash1, peer1.clone());
-        cache.insert(hash2, peer1);
-        cache.insert(hash3, peer3);
+        cache.insert(&clock.clock(), hash0, peer0);
+        clock.advance(time::Duration::milliseconds(1000));
+        cache.insert(&clock.clock(), hash1, peer1.clone());
+        cache.insert(&clock.clock(), hash2, peer1);
+        cache.insert(&clock.clock(), hash3, peer3);
         check_consistency(&cache);
 
         assert!(cache.get(&hash0).is_some());
@@ -407,7 +419,9 @@ mod test {
     /// initial hashes should be present in the cache after the attack.
     #[test]
     fn poison_attack() {
-        let mut cache = RouteBackCache::new(17, Duration::from_millis(1000000), 1);
+        // cspell:ignore hashi
+        let clock = time::FakeClock::default();
+        let mut cache = RouteBackCache::new(17, time::Duration::milliseconds(1000000), 1);
         let mut ix = 0;
 
         let mut peers = vec![];
@@ -418,7 +432,7 @@ mod test {
             for _ in 0..4 {
                 let hashi = hash(&[ix]);
                 ix += 1;
-                cache.insert(hashi, peer.clone());
+                cache.insert(&clock.clock(), hashi, peer.clone());
             }
 
             peers.push(peer);
@@ -429,7 +443,7 @@ mod test {
         for _ in 0..50 {
             let hashi = hash(&[ix]);
             ix += 1;
-            cache.insert(hashi, attacker.clone());
+            cache.insert(&clock.clock(), hashi, attacker.clone());
         }
 
         check_consistency(&cache);

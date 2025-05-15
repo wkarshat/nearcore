@@ -1,9 +1,10 @@
 use actix::System;
-use futures::{future, FutureExt};
+use futures::{FutureExt, future};
 
 use near_actix_test_utils::run_actix;
 use near_jsonrpc::client::new_http_client;
-use near_logger_utils::init_test_logger;
+use near_o11y::testonly::init_test_logger;
+use near_time::Clock;
 
 use near_jsonrpc_tests as test_utils;
 
@@ -13,7 +14,8 @@ fn test_status() {
     init_test_logger();
 
     run_actix(async {
-        let (_view_client_addr, addr) = test_utils::start_all(test_utils::NodeType::NonValidator);
+        let (_view_client_addr, addr, _runtime_temp_dir) =
+            test_utils::start_all(Clock::real(), test_utils::NodeType::NonValidator);
 
         let client = new_http_client(&format!("http://{}", addr));
         actix::spawn(client.status().then(|res| {

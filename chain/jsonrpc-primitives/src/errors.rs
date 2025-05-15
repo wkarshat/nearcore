@@ -1,17 +1,15 @@
+use near_primitives::errors::TxExecutionError;
+use near_schema_checker_lib::ProtocolSchema;
+use serde_json::{Value, to_value};
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{to_value, Value};
-
-use near_primitives::errors::{InvalidTxError, TxExecutionError};
-
-#[derive(Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct RpcParseError(pub String);
 
 /// This struct may be returned from JSON RPC server in case of error
-/// It is expected that that this struct has impls From<_> all other RPC errors
+/// It is expected that this struct has impl From<_> all other RPC errors
 /// like [RpcBlockError](crate::types::blocks::RpcBlockError)
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpcError {
     #[serde(flatten)]
@@ -22,18 +20,18 @@ pub struct RpcError {
     pub message: String,
     /// Deprecated please use the `error_struct` instead
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
+    pub data: Option<Box<Value>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 #[serde(tag = "name", content = "cause", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RpcErrorKind {
     RequestValidationError(RpcRequestValidationErrorKind),
-    HandlerError(Value),
-    InternalError(Value),
+    HandlerError(Box<Value>),
+    InternalError(Box<Value>),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 #[serde(tag = "name", content = "info", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RpcRequestValidationErrorKind {
     MethodNotFound { method_name: String },
@@ -41,7 +39,7 @@ pub enum RpcRequestValidationErrorKind {
 }
 
 /// A general Server Error
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, near_rpc_error_macro::RpcError)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq, Clone, ProtocolSchema)]
 pub enum ServerError {
     TxExecutionError(TxExecutionError),
     Timeout,
@@ -53,19 +51,20 @@ impl RpcError {
     ///
     /// Mostly for completeness, doesn't do anything but filling in the corresponding fields.
     pub fn new(code: i64, message: String, data: Option<Value>) -> Self {
+        let data = data.map(Box::new);
         RpcError { code, message, data, error_struct: None }
     }
 
     /// Create an Invalid Param error.
     #[cfg(feature = "test_features")]
-    pub fn invalid_params(data: impl Serialize) -> Self {
+    pub fn invalid_params(data: impl serde::Serialize) -> Self {
         let value = match to_value(data) {
             Ok(value) => value,
             Err(err) => {
                 return Self::server_error(Some(format!(
                     "Failed to serialize invalid parameters error: {:?}",
                     err.to_string()
-                )))
+                )));
             }
         };
         RpcError::new(-32_602, "Invalid params".to_owned(), Some(value))
@@ -73,7 +72,7 @@ impl RpcError {
 
     /// Create a server error.
     #[cfg(feature = "test_features")]
-    pub fn server_error<E: Serialize>(e: Option<E>) -> Self {
+    pub fn server_error<E: serde::Serialize>(e: Option<E>) -> Self {
         RpcError::new(
             -32_000,
             "Server error".to_owned(),
@@ -86,7 +85,7 @@ impl RpcError {
         RpcError {
             code: -32_700,
             message: "Parse error".to_owned(),
-            data: Some(Value::String(e.clone())),
+            data: Some(Box::new(Value::String(e.clone()))),
             error_struct: Some(RpcErrorKind::RequestValidationError(
                 RpcRequestValidationErrorKind::ParseError { error_message: e },
             )),
@@ -115,11 +114,11 @@ impl RpcError {
         RpcError {
             code: -32_000,
             message: "Server error".to_owned(),
-            data: error_data,
-            error_struct: Some(RpcErrorKind::InternalError(serde_json::json!({
+            data: error_data.map(Box::new),
+            error_struct: Some(RpcErrorKind::InternalError(Box::new(serde_json::json!({
                 "name": "INTERNAL_ERROR",
                 "info": serde_json::json!({"error_message": info})
-            }))),
+            })))),
         }
     }
 
@@ -127,8 +126,8 @@ impl RpcError {
         RpcError {
             code: -32_000,
             message: "Server error".to_owned(),
-            data: error_data,
-            error_struct: Some(RpcErrorKind::HandlerError(error_struct)),
+            data: error_data.map(Box::new),
+            error_struct: Some(RpcErrorKind::HandlerError(Box::new(error_struct))),
         }
     }
 
@@ -137,7 +136,7 @@ impl RpcError {
         RpcError {
             code: -32_601,
             message: "Method not found".to_owned(),
-            data: Some(Value::String(method.clone())),
+            data: Some(Box::new(Value::String(method.clone()))),
             error_struct: Some(RpcErrorKind::RequestValidationError(
                 RpcRequestValidationErrorKind::MethodNotFound { method_name: method },
             )),
@@ -151,15 +150,15 @@ impl fmt::Display for RpcError {
     }
 }
 
-impl From<actix::MailboxError> for RpcError {
-    fn from(error: actix::MailboxError) -> Self {
-        Self::new(-32_000, "Server error".to_string(), Some(Value::String(error.to_string())))
+impl From<RpcParseError> for RpcError {
+    fn from(parse_error: RpcParseError) -> Self {
+        Self::parse_error(parse_error.0)
     }
 }
 
-impl From<crate::errors::RpcParseError> for RpcError {
-    fn from(parse_error: crate::errors::RpcParseError) -> Self {
-        Self::parse_error(parse_error.0)
+impl From<std::convert::Infallible> for RpcError {
+    fn from(_: std::convert::Infallible) -> Self {
+        unsafe { core::hint::unreachable_unchecked() }
     }
 }
 
@@ -173,21 +172,6 @@ impl fmt::Display for ServerError {
     }
 }
 
-impl From<InvalidTxError> for ServerError {
-    fn from(e: InvalidTxError) -> ServerError {
-        ServerError::TxExecutionError(TxExecutionError::InvalidTxError(e))
-    }
-}
-
-impl From<actix::MailboxError> for ServerError {
-    fn from(e: actix::MailboxError) -> Self {
-        match e {
-            actix::MailboxError::Closed => ServerError::Closed,
-            actix::MailboxError::Timeout => ServerError::Timeout,
-        }
-    }
-}
-
 impl From<ServerError> for RpcError {
     fn from(e: ServerError) -> RpcError {
         let error_data = match to_value(&e) {
@@ -196,14 +180,14 @@ impl From<ServerError> for RpcError {
                 return RpcError::new_internal_error(
                     None,
                     "Failed to serialize ServerError".to_string(),
-                )
+                );
             }
         };
         match e {
             ServerError::TxExecutionError(_) => {
                 RpcError::new_handler_error(Some(error_data.clone()), error_data)
             }
-            _ => RpcError::new_internal_error(Some(error_data.clone()), e.to_string()),
+            _ => RpcError::new_internal_error(Some(error_data), e.to_string()),
         }
     }
 }

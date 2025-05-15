@@ -5,7 +5,7 @@
 # Before the "fake" tx we expect the stakes to be equal to the largest of the last three "real" stakes for
 # each node. Before "real" txs it is the largest of the same value, and the last "fake" stake.
 
-import sys, time, base58, random
+import sys, time, base58, random, logging
 import pathlib
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / 'lib'))
@@ -57,7 +57,7 @@ def do_moar_stakes(last_block_hash, update_expected):
     if len(sequence) == 0:
         stakes = [0, 0, 0]
         # have 1-2 validators with stake, and the remaining without
-        # make numbers dibisable by 1M so that we can easily distinguish a situation when the current locked amt has some reward added to it (not divisable by 1M) vs not (divisable by 1M)
+        # make numbers divisible by 1M so that we can easily distinguish a situation when the current locked amt has some reward added to it (not divisible by 1M) vs not (divisible by 1M)
         stakes[random.randint(0, 2)] = random.randint(
             70000000000000000000000000, 100000000000000000000000000) * 1000000
         stakes[random.randint(0, 2)] = random.randint(
@@ -93,45 +93,73 @@ def doit(seq=[]):
     nodes = start_cluster(
         2, 1, 1, config, [["epoch_length", EPOCH_LENGTH],
                           ["block_producer_kickout_threshold", 40],
-                          ["chunk_producer_kickout_threshold", 40]], {
-                              0: {
-                                  "view_client_throttle_period": {
-                                      "secs": 0,
-                                      "nanos": 0
-                                  },
-                                  "consensus": {
-                                      "state_sync_timeout": {
-                                          "secs": 2,
-                                          "nanos": 0
-                                      }
-                                  }
-                              },
-                              1: {
-                                  "view_client_throttle_period": {
-                                      "secs": 0,
-                                      "nanos": 0
-                                  },
-                                  "consensus": {
-                                      "state_sync_timeout": {
-                                          "secs": 2,
-                                          "nanos": 0
-                                      }
-                                  }
-                              },
-                              2: {
-                                  "tracked_shards": [0],
-                                  "view_client_throttle_period": {
-                                      "secs": 0,
-                                      "nanos": 0
-                                  },
-                                  "consensus": {
-                                      "state_sync_timeout": {
-                                          "secs": 2,
-                                          "nanos": 0
-                                      }
-                                  }
-                              }
-                          })
+                          ["chunk_producer_kickout_threshold", 40]],
+        {
+            0: {
+                "tracked_shards_config": "AllShards",
+                "view_client_throttle_period": {
+                    "secs": 0,
+                    "nanos": 0
+                },
+                "consensus": {
+                    "state_sync_external_timeout": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                    "state_sync_p2p_timeout": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                    "state_sync_external_backoff": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                }
+            },
+            1: {
+                "tracked_shards_config": "AllShards",
+                "view_client_throttle_period": {
+                    "secs": 0,
+                    "nanos": 0
+                },
+                "consensus": {
+                    "state_sync_external_timeout": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                    "state_sync_p2p_timeout": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                    "state_sync_external_backoff": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                }
+            },
+            2: {
+                "tracked_shards_config": "AllShards",
+                "view_client_throttle_period": {
+                    "secs": 0,
+                    "nanos": 0
+                },
+                "consensus": {
+                    "state_sync_external_timeout": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                    "state_sync_p2p_timeout": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                    "state_sync_external_backoff": {
+                        "secs": 2,
+                        "nanos": 0
+                    },
+                },
+                "store.state_snapshot_config.state_snapshot_type": "Enabled",
+            }
+        })
 
     started = time.time()
     last_iter = started
@@ -154,6 +182,9 @@ def doit(seq=[]):
         assert time.time() - last_iter < TIMEOUT_PER_ITER
 
         height, hash_ = nodes[0].get_latest_block()
+        logging.info(
+            f"Node 0 at height {height}; time since last staking iteration: {time.time() - last_iter} seconds"
+        )
         send_fakes = send_reals = False
 
         if (height + EPOCH_LENGTH - FAKE_OFFSET) // EPOCH_LENGTH > (
@@ -188,6 +219,8 @@ def doit(seq=[]):
 
         elif send_reals:
             last_staked_height += EPOCH_LENGTH
+
+        time.sleep(1)
 
 
 if __name__ == "__main__":

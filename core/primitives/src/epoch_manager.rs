@@ -1,28 +1,26 @@
-use borsh::{BorshDeserialize, BorshSerialize};
-use num_rational::Rational;
-use serde::{Deserialize, Serialize};
-
-use crate::challenge::SlashedValidator;
-use crate::checked_feature;
+use crate::num_rational::Rational32;
 use crate::shard_layout::ShardLayout;
-use crate::types::validator_stake::ValidatorStakeV1;
+use crate::types::validator_stake::ValidatorStake;
 use crate::types::{
-    AccountId, Balance, BlockHeightDelta, EpochHeight, EpochId, NumSeats, ProtocolVersion,
-    ValidatorId, ValidatorKickoutReason,
+    AccountId, Balance, BlockChunkValidatorStats, BlockHeightDelta, NumSeats, ProtocolVersion,
+    ValidatorKickoutReason,
 };
-use crate::version::PROTOCOL_VERSION;
+use borsh::{BorshDeserialize, BorshSerialize};
 use near_primitives_core::hash::CryptoHash;
-use near_primitives_core::types::BlockHeight;
-use smart_default::SmartDefault;
+use near_primitives_core::serialize::dec_format;
+use near_primitives_core::version::PROTOCOL_VERSION;
+use near_schema_checker_lib::ProtocolSchema;
 use std::collections::{BTreeMap, HashMap};
-
-pub type RngSeed = [u8; 32];
+use std::fs;
+use std::ops::Bound;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const AGGREGATOR_KEY: &[u8] = b"AGGREGATOR";
 
 /// Epoch config, determines validator assignment for given epoch.
 /// Can change from epoch to epoch depending on the sharding and other parameters, etc.
-#[derive(Clone, Eq, Debug, PartialEq)]
+#[derive(Clone, Eq, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EpochConfig {
     /// Epoch length in block heights.
     pub epoch_length: BlockHeightDelta,
@@ -32,871 +30,499 @@ pub struct EpochConfig {
     pub num_block_producer_seats_per_shard: Vec<NumSeats>,
     /// Expected number of hidden validator seats per each shard.
     pub avg_hidden_validator_seats_per_shard: Vec<NumSeats>,
-    /// Criterion for kicking out block producers.
+    /// Threshold for kicking out block producers.
     pub block_producer_kickout_threshold: u8,
-    /// Criterion for kicking out chunk producers.
+    /// Threshold for kicking out chunk producers.
     pub chunk_producer_kickout_threshold: u8,
+    /// Threshold for kicking out nodes which are only chunk validators.
+    pub chunk_validator_only_kickout_threshold: u8,
+    /// Number of target chunk validator mandates for each shard.
+    pub target_validator_mandates_per_shard: NumSeats,
+    /// Max ratio of validators that we can kick out in an epoch
+    pub validator_max_kickout_stake_perc: u8,
     /// Online minimum threshold below which validator doesn't receive reward.
-    pub online_min_threshold: Rational,
+    pub online_min_threshold: Rational32,
     /// Online maximum threshold above which validator gets full reward.
-    pub online_max_threshold: Rational,
+    pub online_max_threshold: Rational32,
     /// Stake threshold for becoming a fisherman.
+    #[serde(with = "dec_format")]
     pub fishermen_threshold: Balance,
     /// The minimum stake required for staking is last seat price divided by this number.
     pub minimum_stake_divisor: u64,
     /// Threshold of stake that needs to indicate that they ready for upgrade.
-    pub protocol_upgrade_stake_threshold: Rational,
-    /// Number of epochs after stake threshold was achieved to start next prtocol version.
-    pub protocol_upgrade_num_epochs: EpochHeight,
+    pub protocol_upgrade_stake_threshold: Rational32,
     /// Shard layout of this epoch, may change from epoch to epoch
     pub shard_layout: ShardLayout,
-    /// Additional config for validator selection algorithm
-    pub validator_selection_config: ValidatorSelectionConfig,
+    /// Additional configuration parameters for the new validator selection
+    /// algorithm. See <https://github.com/near/NEPs/pull/167> for details.
+    // #[default(100)]
+    pub num_chunk_producer_seats: NumSeats,
+    // #[default(300)]
+    pub num_chunk_validator_seats: NumSeats,
+    // TODO (#11267): deprecate after StatelessValidationV0 is in place.
+    // Use 300 for older protocol versions.
+    // #[default(300)]
+    pub num_chunk_only_producer_seats: NumSeats,
+    // #[default(1)]
+    pub minimum_validators_per_shard: NumSeats,
+    // #[default(Rational32::new(160, 1_000_000))]
+    pub minimum_stake_ratio: Rational32,
+    // #[default(5)]
+    /// Limits the number of shard changes in chunk producer assignments,
+    /// if algorithm is able to choose assignment with better balance of
+    /// number of chunk producers for shards.
+    pub chunk_producer_assignment_changes_limit: NumSeats,
+    // #[default(false)]
+    pub shuffle_shard_assignment_for_chunk_producers: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl EpochConfig {
+    /// Total number of validator seats in the epoch since protocol version 69.
+    pub fn num_validators(&self) -> NumSeats {
+        self.num_block_producer_seats
+            .max(self.num_chunk_producer_seats)
+            .max(self.num_chunk_validator_seats)
+    }
+}
+
+impl EpochConfig {
+    // Create test-only epoch config.
+    // Not depends on genesis!
+    pub fn genesis_test(
+        num_block_producer_seats: NumSeats,
+        shard_layout: ShardLayout,
+        epoch_length: BlockHeightDelta,
+        block_producer_kickout_threshold: u8,
+        chunk_producer_kickout_threshold: u8,
+        chunk_validator_only_kickout_threshold: u8,
+        protocol_upgrade_stake_threshold: Rational32,
+        fishermen_threshold: Balance,
+    ) -> Self {
+        Self {
+            epoch_length,
+            num_block_producer_seats,
+            num_block_producer_seats_per_shard: vec![
+                num_block_producer_seats;
+                shard_layout.shard_ids().count()
+            ],
+            avg_hidden_validator_seats_per_shard: vec![],
+            target_validator_mandates_per_shard: 68,
+            validator_max_kickout_stake_perc: 100,
+            online_min_threshold: Rational32::new(90, 100),
+            online_max_threshold: Rational32::new(99, 100),
+            minimum_stake_divisor: 10,
+            protocol_upgrade_stake_threshold,
+            block_producer_kickout_threshold,
+            chunk_producer_kickout_threshold,
+            chunk_validator_only_kickout_threshold,
+            fishermen_threshold,
+            shard_layout,
+            num_chunk_producer_seats: 100,
+            num_chunk_validator_seats: 300,
+            num_chunk_only_producer_seats: 300,
+            minimum_validators_per_shard: 1,
+            minimum_stake_ratio: Rational32::new(160i32, 1_000_000i32),
+            chunk_producer_assignment_changes_limit: 5,
+            shuffle_shard_assignment_for_chunk_producers: false,
+        }
+    }
+
+    /// Minimal config for testing.
+    pub fn minimal() -> Self {
+        Self {
+            epoch_length: 0,
+            num_block_producer_seats: 0,
+            num_block_producer_seats_per_shard: vec![],
+            avg_hidden_validator_seats_per_shard: vec![],
+            block_producer_kickout_threshold: 0,
+            chunk_producer_kickout_threshold: 0,
+            chunk_validator_only_kickout_threshold: 0,
+            target_validator_mandates_per_shard: 0,
+            validator_max_kickout_stake_perc: 0,
+            online_min_threshold: 0.into(),
+            online_max_threshold: 0.into(),
+            fishermen_threshold: 0,
+            minimum_stake_divisor: 0,
+            protocol_upgrade_stake_threshold: 0.into(),
+            shard_layout: ShardLayout::get_simple_nightshade_layout(),
+            num_chunk_producer_seats: 100,
+            num_chunk_validator_seats: 300,
+            num_chunk_only_producer_seats: 300,
+            minimum_validators_per_shard: 1,
+            minimum_stake_ratio: Rational32::new(160i32, 1_000_000i32),
+            chunk_producer_assignment_changes_limit: 5,
+            shuffle_shard_assignment_for_chunk_producers: false,
+        }
+    }
+
+    pub fn mock(epoch_length: BlockHeightDelta, shard_layout: ShardLayout) -> Self {
+        Self {
+            epoch_length,
+            num_block_producer_seats: 2,
+            num_block_producer_seats_per_shard: vec![1, 1],
+            avg_hidden_validator_seats_per_shard: vec![1, 1],
+            block_producer_kickout_threshold: 0,
+            chunk_producer_kickout_threshold: 0,
+            chunk_validator_only_kickout_threshold: 0,
+            target_validator_mandates_per_shard: 1,
+            validator_max_kickout_stake_perc: 0,
+            online_min_threshold: Rational32::new(1i32, 4i32),
+            online_max_threshold: Rational32::new(3i32, 4i32),
+            fishermen_threshold: 1,
+            minimum_stake_divisor: 1,
+            protocol_upgrade_stake_threshold: Rational32::new(3i32, 4i32),
+            shard_layout,
+            num_chunk_producer_seats: 100,
+            num_chunk_validator_seats: 300,
+            num_chunk_only_producer_seats: 300,
+            minimum_validators_per_shard: 1,
+            minimum_stake_ratio: Rational32::new(160i32, 1_000_000i32),
+            chunk_producer_assignment_changes_limit: 5,
+            shuffle_shard_assignment_for_chunk_producers: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardConfig {
     pub num_block_producer_seats_per_shard: Vec<NumSeats>,
     pub avg_hidden_validator_seats_per_shard: Vec<NumSeats>,
     pub shard_layout: ShardLayout,
 }
 
-impl From<EpochConfig> for ShardConfig {
-    fn from(config: EpochConfig) -> Self {
-        ShardConfig {
-            num_block_producer_seats_per_shard: config.num_block_producer_seats_per_shard,
-            avg_hidden_validator_seats_per_shard: config.avg_hidden_validator_seats_per_shard,
-            shard_layout: config.shard_layout,
+impl ShardConfig {
+    pub fn new(epoch_config: EpochConfig) -> Self {
+        Self {
+            num_block_producer_seats_per_shard: epoch_config
+                .num_block_producer_seats_per_shard
+                .clone(),
+            avg_hidden_validator_seats_per_shard: epoch_config
+                .avg_hidden_validator_seats_per_shard
+                .clone(),
+            shard_layout: epoch_config.shard_layout,
         }
     }
 }
 
-#[derive(Clone)]
+/// Testing overrides to apply to the EpochConfig returned by the `for_protocol_version`.
+/// All fields should be optional and the default should be a no-op.
+#[derive(Clone, Debug, Default)]
+pub struct AllEpochConfigTestOverrides {
+    pub block_producer_kickout_threshold: Option<u8>,
+    pub chunk_producer_kickout_threshold: Option<u8>,
+}
+
+/// AllEpochConfig manages protocol configs that might be changing throughout epochs (hence EpochConfig).
+/// The main function in AllEpochConfig is ::for_protocol_version which takes a protocol version
+/// and returns the EpochConfig that should be used for this protocol version.
+#[derive(Debug, Clone)]
 pub struct AllEpochConfig {
-    genesis_epoch_config: EpochConfig,
-    simple_nightshade_epoch_config: EpochConfig,
+    /// Store for EpochConfigs, provides configs per protocol version.
+    /// Initialized only for production, ie. when `use_protocol_version` is true.
+    config_store: EpochConfigStore,
+    /// Chain Id. Some parameters are specific to certain chains.
+    chain_id: String,
+    epoch_length: BlockHeightDelta,
 }
 
 impl AllEpochConfig {
-    pub fn new(
-        genesis_epoch_config: EpochConfig,
-        simple_nightshade_shard_config: Option<ShardConfig>,
+    pub fn from_epoch_config_store(
+        chain_id: &str,
+        epoch_length: BlockHeightDelta,
+        config_store: EpochConfigStore,
     ) -> Self {
-        let mut config = genesis_epoch_config.clone();
-        if let Some(ShardConfig {
-            num_block_producer_seats_per_shard,
-            avg_hidden_validator_seats_per_shard,
-            shard_layout,
-        }) = simple_nightshade_shard_config
-        {
-            config.num_block_producer_seats_per_shard = num_block_producer_seats_per_shard;
-            config.avg_hidden_validator_seats_per_shard = avg_hidden_validator_seats_per_shard;
-            config.shard_layout = shard_layout;
-        }
-        Self { genesis_epoch_config, simple_nightshade_epoch_config: config }
+        Self { config_store, chain_id: chain_id.to_string(), epoch_length }
     }
 
-    pub fn for_protocol_version(&self, protocol_version: ProtocolVersion) -> &EpochConfig {
-        if checked_feature!("stable", SimpleNightshade, protocol_version) {
-            &self.simple_nightshade_epoch_config
-        } else {
-            &self.genesis_epoch_config
-        }
+    pub fn for_protocol_version(&self, protocol_version: ProtocolVersion) -> EpochConfig {
+        let mut config = self.config_store.get_config(protocol_version).as_ref().clone();
+        // TODO(#11265): epoch length is overridden in many tests so we
+        // need to support it here. Consider removing `epoch_length` from
+        // EpochConfig.
+        config.epoch_length = self.epoch_length;
+        config
+    }
+
+    pub fn chain_id(&self) -> &str {
+        &self.chain_id
     }
 }
 
-/// Additional configuration parameters for the new validator selection
-/// algorithm.  See <https://github.com/near/NEPs/pull/167> for details.
-#[derive(Debug, Clone, SmartDefault, PartialEq, Eq)]
-pub struct ValidatorSelectionConfig {
-    #[cfg(feature = "protocol_feature_chunk_only_producers")]
-    #[default(300)]
-    pub num_chunk_only_producer_seats: NumSeats,
-    #[cfg(feature = "protocol_feature_chunk_only_producers")]
-    #[default(1)]
-    pub minimum_validators_per_shard: NumSeats,
-    #[default(Rational::new(160, 1_000_000))]
-    pub minimum_stake_ratio: Rational,
-}
-
-#[cfg(feature = "deepsize_feature")]
-impl deepsize::DeepSizeOf for ValidatorSelectionConfig {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-pub mod block_info {
-    use super::SlashState;
-    use crate::challenge::SlashedValidator;
-    use crate::types::validator_stake::{ValidatorStake, ValidatorStakeIter};
-    use crate::types::EpochId;
-    use borsh::{BorshDeserialize, BorshSerialize};
-    use near_primitives_core::hash::CryptoHash;
-    use near_primitives_core::types::{AccountId, Balance, BlockHeight, ProtocolVersion};
-    use std::collections::HashMap;
-
-    pub use super::BlockInfoV1;
-
-    /// Information per each block.
-    #[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-    #[derive(BorshSerialize, BorshDeserialize, Eq, PartialEq, Clone, Debug)]
-    pub enum BlockInfo {
-        V1(BlockInfoV1),
-        V2(BlockInfoV2),
-    }
-
-    impl Default for BlockInfo {
-        fn default() -> Self {
-            Self::V2(BlockInfoV2::default())
-        }
-    }
-
-    impl BlockInfo {
-        pub fn new(
-            hash: CryptoHash,
-            height: BlockHeight,
-            last_finalized_height: BlockHeight,
-            last_final_block_hash: CryptoHash,
-            prev_hash: CryptoHash,
-            proposals: Vec<ValidatorStake>,
-            validator_mask: Vec<bool>,
-            slashed: Vec<SlashedValidator>,
-            total_supply: Balance,
-            latest_protocol_version: ProtocolVersion,
-            timestamp_nanosec: u64,
-        ) -> Self {
-            Self::V2(BlockInfoV2 {
-                hash,
-                height,
-                last_finalized_height,
-                last_final_block_hash,
-                prev_hash,
-                proposals,
-                chunk_mask: validator_mask,
-                latest_protocol_version,
-                slashed: slashed
-                    .into_iter()
-                    .map(|s| {
-                        let slash_state = if s.is_double_sign {
-                            SlashState::DoubleSign
-                        } else {
-                            SlashState::Other
-                        };
-                        (s.account_id, slash_state)
-                    })
-                    .collect(),
-                total_supply,
-                epoch_first_block: Default::default(),
-                epoch_id: Default::default(),
-                timestamp_nanosec,
-            })
-        }
-
-        #[inline]
-        pub fn proposals_iter(&self) -> ValidatorStakeIter {
-            match self {
-                Self::V1(v1) => ValidatorStakeIter::v1(&v1.proposals),
-                Self::V2(v2) => ValidatorStakeIter::new(&v2.proposals),
-            }
-        }
-
-        #[inline]
-        pub fn hash(&self) -> &CryptoHash {
-            match self {
-                Self::V1(v1) => &v1.hash,
-                Self::V2(v2) => &v2.hash,
-            }
-        }
-
-        #[inline]
-        pub fn height(&self) -> &BlockHeight {
-            match self {
-                Self::V1(v1) => &v1.height,
-                Self::V2(v2) => &v2.height,
-            }
-        }
-
-        #[inline]
-        pub fn last_finalized_height(&self) -> &BlockHeight {
-            match self {
-                Self::V1(v1) => &v1.last_finalized_height,
-                Self::V2(v2) => &v2.last_finalized_height,
-            }
-        }
-
-        #[inline]
-        pub fn last_final_block_hash(&self) -> &CryptoHash {
-            match self {
-                Self::V1(v1) => &v1.last_final_block_hash,
-                Self::V2(v2) => &v2.last_final_block_hash,
-            }
-        }
-
-        #[inline]
-        pub fn prev_hash(&self) -> &CryptoHash {
-            match self {
-                Self::V1(v1) => &v1.prev_hash,
-                Self::V2(v2) => &v2.prev_hash,
-            }
-        }
-
-        #[inline]
-        pub fn epoch_first_block(&self) -> &CryptoHash {
-            match self {
-                Self::V1(v1) => &v1.epoch_first_block,
-                Self::V2(v2) => &v2.epoch_first_block,
-            }
-        }
-
-        #[inline]
-        pub fn epoch_first_block_mut(&mut self) -> &mut CryptoHash {
-            match self {
-                Self::V1(v1) => &mut v1.epoch_first_block,
-                Self::V2(v2) => &mut v2.epoch_first_block,
-            }
-        }
-
-        #[inline]
-        pub fn epoch_id(&self) -> &EpochId {
-            match self {
-                Self::V1(v1) => &v1.epoch_id,
-                Self::V2(v2) => &v2.epoch_id,
-            }
-        }
-
-        #[inline]
-        pub fn epoch_id_mut(&mut self) -> &mut EpochId {
-            match self {
-                Self::V1(v1) => &mut v1.epoch_id,
-                Self::V2(v2) => &mut v2.epoch_id,
-            }
-        }
-
-        #[inline]
-        pub fn chunk_mask(&self) -> &[bool] {
-            match self {
-                Self::V1(v1) => &v1.chunk_mask,
-                Self::V2(v2) => &v2.chunk_mask,
-            }
-        }
-
-        #[inline]
-        pub fn latest_protocol_version(&self) -> &ProtocolVersion {
-            match self {
-                Self::V1(v1) => &v1.latest_protocol_version,
-                Self::V2(v2) => &v2.latest_protocol_version,
-            }
-        }
-
-        #[inline]
-        pub fn slashed(&self) -> &HashMap<AccountId, SlashState> {
-            match self {
-                Self::V1(v1) => &v1.slashed,
-                Self::V2(v2) => &v2.slashed,
-            }
-        }
-
-        #[inline]
-        pub fn slashed_mut(&mut self) -> &mut HashMap<AccountId, SlashState> {
-            match self {
-                Self::V1(v1) => &mut v1.slashed,
-                Self::V2(v2) => &mut v2.slashed,
-            }
-        }
-
-        #[inline]
-        pub fn total_supply(&self) -> &Balance {
-            match self {
-                Self::V1(v1) => &v1.total_supply,
-                Self::V2(v2) => &v2.total_supply,
-            }
-        }
-
-        #[inline]
-        pub fn timestamp_nanosec(&self) -> &u64 {
-            match self {
-                Self::V1(v1) => &v1.timestamp_nanosec,
-                Self::V2(v2) => &v2.timestamp_nanosec,
-            }
-        }
-    }
-
-    // V1 -> V2: Use versioned ValidatorStake structure in proposals
-    #[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-    #[derive(Default, BorshSerialize, BorshDeserialize, Eq, PartialEq, Clone, Debug)]
-    pub struct BlockInfoV2 {
-        pub hash: CryptoHash,
-        pub height: BlockHeight,
-        pub last_finalized_height: BlockHeight,
-        pub last_final_block_hash: CryptoHash,
-        pub prev_hash: CryptoHash,
-        pub epoch_first_block: CryptoHash,
-        pub epoch_id: EpochId,
-        pub proposals: Vec<ValidatorStake>,
-        pub chunk_mask: Vec<bool>,
-        /// Latest protocol version this validator observes.
-        pub latest_protocol_version: ProtocolVersion,
-        /// Validators slashed since the start of epoch or in previous epoch.
-        pub slashed: HashMap<AccountId, SlashState>,
-        /// Total supply at this block.
-        pub total_supply: Balance,
-        pub timestamp_nanosec: u64,
-    }
-}
-
-/// Information per each block.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(Default, BorshSerialize, BorshDeserialize, Eq, PartialEq, Clone, Debug)]
-pub struct BlockInfoV1 {
-    pub hash: CryptoHash,
-    pub height: BlockHeight,
-    pub last_finalized_height: BlockHeight,
-    pub last_final_block_hash: CryptoHash,
-    pub prev_hash: CryptoHash,
-    pub epoch_first_block: CryptoHash,
-    pub epoch_id: EpochId,
-    pub proposals: Vec<ValidatorStakeV1>,
-    pub chunk_mask: Vec<bool>,
-    /// Latest protocol version this validator observes.
-    pub latest_protocol_version: ProtocolVersion,
-    /// Validators slashed since the start of epoch or in previous epoch.
-    pub slashed: HashMap<AccountId, SlashState>,
-    /// Total supply at this block.
-    pub total_supply: Balance,
-    pub timestamp_nanosec: u64,
-}
-
-impl BlockInfoV1 {
-    pub fn new(
-        hash: CryptoHash,
-        height: BlockHeight,
-        last_finalized_height: BlockHeight,
-        last_final_block_hash: CryptoHash,
-        prev_hash: CryptoHash,
-        proposals: Vec<ValidatorStakeV1>,
-        validator_mask: Vec<bool>,
-        slashed: Vec<SlashedValidator>,
-        total_supply: Balance,
-        latest_protocol_version: ProtocolVersion,
-        timestamp_nanosec: u64,
-    ) -> Self {
-        Self {
-            hash,
-            height,
-            last_finalized_height,
-            last_final_block_hash,
-            prev_hash,
-            proposals,
-            chunk_mask: validator_mask,
-            latest_protocol_version,
-            slashed: slashed
-                .into_iter()
-                .map(|s| {
-                    let slash_state =
-                        if s.is_double_sign { SlashState::DoubleSign } else { SlashState::Other };
-                    (s.account_id, slash_state)
-                })
-                .collect(),
-            total_supply,
-            epoch_first_block: Default::default(),
-            epoch_id: Default::default(),
-            timestamp_nanosec,
-        }
-    }
-}
-
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(Default, BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ValidatorWeight(ValidatorId, u64);
-
-pub mod epoch_info {
-    use crate::epoch_manager::ValidatorWeight;
-    use crate::types::validator_stake::{ValidatorStake, ValidatorStakeIter};
-    use crate::types::{BlockChunkValidatorStats, ValidatorKickoutReason};
-    use crate::version::PROTOCOL_VERSION;
-    use borsh::{BorshDeserialize, BorshSerialize};
-    use near_primitives_core::hash::CryptoHash;
-    use near_primitives_core::types::{
-        AccountId, Balance, EpochHeight, ProtocolVersion, ValidatorId,
-    };
-    use smart_default::SmartDefault;
-    use std::collections::{BTreeMap, HashMap};
-
-    use crate::{checked_feature, epoch_manager::RngSeed, rand::WeightedIndex};
-    use near_primitives_core::{
-        hash::hash,
-        types::{BlockHeight, ShardId},
-    };
-
-    pub use super::EpochInfoV1;
-
-    /// Information per epoch.
-    #[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-    #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
-    pub enum EpochInfo {
-        V1(EpochInfoV1),
-        V2(EpochInfoV2),
-        V3(EpochInfoV3),
-    }
-
-    impl Default for EpochInfo {
-        fn default() -> Self {
-            Self::V2(EpochInfoV2::default())
-        }
-    }
-
-    // V1 -> V2: Use versioned ValidatorStake structure in validators and fishermen
-    #[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-    #[derive(SmartDefault, BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
-    pub struct EpochInfoV2 {
-        /// Ordinal of given epoch from genesis.
-        /// There can be multiple epochs with the same ordinal in case of long forks.
-        pub epoch_height: EpochHeight,
-        /// List of current validators.
-        pub validators: Vec<ValidatorStake>,
-        /// Validator account id to index in proposals.
-        pub validator_to_index: HashMap<AccountId, ValidatorId>,
-        /// Settlement of validators responsible for block production.
-        pub block_producers_settlement: Vec<ValidatorId>,
-        /// Per each shard, settlement validators that are responsible.
-        pub chunk_producers_settlement: Vec<Vec<ValidatorId>>,
-        /// Settlement of hidden validators with weights used to determine how many shards they will validate.
-        pub hidden_validators_settlement: Vec<ValidatorWeight>,
-        /// List of current fishermen.
-        pub fishermen: Vec<ValidatorStake>,
-        /// Fisherman account id to index of proposal.
-        pub fishermen_to_index: HashMap<AccountId, ValidatorId>,
-        /// New stake for validators.
-        pub stake_change: BTreeMap<AccountId, Balance>,
-        /// Validator reward for the epoch.
-        pub validator_reward: HashMap<AccountId, Balance>,
-        /// Validators who are kicked out in this epoch.
-        pub validator_kickout: HashMap<AccountId, ValidatorKickoutReason>,
-        /// Total minted tokens in the epoch.
-        pub minted_amount: Balance,
-        /// Seat price of this epoch.
-        pub seat_price: Balance,
-        /// Current protocol version during this epoch.
-        #[default(PROTOCOL_VERSION)]
-        pub protocol_version: ProtocolVersion,
-    }
-
-    // V2 -> V3: Structures for randomly selecting validators at each height based on new
-    // block producer and chunk producer selection algorithm.
-    #[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-    #[derive(SmartDefault, BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
-    pub struct EpochInfoV3 {
-        pub epoch_height: EpochHeight,
-        pub validators: Vec<ValidatorStake>,
-        pub validator_to_index: HashMap<AccountId, ValidatorId>,
-        pub block_producers_settlement: Vec<ValidatorId>,
-        pub chunk_producers_settlement: Vec<Vec<ValidatorId>>,
-        pub hidden_validators_settlement: Vec<ValidatorWeight>,
-        pub fishermen: Vec<ValidatorStake>,
-        pub fishermen_to_index: HashMap<AccountId, ValidatorId>,
-        pub stake_change: BTreeMap<AccountId, Balance>,
-        pub validator_reward: HashMap<AccountId, Balance>,
-        pub validator_kickout: HashMap<AccountId, ValidatorKickoutReason>,
-        pub minted_amount: Balance,
-        pub seat_price: Balance,
-        #[default(PROTOCOL_VERSION)]
-        pub protocol_version: ProtocolVersion,
-        // stuff for selecting validators at each height
-        rng_seed: RngSeed,
-        block_producers_sampler: WeightedIndex,
-        chunk_producers_sampler: Vec<WeightedIndex>,
-    }
-
-    impl EpochInfo {
-        pub fn new(
-            epoch_height: EpochHeight,
-            validators: Vec<ValidatorStake>,
-            validator_to_index: HashMap<AccountId, ValidatorId>,
-            block_producers_settlement: Vec<ValidatorId>,
-            chunk_producers_settlement: Vec<Vec<ValidatorId>>,
-            hidden_validators_settlement: Vec<ValidatorWeight>,
-            fishermen: Vec<ValidatorStake>,
-            fishermen_to_index: HashMap<AccountId, ValidatorId>,
-            stake_change: BTreeMap<AccountId, Balance>,
-            validator_reward: HashMap<AccountId, Balance>,
-            validator_kickout: HashMap<AccountId, ValidatorKickoutReason>,
-            minted_amount: Balance,
-            seat_price: Balance,
-            protocol_version: ProtocolVersion,
-            rng_seed: RngSeed,
-        ) -> Self {
-            if checked_feature!("stable", AliasValidatorSelectionAlgorithm, protocol_version) {
-                let stake_weights = |ids: &[ValidatorId]| -> WeightedIndex {
-                    WeightedIndex::new(
-                        ids.iter()
-                            .copied()
-                            .map(|validator_id| validators[validator_id as usize].stake())
-                            .collect(),
-                    )
-                };
-                let block_producers_sampler = stake_weights(&block_producers_settlement);
-                let chunk_producers_sampler =
-                    chunk_producers_settlement.iter().map(|vs| stake_weights(vs)).collect();
-                Self::V3(EpochInfoV3 {
-                    epoch_height,
-                    validators,
-                    fishermen,
-                    validator_to_index,
-                    block_producers_settlement,
-                    chunk_producers_settlement,
-                    hidden_validators_settlement,
-                    stake_change,
-                    validator_reward,
-                    validator_kickout,
-                    fishermen_to_index,
-                    minted_amount,
-                    seat_price,
-                    protocol_version,
-                    rng_seed,
-                    block_producers_sampler,
-                    chunk_producers_sampler,
-                })
-            } else {
-                Self::V2(EpochInfoV2 {
-                    epoch_height,
-                    validators,
-                    fishermen,
-                    validator_to_index,
-                    block_producers_settlement,
-                    chunk_producers_settlement,
-                    hidden_validators_settlement,
-                    stake_change,
-                    validator_reward,
-                    validator_kickout,
-                    fishermen_to_index,
-                    minted_amount,
-                    seat_price,
-                    protocol_version,
-                })
-            }
-        }
-
-        #[inline]
-        pub fn epoch_height_mut(&mut self) -> &mut EpochHeight {
-            match self {
-                Self::V1(v1) => &mut v1.epoch_height,
-                Self::V2(v2) => &mut v2.epoch_height,
-                Self::V3(v3) => &mut v3.epoch_height,
-            }
-        }
-
-        #[inline]
-        pub fn epoch_height(&self) -> EpochHeight {
-            match self {
-                Self::V1(v1) => v1.epoch_height,
-                Self::V2(v2) => v2.epoch_height,
-                Self::V3(v3) => v3.epoch_height,
-            }
-        }
-
-        #[inline]
-        pub fn seat_price(&self) -> Balance {
-            match self {
-                Self::V1(v1) => v1.seat_price,
-                Self::V2(v2) => v2.seat_price,
-                Self::V3(v3) => v3.seat_price,
-            }
-        }
-
-        #[inline]
-        pub fn minted_amount(&self) -> Balance {
-            match self {
-                Self::V1(v1) => v1.minted_amount,
-                Self::V2(v2) => v2.minted_amount,
-                Self::V3(v3) => v3.minted_amount,
-            }
-        }
-
-        #[inline]
-        pub fn block_producers_settlement(&self) -> &[ValidatorId] {
-            match self {
-                Self::V1(v1) => &v1.block_producers_settlement,
-                Self::V2(v2) => &v2.block_producers_settlement,
-                Self::V3(v3) => &v3.block_producers_settlement,
-            }
-        }
-
-        #[inline]
-        pub fn chunk_producers_settlement(&self) -> &[Vec<ValidatorId>] {
-            match self {
-                Self::V1(v1) => &v1.chunk_producers_settlement,
-                Self::V2(v2) => &v2.chunk_producers_settlement,
-                Self::V3(v3) => &v3.chunk_producers_settlement,
-            }
-        }
-
-        #[inline]
-        pub fn validator_kickout(&self) -> &HashMap<AccountId, ValidatorKickoutReason> {
-            match self {
-                Self::V1(v1) => &v1.validator_kickout,
-                Self::V2(v2) => &v2.validator_kickout,
-                Self::V3(v3) => &v3.validator_kickout,
-            }
-        }
-
-        #[inline]
-        pub fn protocol_version(&self) -> ProtocolVersion {
-            match self {
-                Self::V1(v1) => v1.protocol_version,
-                Self::V2(v2) => v2.protocol_version,
-                Self::V3(v3) => v3.protocol_version,
-            }
-        }
-
-        #[inline]
-        pub fn stake_change(&self) -> &BTreeMap<AccountId, Balance> {
-            match self {
-                Self::V1(v1) => &v1.stake_change,
-                Self::V2(v2) => &v2.stake_change,
-                Self::V3(v3) => &v3.stake_change,
-            }
-        }
-
-        #[inline]
-        pub fn validator_reward(&self) -> &HashMap<AccountId, Balance> {
-            match self {
-                Self::V1(v1) => &v1.validator_reward,
-                Self::V2(v2) => &v2.validator_reward,
-                Self::V3(v3) => &v3.validator_reward,
-            }
-        }
-
-        #[inline]
-        pub fn validators_iter(&self) -> ValidatorStakeIter {
-            match self {
-                Self::V1(v1) => ValidatorStakeIter::v1(&v1.validators),
-                Self::V2(v2) => ValidatorStakeIter::new(&v2.validators),
-                Self::V3(v3) => ValidatorStakeIter::new(&v3.validators),
-            }
-        }
-
-        #[inline]
-        pub fn fishermen_iter(&self) -> ValidatorStakeIter {
-            match self {
-                Self::V1(v1) => ValidatorStakeIter::v1(&v1.fishermen),
-                Self::V2(v2) => ValidatorStakeIter::new(&v2.fishermen),
-                Self::V3(v3) => ValidatorStakeIter::new(&v3.fishermen),
-            }
-        }
-
-        #[inline]
-        pub fn validator_stake(&self, validator_id: u64) -> Balance {
-            match self {
-                Self::V1(v1) => v1.validators[validator_id as usize].stake,
-                Self::V2(v2) => v2.validators[validator_id as usize].stake(),
-                Self::V3(v3) => v3.validators[validator_id as usize].stake(),
-            }
-        }
-
-        #[inline]
-        pub fn validator_account_id(&self, validator_id: u64) -> &AccountId {
-            match self {
-                Self::V1(v1) => &v1.validators[validator_id as usize].account_id,
-                Self::V2(v2) => v2.validators[validator_id as usize].account_id(),
-                Self::V3(v3) => v3.validators[validator_id as usize].account_id(),
-            }
-        }
-
-        #[inline]
-        pub fn account_is_validator(&self, account_id: &AccountId) -> bool {
-            match self {
-                Self::V1(v1) => v1.validator_to_index.contains_key(account_id),
-                Self::V2(v2) => v2.validator_to_index.contains_key(account_id),
-                Self::V3(v3) => v3.validator_to_index.contains_key(account_id),
-            }
-        }
-
-        pub fn get_validator_id(&self, account_id: &AccountId) -> Option<&ValidatorId> {
-            match self {
-                Self::V1(v1) => v1.validator_to_index.get(account_id),
-                Self::V2(v2) => v2.validator_to_index.get(account_id),
-                Self::V3(v3) => v3.validator_to_index.get(account_id),
-            }
-        }
-
-        pub fn get_validator_by_account(&self, account_id: &AccountId) -> Option<ValidatorStake> {
-            match self {
-                Self::V1(v1) => v1.validator_to_index.get(account_id).map(|validator_id| {
-                    ValidatorStake::V1(v1.validators[*validator_id as usize].clone())
-                }),
-                Self::V2(v2) => v2
-                    .validator_to_index
-                    .get(account_id)
-                    .map(|validator_id| v2.validators[*validator_id as usize].clone()),
-                Self::V3(v3) => v3
-                    .validator_to_index
-                    .get(account_id)
-                    .map(|validator_id| v3.validators[*validator_id as usize].clone()),
-            }
-        }
-
-        #[inline]
-        pub fn get_validator(&self, validator_id: u64) -> ValidatorStake {
-            match self {
-                Self::V1(v1) => ValidatorStake::V1(v1.validators[validator_id as usize].clone()),
-                Self::V2(v2) => v2.validators[validator_id as usize].clone(),
-                Self::V3(v3) => v3.validators[validator_id as usize].clone(),
-            }
-        }
-
-        #[inline]
-        pub fn account_is_fisherman(&self, account_id: &AccountId) -> bool {
-            match self {
-                Self::V1(v1) => v1.fishermen_to_index.contains_key(account_id),
-                Self::V2(v2) => v2.fishermen_to_index.contains_key(account_id),
-                Self::V3(v3) => v3.fishermen_to_index.contains_key(account_id),
-            }
-        }
-
-        pub fn get_fisherman_by_account(&self, account_id: &AccountId) -> Option<ValidatorStake> {
-            match self {
-                Self::V1(v1) => v1.fishermen_to_index.get(account_id).map(|validator_id| {
-                    ValidatorStake::V1(v1.fishermen[*validator_id as usize].clone())
-                }),
-                Self::V2(v2) => v2
-                    .fishermen_to_index
-                    .get(account_id)
-                    .map(|validator_id| v2.fishermen[*validator_id as usize].clone()),
-                Self::V3(v3) => v3
-                    .fishermen_to_index
-                    .get(account_id)
-                    .map(|validator_id| v3.fishermen[*validator_id as usize].clone()),
-            }
-        }
-
-        #[inline]
-        pub fn get_fisherman(&self, fisherman_id: u64) -> ValidatorStake {
-            match self {
-                Self::V1(v1) => ValidatorStake::V1(v1.fishermen[fisherman_id as usize].clone()),
-                Self::V2(v2) => v2.fishermen[fisherman_id as usize].clone(),
-                Self::V3(v3) => v3.fishermen[fisherman_id as usize].clone(),
-            }
-        }
-
-        #[inline]
-        pub fn validators_len(&self) -> usize {
-            match self {
-                Self::V1(v1) => v1.validators.len(),
-                Self::V2(v2) => v2.validators.len(),
-                Self::V3(v3) => v3.validators.len(),
-            }
-        }
-
-        pub fn sample_block_producer(&self, height: BlockHeight) -> ValidatorId {
-            match &self {
-                Self::V1(v1) => {
-                    let bp_settlement = &v1.block_producers_settlement;
-                    bp_settlement[(height % (bp_settlement.len() as u64)) as usize]
-                }
-                Self::V2(v2) => {
-                    let bp_settlement = &v2.block_producers_settlement;
-                    bp_settlement[(height % (bp_settlement.len() as u64)) as usize]
-                }
-                Self::V3(v3) => {
-                    let seed = {
-                        let mut buffer = [0u8; 40]; // 32 bytes from epoch_seed, 8 bytes from height
-                        buffer[0..32].copy_from_slice(&v3.rng_seed);
-                        buffer[32..40].copy_from_slice(&height.to_le_bytes());
-                        hash(&buffer).0
-                    };
-                    v3.block_producers_settlement[v3.block_producers_sampler.sample(seed)]
-                }
-            }
-        }
-
-        pub fn sample_chunk_producer(&self, height: BlockHeight, shard_id: ShardId) -> ValidatorId {
-            match &self {
-                Self::V1(v1) => {
-                    let cp_settlement = &v1.chunk_producers_settlement;
-                    let shard_cps = &cp_settlement[shard_id as usize];
-                    shard_cps[(height as u64 % (shard_cps.len() as u64)) as usize]
-                }
-                Self::V2(v2) => {
-                    let cp_settlement = &v2.chunk_producers_settlement;
-                    let shard_cps = &cp_settlement[shard_id as usize];
-                    shard_cps[(height as u64 % (shard_cps.len() as u64)) as usize]
-                }
-                Self::V3(v3) => {
-                    let seed = {
-                        // 32 bytes from epoch_seed, 8 bytes from height, 8 bytes from shard_id
-                        let mut buffer = [0u8; 48];
-                        buffer[0..32].copy_from_slice(&v3.rng_seed);
-                        buffer[32..40].copy_from_slice(&height.to_le_bytes());
-                        buffer[40..48].copy_from_slice(&shard_id.to_le_bytes());
-                        hash(&buffer).0
-                    };
-                    let shard_id = shard_id as usize;
-                    v3.chunk_producers_settlement[shard_id]
-                        [v3.chunk_producers_sampler[shard_id].sample(seed)]
-                }
-            }
-        }
-    }
-
-    #[derive(BorshSerialize, BorshDeserialize)]
-    pub struct EpochSummary {
-        pub prev_epoch_last_block_hash: CryptoHash,
-        /// Proposals from the epoch, only the latest one per account
-        pub all_proposals: Vec<ValidatorStake>,
-        /// Kickout set, includes slashed
-        pub validator_kickout: HashMap<AccountId, ValidatorKickoutReason>,
-        /// Only for validators who met the threshold and didn't get slashed
-        pub validator_block_chunk_stats: HashMap<AccountId, BlockChunkValidatorStats>,
-        /// Protocol version for next epoch.
-        pub next_version: ProtocolVersion,
-    }
-}
-
-/// Information per epoch.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(SmartDefault, BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
-pub struct EpochInfoV1 {
-    /// Ordinal of given epoch from genesis.
-    /// There can be multiple epochs with the same ordinal in case of long forks.
-    pub epoch_height: EpochHeight,
-    /// List of current validators.
-    pub validators: Vec<ValidatorStakeV1>,
-    /// Validator account id to index in proposals.
-    pub validator_to_index: HashMap<AccountId, ValidatorId>,
-    /// Settlement of validators responsible for block production.
-    pub block_producers_settlement: Vec<ValidatorId>,
-    /// Per each shard, settlement validators that are responsible.
-    pub chunk_producers_settlement: Vec<Vec<ValidatorId>>,
-    /// Settlement of hidden validators with weights used to determine how many shards they will validate.
-    pub hidden_validators_settlement: Vec<ValidatorWeight>,
-    /// List of current fishermen.
-    pub fishermen: Vec<ValidatorStakeV1>,
-    /// Fisherman account id to index of proposal.
-    pub fishermen_to_index: HashMap<AccountId, ValidatorId>,
-    /// New stake for validators.
-    pub stake_change: BTreeMap<AccountId, Balance>,
-    /// Validator reward for the epoch.
-    pub validator_reward: HashMap<AccountId, Balance>,
-    /// Validators who are kicked out in this epoch.
+#[derive(BorshSerialize, BorshDeserialize, ProtocolSchema)]
+pub struct EpochSummary {
+    pub prev_epoch_last_block_hash: CryptoHash,
+    /// Proposals from the epoch, only the latest one per account
+    pub all_proposals: Vec<ValidatorStake>,
+    /// Kickout set, includes slashed
     pub validator_kickout: HashMap<AccountId, ValidatorKickoutReason>,
-    /// Total minted tokens in the epoch.
-    pub minted_amount: Balance,
-    /// Seat price of this epoch.
-    pub seat_price: Balance,
-    /// Current protocol version during this epoch.
-    #[default(PROTOCOL_VERSION)]
-    pub protocol_version: ProtocolVersion,
+    /// Only for validators who met the threshold and didn't get slashed
+    pub validator_block_chunk_stats: HashMap<AccountId, BlockChunkValidatorStats>,
+    /// Protocol version for next next epoch, as summary of epoch T defines
+    /// epoch T+2.
+    pub next_next_epoch_version: ProtocolVersion,
 }
 
-/// State that a slashed validator can be in.
-#[cfg_attr(feature = "deepsize_feature", derive(deepsize::DeepSizeOf))]
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub enum SlashState {
-    /// Double Sign, will be partially slashed.
-    DoubleSign,
-    /// Malicious behavior but is already slashed (tokens taken away from account).
-    AlreadySlashed,
-    /// All other cases (tokens should be entirely slashed),
-    Other,
+macro_rules! include_config {
+    ($chain:expr, $version:expr, $file:expr) => {
+        (
+            $chain,
+            $version,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/res/epoch_configs/",
+                $chain,
+                "/",
+                $file
+            )),
+        )
+    };
+}
+
+/// List of (chain_id, version, JSON content) tuples used to initialize the EpochConfigStore.
+static CONFIGS: &[(&str, ProtocolVersion, &str)] = &[
+    // Epoch configs for mainnet (genesis protocol version is 29).
+    include_config!("mainnet", 29, "29.json"),
+    include_config!("mainnet", 48, "48.json"),
+    include_config!("mainnet", 56, "56.json"),
+    include_config!("mainnet", 64, "64.json"),
+    include_config!("mainnet", 65, "65.json"),
+    include_config!("mainnet", 69, "69.json"),
+    include_config!("mainnet", 70, "70.json"),
+    include_config!("mainnet", 71, "71.json"),
+    include_config!("mainnet", 72, "72.json"),
+    include_config!("mainnet", 75, "75.json"),
+    include_config!("mainnet", 76, "76.json"),
+    include_config!("mainnet", 78, "78.json"),
+    include_config!("mainnet", 143, "143.json"),
+    // Epoch configs for testnet (genesis protocol version is 29).
+    include_config!("testnet", 29, "29.json"),
+    include_config!("testnet", 48, "48.json"),
+    include_config!("testnet", 56, "56.json"),
+    include_config!("testnet", 64, "64.json"),
+    include_config!("testnet", 65, "65.json"),
+    include_config!("testnet", 69, "69.json"),
+    include_config!("testnet", 70, "70.json"),
+    include_config!("testnet", 71, "71.json"),
+    include_config!("testnet", 72, "72.json"),
+    include_config!("testnet", 75, "75.json"),
+    include_config!("testnet", 76, "76.json"),
+    include_config!("mainnet", 78, "78.json"),
+    include_config!("testnet", 143, "143.json"),
+];
+
+/// Store for `[EpochConfig]` per protocol version.`
+#[derive(Debug, Clone)]
+pub struct EpochConfigStore {
+    store: BTreeMap<ProtocolVersion, Arc<EpochConfig>>,
+}
+
+impl EpochConfigStore {
+    /// Creates a config store to contain the EpochConfigs for the given chain parsed from the JSON files.
+    /// If no configs are found for the given chain, try to load the configs from the file system.
+    /// If there are no configs found, return None.
+    pub fn for_chain_id(chain_id: &str, config_dir: Option<PathBuf>) -> Option<Self> {
+        let mut store = Self::load_default_epoch_configs(chain_id);
+
+        if !store.is_empty() {
+            return Some(Self { store });
+        }
+        if let Some(config_dir) = config_dir {
+            store = Self::load_epoch_config_from_file_system(config_dir.to_str().unwrap());
+        }
+
+        if store.is_empty() { None } else { Some(Self { store }) }
+    }
+
+    /// Loads the default epoch configs for the given chain from the CONFIGS array.
+    fn load_default_epoch_configs(chain_id: &str) -> BTreeMap<ProtocolVersion, Arc<EpochConfig>> {
+        let mut store = BTreeMap::new();
+        for (chain, version, content) in CONFIGS {
+            if *chain == chain_id {
+                let config: EpochConfig = serde_json::from_str(*content).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to load epoch config files for chain {} and version {}: {:#}",
+                        chain_id, version, e
+                    )
+                });
+                store.insert(*version, Arc::new(config));
+            }
+        }
+        store
+    }
+
+    /// Reads the json files from the epoch config directory.
+    fn load_epoch_config_from_file_system(
+        directory: &str,
+    ) -> BTreeMap<ProtocolVersion, Arc<EpochConfig>> {
+        fn get_epoch_config(
+            dir_entry: fs::DirEntry,
+        ) -> Option<(ProtocolVersion, Arc<EpochConfig>)> {
+            let path = dir_entry.path();
+            if !(path.extension()? == "json") {
+                return None;
+            }
+            let file_name = path.file_stem()?.to_str()?.to_string();
+            let protocol_version = file_name.parse().expect("Invalid protocol version");
+            if protocol_version > PROTOCOL_VERSION {
+                return None;
+            }
+            let contents = fs::read_to_string(&path).ok()?;
+            let epoch_config = serde_json::from_str(&contents).unwrap_or_else(|_| {
+                panic!("Failed to parse epoch config for version {}", protocol_version)
+            });
+            Some((protocol_version, epoch_config))
+        }
+
+        fs::read_dir(directory)
+            .expect("Failed opening epoch config directory")
+            .filter_map(Result::ok)
+            .filter_map(get_epoch_config)
+            .collect()
+    }
+
+    pub fn test(store: BTreeMap<ProtocolVersion, Arc<EpochConfig>>) -> Self {
+        Self { store }
+    }
+
+    pub fn test_single_version(
+        protocol_version: ProtocolVersion,
+        epoch_config: EpochConfig,
+    ) -> Self {
+        Self::test(BTreeMap::from([(protocol_version, Arc::new(epoch_config))]))
+    }
+
+    /// Returns the EpochConfig for the given protocol version.
+    /// This panics if no config is found for the given version, thus the initialization via `for_chain_id` should
+    /// only be performed for chains with some configs stored in files.
+    pub fn get_config(&self, protocol_version: ProtocolVersion) -> &Arc<EpochConfig> {
+        self.store
+            .range((Bound::Unbounded, Bound::Included(protocol_version)))
+            .next_back()
+            .unwrap_or_else(|| {
+                panic!("Failed to find EpochConfig for protocol version {}", protocol_version)
+            })
+            .1
+    }
+
+    fn dump_epoch_config(directory: &Path, version: &ProtocolVersion, config: &Arc<EpochConfig>) {
+        let content = serde_json::to_string_pretty(config.as_ref()).unwrap();
+        let path = PathBuf::from(directory).join(format!("{}.json", version));
+        fs::write(path, content).unwrap();
+    }
+
+    /// Dumps all the configs between the beginning and end protocol versions to the given directory.
+    /// If the beginning version doesn't exist, the closest config to it will be dumped.
+    pub fn dump_epoch_configs_between(
+        &self,
+        first_version: Option<&ProtocolVersion>,
+        last_version: Option<&ProtocolVersion>,
+        directory: impl AsRef<Path>,
+    ) {
+        // Dump all the configs between the beginning and end versions, inclusive.
+        self.store
+            .iter()
+            .filter(|(version, _)| {
+                first_version.is_none_or(|first_version| *version >= first_version)
+            })
+            .filter(|(version, _)| last_version.is_none_or(|last_version| *version <= last_version))
+            .for_each(|(version, config)| {
+                Self::dump_epoch_config(directory.as_ref(), version, config);
+            });
+
+        // Dump the closest config to the beginning version if it doesn't exist.
+        if let Some(first_version) = first_version {
+            if !self.store.contains_key(&first_version) {
+                let config = self.get_config(*first_version);
+                Self::dump_epoch_config(directory.as_ref(), first_version, config);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EpochConfigStore;
+    use crate::epoch_manager::EpochConfig;
+    use near_primitives_core::types::ProtocolVersion;
+    use near_primitives_core::version::PROTOCOL_VERSION;
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn test_dump_epoch_configs_mainnet() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        EpochConfigStore::for_chain_id("mainnet", None).unwrap().dump_epoch_configs_between(
+            Some(&55),
+            Some(&68),
+            tmp_dir.path().to_str().unwrap(),
+        );
+
+        // Check if tmp dir contains the dumped files. 55, 64, 65.
+        let dumped_files = fs::read_dir(tmp_dir.path()).unwrap();
+        let dumped_files: Vec<_> =
+            dumped_files.map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+
+        assert!(dumped_files.contains(&String::from("55.json")));
+        assert!(dumped_files.contains(&String::from("64.json")));
+        assert!(dumped_files.contains(&String::from("65.json")));
+
+        // Check if 55.json is equal to 48.json from res/epoch_configs/mainnet.
+        let contents_55 = fs::read_to_string(tmp_dir.path().join("55.json")).unwrap();
+        let epoch_config_55: EpochConfig = serde_json::from_str(&contents_55).unwrap();
+        let epoch_config_48 = parse_config_file("mainnet", 48).unwrap();
+        assert_eq!(epoch_config_55, epoch_config_48);
+    }
+
+    #[test]
+    fn test_dump_and_load_epoch_configs_mainnet() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let epoch_configs = EpochConfigStore::for_chain_id("mainnet", None).unwrap();
+        epoch_configs.dump_epoch_configs_between(
+            Some(&55),
+            Some(&68),
+            tmp_dir.path().to_str().unwrap(),
+        );
+
+        let loaded_epoch_configs = EpochConfigStore::test(
+            EpochConfigStore::load_epoch_config_from_file_system(tmp_dir.path().to_str().unwrap()),
+        );
+
+        // Insert a config for an newer protocol version. It should be ignored.
+        EpochConfigStore::dump_epoch_config(
+            tmp_dir.path(),
+            &(PROTOCOL_VERSION + 1),
+            &epoch_configs.get_config(PROTOCOL_VERSION),
+        );
+
+        let loaded_after_insert_epoch_configs = EpochConfigStore::test(
+            EpochConfigStore::load_epoch_config_from_file_system(tmp_dir.path().to_str().unwrap()),
+        );
+        assert_eq!(loaded_epoch_configs.store, loaded_after_insert_epoch_configs.store);
+
+        // Insert a config for an older protocol version. It should be loaded.
+        EpochConfigStore::dump_epoch_config(
+            tmp_dir.path(),
+            &(PROTOCOL_VERSION - 22),
+            &epoch_configs.get_config(PROTOCOL_VERSION),
+        );
+
+        let loaded_after_insert_epoch_configs = EpochConfigStore::test(
+            EpochConfigStore::load_epoch_config_from_file_system(tmp_dir.path().to_str().unwrap()),
+        );
+        assert_ne!(loaded_epoch_configs.store, loaded_after_insert_epoch_configs.store);
+    }
+
+    fn parse_config_file(chain_id: &str, protocol_version: ProtocolVersion) -> Option<EpochConfig> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("res/epoch_configs")
+            .join(chain_id)
+            .join(format!("{}.json", protocol_version));
+        if path.exists() {
+            let content = fs::read_to_string(path).unwrap();
+            let config: EpochConfig = serde_json::from_str(&content).unwrap();
+            Some(config)
+        } else {
+            None
+        }
+    }
 }

@@ -1,8 +1,10 @@
-use paperclip::actix::{api_v2_errors, Apiv2Schema};
+// cspell:words Apiv frunk
+use paperclip::actix::{Apiv2Schema, api_v2_errors};
 
-use near_primitives::serialize::BaseEncode;
+use near_primitives::hash::CryptoHash;
+use near_primitives::types::{BlockHeight, Nonce};
 
-use crate::utils::{BlobInHexString, BorshInHexString};
+use crate::utils::{BlobInHexString, BorshInHexString, SignedDiff};
 
 /// An AccountBalanceRequest is utilized to make a balance request on the
 /// /account/balance endpoint. If the block_identifier is populated, a
@@ -15,6 +17,8 @@ pub(crate) struct AccountBalanceRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_identifier: Option<PartialBlockIdentifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currencies: Option<Vec<Currency>>,
 }
 
 /// An AccountBalanceResponse is returned on the /account/balance endpoint. If
@@ -28,15 +32,19 @@ pub(crate) struct AccountBalanceResponse {
 
     /// A single account may have a balance in multiple currencies.
     pub balances: Vec<Amount>,
-    /* Rosetta Spec also optionally provides:
-     *
-     * /// Account-based blockchains that utilize a nonce or sequence number should
-     * /// include that number in the metadata. This number could be unique to the
-     * /// identifier or global across the account address.
-     * #[serde(skip_serializing_if = "Option::is_none")]
-     * pub metadata: Option<serde_json::Value>, */
+    /// Rosetta Spec also optionally provides:
+    /// Account-based blockchains that utilize a nonce or sequence number should
+    /// include that number in the metadata. This number could be unique to the
+    /// identifier or global across the account address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<AccountBalanceResponseMetadata>,
 }
-
+// Account-based blockchains that utilize a nonce or sequence number should
+// include that number in the metadata.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+pub(crate) struct AccountBalanceResponseMetadata {
+    pub nonces: Vec<Nonce>,
+}
 /// The account_identifier uniquely identifies an account within a network. All
 /// fields in the account_identifier are utilized to determine this uniqueness
 /// (including the metadata field, if populated).
@@ -48,18 +56,17 @@ pub(crate) struct AccountIdentifier {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_account: Option<SubAccountIdentifier>,
-    /* Rosetta Spec also optionally provides:
-     *
-     * /// Blockchains that utilize a username model (where the address is not a
-     * /// derivative of a cryptographic public key) should specify the public
-     * /// key(s) owned by the address in metadata.
-     * #[serde(skip_serializing_if = "Option::is_none")]
-     * pub metadata: Option<serde_json::Value>, */
+    /// Rosetta Spec also optionally provides:
+    /// Blockchains that utilize a username model (where the address is not a
+    /// derivative of a cryptographic public key) should specify the public
+    /// key(s) owned by the address in metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<AccountIdentifierMetadata>,
 }
 
 impl From<near_primitives::types::AccountId> for AccountIdentifier {
     fn from(account_id: near_primitives::types::AccountId) -> Self {
-        Self { address: account_id.into(), sub_account: None }
+        Self { address: account_id.into(), sub_account: None, metadata: None }
     }
 }
 
@@ -69,6 +76,13 @@ impl std::str::FromStr for AccountIdentifier {
     fn from_str(account_id: &str) -> Result<Self, Self::Err> {
         Ok(Self::from(account_id.parse::<near_primitives::types::AccountId>()?))
     }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, Apiv2Schema,
+)]
+pub(crate) struct AccountIdentifierMetadata {
+    pub public_keys: Vec<PublicKey>,
 }
 
 /// Allow specifies supported Operation status, Operation types, and all
@@ -133,12 +147,15 @@ impl Amount {
     ) -> Self {
         Self { value: amount, currency: Currency::near() }
     }
+    pub(crate) fn from_fungible_token(amount: u128, currency: Currency) -> Self {
+        Self { value: crate::utils::SignedDiff::from(amount), currency }
+    }
 }
 
 /// Blocks contain an array of Transactions that occurred at a particular
 /// BlockIdentifier. A hard requirement for blocks returned by Rosetta
 /// implementations is that they MUST be _inalterable_: once a client has
-/// requested and received a block identified by a specific BlockIndentifier,
+/// requested and received a block identified by a specific BlockIdentifier,
 /// all future calls for that same BlockIdentifier must return the same block
 /// contents.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
@@ -164,19 +181,21 @@ pub(crate) struct Block {
 pub(crate) struct BlockIdentifier {
     /// This is also known as the block height.
     pub index: i64,
-
     pub hash: String,
 }
 
-impl From<&near_primitives::views::BlockHeaderView> for BlockIdentifier {
-    fn from(header: &near_primitives::views::BlockHeaderView) -> Self {
+impl BlockIdentifier {
+    pub fn new(height: BlockHeight, hash: &CryptoHash) -> Self {
         Self {
-            index: header
-                .height
-                .try_into()
-                .expect("Rosetta only supports block indecies up to i64::MAX"),
-            hash: header.hash.to_base(),
+            index: height.try_into().expect("Rosetta only supports block indices up to i64::MAX"),
+            hash: hash.to_string(),
         }
+    }
+}
+
+impl From<&near_primitives::views::BlockView> for BlockIdentifier {
+    fn from(block: &near_primitives::views::BlockView) -> Self {
+        Self::new(block.header.height, &block.header.hash)
     }
 }
 
@@ -358,7 +377,7 @@ pub(crate) struct ConstructionPayloadsRequest {
 
 /// ConstructionTransactionResponse is returned by `/construction/payloads`. It
 /// contains an unsigned transaction blob (that is usually needed to construct
-/// the a network transaction from a collection of signatures) and an
+/// a network transaction from a collection of signatures) and an
 /// array of payloads that must be signed by the caller.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 pub(crate) struct ConstructionPayloadsResponse {
@@ -442,39 +461,49 @@ pub(crate) struct ConstructionHashRequest {
     pub signed_transaction: BorshInHexString<near_primitives::transaction::SignedTransaction>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
-pub(crate) enum CurrencySymbol {
-    NEAR,
-}
-
 /// Currency is composed of a canonical Symbol and Decimals. This Decimals value
-/// is used to convert an Amount.Value from atomic units (Satoshis) to standard
+/// is used to convert an Amount.Value from atomic units (Satoshi) to standard
 /// units (Bitcoins).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
-pub(crate) struct Currency {
+pub struct Currency {
     /// Canonical symbol associated with a currency.
-    pub symbol: CurrencySymbol,
+    pub symbol: String,
 
     /// Number of decimal places in the standard unit representation of the
     /// amount.  For example, BTC has 8 decimals. Note that it is not possible
     /// to represent the value of some currency in atomic units that is not base
     /// 10.
     pub decimals: u32,
-    /* Rosetta Spec also optionally provides:
-     *
-     * /// Any additional information related to the currency itself.  For example,
-     * /// it would be useful to populate this object with the contract address of
-     * /// an ERC-20 token.
-     * #[serde(skip_serializing_if = "Option::is_none")]
-     * pub metadata: Option<serde_json::Value>, */
+
+    /// Any additional information related to the currency itself.  For example,
+    /// it would be useful to populate this object with the contract address of
+    /// an ERC-20 token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<CurrencyMetadata>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+
+pub struct CurrencyMetadata {
+    pub contract_address: String,
 }
 
 impl Currency {
     fn near() -> Self {
-        Self { symbol: CurrencySymbol::NEAR, decimals: 24 }
+        Self { symbol: String::from("NEAR"), decimals: 24, metadata: None }
     }
 }
-
+impl FromIterator<Currency> for std::collections::HashMap<String, Currency> {
+    fn from_iter<T: IntoIterator<Item = Currency>>(iter: T) -> Self {
+        let mut currency_map: std::collections::HashMap<String, Currency> =
+            std::collections::HashMap::new();
+        for i in iter {
+            if let Some(metadata) = &i.metadata {
+                currency_map.insert(metadata.contract_address.clone(), i);
+            }
+        }
+        currency_map
+    }
+}
 /// Instead of utilizing HTTP status codes to describe node errors (which often
 /// do not have a good analog), rich errors are returned using this object.
 #[api_v2_errors(code = 500, description = "See the inner `code` value to get more details")]
@@ -487,9 +516,9 @@ pub(crate) struct Error {
     /// Message is a network-specific error message.
     pub message: String,
 
-    /// An error is retriable if the same request may succeed if submitted
+    /// An error is retryable if the same request may succeed if submitted
     /// again.
-    pub retriable: bool,
+    pub retryable: bool,
     /* Rosetta Spec also optionally provides:
      *
      * /// Often times it is useful to return context specific to the request that
@@ -501,8 +530,8 @@ pub(crate) struct Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let retriable = if self.retriable { " (retriable)" } else { "" };
-        write!(f, "Error #{}{}: {}", self.code, retriable, self.message)
+        let retryable = if self.retryable { " (retryable)" } else { "" };
+        write!(f, "Error #{}{}: {}", self.code, retryable, self.message)
     }
 }
 
@@ -510,24 +539,24 @@ impl Error {
     pub(crate) fn from_error_kind(err: crate::errors::ErrorKind) -> Self {
         match err {
             crate::errors::ErrorKind::InvalidInput(message) => {
-                Self { code: 400, message: format!("Invalid Input: {}", message), retriable: false }
+                Self { code: 400, message: format!("Invalid Input: {}", message), retryable: false }
             }
             crate::errors::ErrorKind::NotFound(message) => {
-                Self { code: 404, message: format!("Not Found: {}", message), retriable: false }
+                Self { code: 404, message: format!("Not Found: {}", message), retryable: false }
             }
             crate::errors::ErrorKind::WrongNetwork(message) => {
-                Self { code: 403, message: format!("Wrong Network: {}", message), retriable: false }
+                Self { code: 403, message: format!("Wrong Network: {}", message), retryable: false }
             }
             crate::errors::ErrorKind::Timeout(message) => {
-                Self { code: 504, message: format!("Timeout: {}", message), retriable: true }
+                Self { code: 504, message: format!("Timeout: {}", message), retryable: true }
             }
             crate::errors::ErrorKind::InternalInvariantError(message) => Self {
                 code: 501,
                 message: format!("Internal Invariant Error (please, report it): {}", message),
-                retriable: true,
+                retryable: true,
             },
             crate::errors::ErrorKind::InternalError(message) => {
-                Self { code: 500, message: format!("Internal Error: {}", message), retriable: true }
+                Self { code: 500, message: format!("Internal Error: {}", message), retryable: true }
             }
         }
     }
@@ -543,9 +572,9 @@ where
 }
 
 impl actix_web::ResponseError for Error {
-    fn error_response(&self) -> actix_web::BaseHttpResponse<actix_web::body::Body> {
+    fn error_response(&self) -> actix_web::HttpResponse {
         let data = paperclip::actix::web::Json(self);
-        actix_web::HttpResponse::InternalServerError().json(data).into()
+        actix_web::HttpResponse::InternalServerError().json(data)
     }
 }
 
@@ -582,8 +611,8 @@ pub(crate) struct MempoolTransactionResponse {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 pub(crate) struct MetadataRequest {
     // Rosetta Spec optionally provides, but we don't have any use for it:
-// #[serde(skip_serializing_if = "Option::is_none")]
-// pub metadata: Option<serde_json::Value>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub metadata: Option<serde_json::Value>,
 }
 
 /// The network_identifier specifies which network a particular object is
@@ -609,12 +638,15 @@ pub(crate) enum SyncStage {
     HeaderSync,
     StateSync,
     StateSyncDone,
+    BlockSync,
+    // DEPRECATED. Keeping for backwards compatibility.
+    // TODO: Delete in 1.38.
     BodySync,
 }
 
 /// SyncStatus is used to provide additional context about an implementation's
 /// sync status. It is often used to indicate that an implementation is healthy
-/// when it cannot be queried  until some sync phase occurs. If an
+/// when it cannot be queried until some sync phase occurs. If an
 /// implementation is immediately queryable, this model is often not populated.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 pub(crate) struct SyncStatus {
@@ -684,9 +716,9 @@ pub(crate) struct NetworkStatusResponse {
     Copy,
     PartialEq,
     Eq,
+    Apiv2Schema,
     serde::Serialize,
     serde::Deserialize,
-    Apiv2Schema,
     strum::EnumIter,
     strum::IntoStaticStr,
 )]
@@ -696,8 +728,10 @@ pub(crate) enum OperationType {
     CreateAccount,
     InitiateDeleteAccount,
     DeleteAccount,
+    DelegateAction,
     RefundDeleteAccount,
     InitiateAddKey,
+    SignedDelegateAction,
     AddKey,
     InitiateDeleteKey,
     DeleteKey,
@@ -706,6 +740,8 @@ pub(crate) enum OperationType {
     InitiateDeployContract,
     DeployContract,
     InitiateFunctionCall,
+    InitiateSignedDelegateAction,
+    InitiateDelegateAction,
     FunctionCall,
 }
 
@@ -714,27 +750,43 @@ pub(crate) enum OperationType {
     Clone,
     Copy,
     PartialEq,
+    Apiv2Schema,
     serde::Serialize,
     serde::Deserialize,
-    Apiv2Schema,
     strum::EnumIter,
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum OperationStatusKind {
     Success,
+    //This OperationStatusKind was specifically requested by Coinbase Integration
+    //team in order to continue their tests. It is NOT fully specified in the Rosetta
+    //specs.
+    #[serde(rename = "")]
+    Empty,
 }
 
 impl OperationStatusKind {
     pub(crate) fn is_successful(&self) -> bool {
         match self {
             Self::Success => true,
+            Self::Empty => false,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum OperationMetadataTransferFeeType {
+    GasPrepayment,
+    GasRefund,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 pub(crate) struct OperationMetadata {
-    /// Has to be specified for ADD_KEY, REMOVE_KEY, and STAKE operations
+    /// Has to be specified for TRANSFER operations which represent gas prepayments or gas refunds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_fee_type: Option<OperationMetadataTransferFeeType>,
+    /// Has to be specified for ADD_KEY, REMOVE_KEY, DELEGATE_ACTION and STAKE operations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<PublicKey>,
     // /// Has to be specified for ADD_KEY
@@ -754,6 +806,45 @@ pub(crate) struct OperationMetadata {
     /// Has to be specified for FUNCTION_CALL operation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached_gas: Option<crate::utils::SignedDiff<near_primitives::types::Gas>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predecessor_id: Option<AccountIdentifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
+    /// Has to be specified for DELEGATE_ACTION operation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_block_height: Option<near_primitives::types::BlockHeight>,
+    /// Has to be specified for DELEGATE_ACTION operation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<Nonce>,
+    /// Has to be specified for SIGNED_DELEGATE_ACTION operation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+impl OperationMetadata {
+    pub(crate) fn from_predecessor(
+        predecessor_id: Option<AccountIdentifier>,
+    ) -> Option<OperationMetadata> {
+        predecessor_id.map(|predecessor_id| crate::models::OperationMetadata {
+            predecessor_id: Some(predecessor_id),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn from_contract_address(contract_address: String) -> Option<OperationMetadata> {
+        Some(crate::models::OperationMetadata {
+            contract_address: Some(contract_address),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn with_transfer_fee_type(
+        mut self,
+        transfer_fee_type: OperationMetadataTransferFeeType,
+    ) -> Self {
+        self.transfer_fee_type = Some(transfer_fee_type);
+        self
+    }
 }
 
 /// Operations contain all balance-changing information within a transaction.
@@ -794,6 +885,47 @@ pub(crate) struct Operation {
     pub metadata: Option<OperationMetadata>,
 }
 
+/// This is Operation which mustn't contain DelegateActionOperation.
+///
+/// This struct is needed to avoid the recursion when Action/DelegateAction is deserialized.
+///
+/// Important: Don't make the inner Action public, this must only be constructed
+/// through the correct interface that ensures the inner Action is actually not
+/// a delegate action. That would break an assumption of this type, which we use
+/// in several places. For example, borsh de-/serialization relies on it. If the
+/// invariant is broken, we may end up with a `Transaction` or `Receipt` that we
+/// can serialize but deserializing it back causes a parsing error.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+pub(crate) struct NonDelegateActionOperation(crate::models::Operation);
+
+impl From<NonDelegateActionOperation> for crate::models::Operation {
+    fn from(action: NonDelegateActionOperation) -> Self {
+        action.0
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Clone, Debug, thiserror::Error)]
+#[error("Delegate operation cannot contain a delegate operation")]
+pub struct IsDelegateOperation;
+
+impl TryFrom<crate::models::Operation> for NonDelegateActionOperation {
+    type Error = IsDelegateOperation;
+
+    fn try_from(operation: crate::models::Operation) -> Result<Self, IsDelegateOperation> {
+        if matches!(operation.type_, crate::models::OperationType::DelegateAction) {
+            Err(IsDelegateOperation)
+        } else {
+            Ok(Self(operation))
+        }
+    }
+}
+
+impl From<IsDelegateOperation> for crate::errors::ErrorKind {
+    fn from(value: IsDelegateOperation) -> Self {
+        crate::errors::ErrorKind::InvalidInput(value.to_string())
+    }
+}
+
 /// The operation_identifier uniquely identifies an operation within a
 /// transaction.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
@@ -805,6 +937,7 @@ pub(crate) struct OperationIdentifier {
     /// operation index in the blockchain being described.
     pub index: i64,
 
+    // cspell:ignore UTXO
     /// Some blockchains specify an operation index that is essential for
     /// client use. For example, Bitcoin uses a network_index to identify
     /// which UTXO was used in a transaction.  network_index should not be
@@ -936,7 +1069,7 @@ pub(crate) struct SubNetworkIdentifier {
 /// timestamp is stored in milliseconds because some blockchains produce blocks
 /// more often than once a second.
 #[derive(
-    Debug, Clone, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize, Apiv2Schema,
+    Debug, Clone, PartialEq, PartialOrd, Apiv2Schema, serde::Serialize, serde::Deserialize,
 )]
 pub(crate) struct Timestamp(i64);
 
@@ -948,10 +1081,49 @@ pub(crate) struct Transaction {
 
     pub operations: Vec<Operation>,
 
+    /// The related_transactions allow implementations to link together multiple
+    /// transactions.  An unpopulated network identifier indicates that the
+    /// related transaction is on the same network.
+    ///
+    /// We’re using it to link NEAR transactions and receipts with receipts they
+    /// generated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related_transactions: Vec<RelatedTransaction>,
+
     /// Transactions that are related to other transactions (like a cross-shard
     /// transaction) should include the transaction_identifier of these
     /// transactions in the metadata.
     pub metadata: TransactionMetadata,
+}
+
+/// Transaction related to another [`Transaction`] such as matching transfer or
+/// a cross-shard transaction.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+pub(crate) struct RelatedTransaction {
+    // Rosetta API defines an optional network_identifier field as well but
+    // since all our related transactions are always on the same network we can
+    // leave out this field.
+    // pub network_identifier: NetworkIdentifier,
+    //
+    pub transaction_identifier: TransactionIdentifier,
+
+    pub direction: RelatedTransactionDirection,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RelatedTransactionDirection {
+    /// Direction indicating a transaction relation is from parent to child.
+    Forward,
+    // Rosetta also defines ‘backward’ direction (which indicates a transaction
+    // relation is from child to parent) but we’re not implementing it at the
+    // moment.
+}
+
+impl RelatedTransaction {
+    pub fn forward(transaction_identifier: TransactionIdentifier) -> Self {
+        Self { transaction_identifier, direction: RelatedTransactionDirection::Forward }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
@@ -993,7 +1165,7 @@ impl TransactionIdentifier {
     /// Returns an identifier for block events constructed as <prefix>:<hash>.
     ///
     /// Note: If constructing identifiers for transactions or receipts, use
-    /// [`transaction`] or [`receipt`] methods instead.
+    /// [`Self::transaction`] or [`Self::receipt`] methods instead.
     pub(crate) fn block_event(
         prefix: &'static str,
         block_hash: &near_primitives::hash::CryptoHash,
@@ -1005,7 +1177,7 @@ impl TransactionIdentifier {
         prefix: &'static str,
         hash: &near_primitives::hash::CryptoHash,
     ) -> Self {
-        Self { hash: format!("{}:{}", prefix, hash.to_base()) }
+        Self { hash: format!("{}:{}", prefix, hash) }
     }
 }
 
@@ -1038,7 +1210,7 @@ pub(crate) struct Version {
 /// PublicKey contains a public key byte array for a particular CurveType
 /// encoded in hex. Note that there is no PrivateKey struct as this is NEVER the
 /// concern of an implementation.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 pub(crate) struct PublicKey {
     /// Hex-encoded public key bytes in the format specified by the CurveType.
     pub hex_bytes: BlobInHexString<Vec<u8>>,
@@ -1068,12 +1240,12 @@ impl TryFrom<&PublicKey> for near_crypto::PublicKey {
 }
 
 /// CurveType is the type of cryptographic curve associated with a PublicKey.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum CurveType {
-    /// `y (255-bits) || x-sign-bit (1-bit)` - `32 bytes` (https://ed25519.cr.yp.to/ed25519-20110926.pdf)
+    /// `y (255-bits) || x-sign-bit (1-bit)` - 32 bytes (<https://ed25519.cr.yp.to/ed25519-20110926.pdf>)
     Edwards25519,
-    /// SEC compressed - `33 bytes` (https://secg.org/sec1-v2.pdf#subsubsection.2.3.3)
+    /// SEC compressed - 33 bytes (<https://secg.org/sec1-v2.pdf#subsubsection.2.3.3>)
     Secp256k1,
 }
 
@@ -1120,6 +1292,7 @@ impl TryFrom<&Signature> for near_crypto::Signature {
     }
 }
 
+// cspell:ignore Schnorr Zilliqa
 /// SignatureType is the type of a cryptographic signature.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
 #[serde(rename_all = "lowercase")]
@@ -1157,4 +1330,92 @@ impl From<SignatureType> for near_crypto::KeyType {
             SignatureType::Ed25519 => Self::ED25519,
         }
     }
+}
+
+// *** NEP-141 FT ***
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub(crate) struct Nep141Event {
+    pub version: String,
+    #[serde(flatten)]
+    pub event_kind: Nep141EventKind,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(tag = "event", content = "data")]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum Nep141EventKind {
+    FtTransfer(Vec<FtTransferData>),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub(crate) struct FtMintData {
+    pub owner_id: String,
+    pub amount: String,
+    pub memo: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub(crate) struct FtTransferData {
+    pub old_owner_id: String,
+    pub new_owner_id: String,
+    pub amount: String,
+    pub memo: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub(crate) struct FtBurnData {
+    pub owner_id: String,
+    pub amount: String,
+    pub memo: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FungibleTokenEvent {
+    pub standard: String,
+    pub receipt_id: CryptoHash,
+    pub block_height: u64,
+    pub block_timestamp: u64,
+    pub contract_account_id: String,
+    pub symbol: String,
+    pub decimals: u32,
+    pub affected_account_id: String,
+    pub involved_account_id: Option<String>,
+    pub delta_amount: SignedDiff<u128>,
+    pub cause: String,
+    pub status: String,
+    pub event_memo: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EventBase {
+    pub standard: String,
+    pub receipt_id: CryptoHash,
+    pub block_height: u64,
+    pub block_timestamp: u64,
+    pub contract_account_id: AccountIdentifier,
+    pub status: near_primitives::views::ExecutionStatusView,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+pub(crate) struct FtEvent {
+    pub affected_id: AccountIdentifier,
+    pub involved_id: Option<AccountIdentifier>,
+    pub delta: SignedDiff<u128>,
+    pub symbol: String,
+    pub decimals: u32,
+    pub cause: String,
+    pub memo: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+pub(crate) struct FTMetadataResponse {
+    pub spec: String,
+    pub name: String,
+    pub symbol: String,
+    pub icon: Option<String>,
+    pub reference: Option<String>,
+    pub reference_hash: Option<String>,
+    pub decimals: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Apiv2Schema)]
+pub(crate) struct FTAccountBalanceResponse {
+    pub amount: u128,
 }

@@ -1,11 +1,8 @@
 mod client;
+mod features;
 mod nearcore;
 mod network;
+mod other_tests;
 mod runtime;
 mod standard_cases;
-mod test_catchup;
-mod test_download_file;
-mod test_errors;
-mod test_overflows;
-mod test_simple;
-mod test_tps_regression;
+mod tools;

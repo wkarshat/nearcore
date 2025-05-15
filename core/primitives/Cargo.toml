@@ -1,53 +1,92 @@
 [package]
 name = "near-primitives"
-version = "0.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "This crate provides the base set of primitives used by other nearcore crates"
+repository.workspace = true
+license.workspace = true
 publish = true
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/near/nearcore"
-description = """
-This crate provides the base set of primitives used by other nearcore crates
-"""
+
+[lints]
+workspace = true
 
 [dependencies]
-byteorder = "1.3"
-bytesize = "1.1"
-chrono = { version = "0.4.4", features = ["serde"] }
-derive_more = "0.99.3"
-easy-ext = "0.2"
-sha2 = "0.9"
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-smart-default = "0.6"
-rand = "0.7"
-reed-solomon-erasure = "4"
-hex = "0.4"
-num-rational = { version = "0.3", features = ["serde"] }
-primitive-types = "0.10"
-deepsize = { version = "0.2.0", features = ["chrono"], optional=true }
+arbitrary.workspace = true
+base64.workspace = true
+bitvec.workspace = true
+borsh.workspace = true
+bytesize.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+derive_more = { workspace = true, features = [
+  "as_ref",
+  "from",
+  "into",
+  "deref",
+] }
+easy-ext.workspace = true
+hex.workspace = true
+itertools.workspace = true
+num-rational.workspace = true
+ordered-float.workspace = true
+primitive-types.workspace = true
+rand = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
+reed-solomon-erasure = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+sha3.workspace = true
+smart-default.workspace = true
+stdx.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zstd.workspace = true
+enum-map.workspace = true
 
-borsh = { version = "0.9", features = ["rc"] }
-
-near-primitives-core = { path = "../primitives-core"}
-near-crypto = { path = "../crypto" }
-near-vm-errors = { path = "../../runtime/near-vm-errors" }
-near-rpc-error-macro = { path = "../../tools/rpctypegen/macro" }
+near-time = { workspace = true }
+near-crypto.workspace = true
+near-fmt.workspace = true
+near-primitives-core.workspace = true
+near-parameters.workspace = true
+near-schema-checker-lib.workspace = true
 
 [features]
-dump_errors_schema = ["near-rpc-error-macro/dump_errors_schema"]
-protocol_feature_alt_bn128 = ["near-primitives-core/protocol_feature_alt_bn128", "near-vm-errors/protocol_feature_alt_bn128"]
-protocol_feature_chunk_only_producers = []
-protocol_feature_routing_exchange_algorithm = ["near-primitives-core/protocol_feature_routing_exchange_algorithm"]
-protocol_feature_access_key_nonce_for_implicit_accounts = []
-nightly_protocol_features = ["nightly_protocol", "protocol_feature_alt_bn128", "protocol_feature_chunk_only_producers", "protocol_feature_routing_exchange_algorithm", "protocol_feature_access_key_nonce_for_implicit_accounts"]
-nightly_protocol = []
-deepsize_feature = ["deepsize", "near-vm-errors/deepsize_feature", "near-primitives-core/deepsize_feature", "near-crypto/deepsize_feature"]
+sandbox = []
+test_features = []
+test_utils = []
+solomon = ["reed-solomon-erasure"]
+rand = ["dep:rand", "rand_chacha", "near-crypto/rand"]
+clock = ["near-time/clock", "near-time/serde"]
+
+nightly = [
+  "near-fmt/nightly",
+  "near-parameters/nightly",
+  "near-primitives-core/nightly",
+  "near-primitives/nightly",
+]
+
+calimero_zero_storage = []
+
+protocol_schema = ["near-schema-checker-lib/protocol_schema"]
 
 [dev-dependencies]
-bencher = "0.1.5"
+chrono = { workspace = true, features = ["clock"] }
+near-primitives = { path = ".", features = [
+  "clock",
+  "solomon",
+  "rand",
+  "test_utils",
+] }
+assert_matches.workspace = true
+bencher.workspace = true
+bolero.workspace = true
+insta.workspace = true
+expect-test.workspace = true
+regex.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "serialization"
